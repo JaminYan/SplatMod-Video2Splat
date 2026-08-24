@@ -1,8 +1,17 @@
-# OOOSplat 本地升级版 0.46
+# SplatMod-Video2Splat 0.47
 
 Windows 本地视频转 3D Gaussian Splatting 桌面应用。选择 MP4/MOV 视频后，应用在本机完成抽帧、COLMAP 稀疏重建与训练，并生成标准 Gaussian PLY。默认训练后端为 Brush；gsplat CUDA 是通过运行时健康检查后才可选的实验后端。
 
-> MOD By Jamin。项目基于 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的桌面流水线继续演进；不会上传视频或训练数据。
+> MOD By Jamin。项目基于 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的桌面流水线继续演进；不会上传视频或训练数据。代码仓库：[JaminYan/SplatMod-Video2Splat](https://github.com/JaminYan/SplatMod-Video2Splat)。
+
+## 0.47 新增改进
+
+- **自适应 SfM 抽帧**：均衡/精细档先用低分辨率代理分析背景运动，通过 FFmpeg `-stats_mux_pre` 保留输入帧索引 `ni` 与显示时间 `ti`，再精确抽取原图；索引缺失、时间戳异常或代理失败时自动回退到固定 2/4 FPS。
+- **质量闭环与可恢复诊断**：自适应结果会继续经过 COLMAP 注册率、稀疏点和模型解析检查；不足时支持定向补帧或进入 `needsSupplement`，不覆盖原始 attempt，取消后仍保留诊断日志和恢复上下文。
+- **CASPAR/Ceres 明确分工**：COLMAP 4.1.1 的局部 BA 使用 Ceres，中大型任务尝试 CASPAR 全局 BA；CASPAR 启动、Mapper、模型解析或质量门禁失败时，在独立目录回退 Ceres并记录实际后端与原因。
+- **可切换工作流锁定**：任务开始后锁定 FFmpeg 解码模式、COLMAP CPU/CUDA/CASPAR 后端、Brush/gsplat 训练后端和质量预设，避免运行中改变输入或设备状态。
+- **进度与诊断增强**：界面区分总进度、当前阶段和阶段百分比；长时间无外部输出时显示心跳，详细 FFmpeg/COLMAP/训练日志写入项目目录，错误提示包含可执行的回退建议。
+- **代码-only 发布边界**：新仓库只提交源码、配置、脚本、许可证和必要文档；COLMAP/Brush/gsplat/CUDA 运行时、安装包、缓存、`node_modules` 和构建产物不进入 Git。
 
 ## 相对原项目的升级
 

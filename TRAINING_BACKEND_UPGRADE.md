@@ -2,7 +2,7 @@
 
 > 状态：M1 已实施；M2 隔离运行时、CUDA smoke、adapter 与资源保护已实施；完整质量/速度基准尚未完成  
 > 日期：2026-08-22  
-> 适用版本：OOOSplat 0.45.x  
+> 适用版本：SplatMod-Video2Splat 0.47.x
 > 目标平台：Windows 10/11 x64，NVIDIA CUDA；现有 Brush/WGPU 路径继续支持  
 > 上游参考：[speedy-splat](https://github.com/j-alex-hanson/speedy-splat)、[gsplat](https://github.com/nerfstudio-project/gsplat)
 
@@ -21,7 +21,7 @@
 
 ## 实施记录（2026-08-22）
 
-- 已完成 M1 的 Rust 基础：`TrainingBackend`、统一训练请求/结果、标准 `work/training-input`、Brush 适配器迁移和设置 schema 6（默认 `brush`）。v0.45 升级会将旧设置重新落到 Brush，之后用户可再显式选择 gsplat。
+- 已完成 M1 的 Rust 基础：`TrainingBackend`、统一训练请求/结果、标准 `work/training-input`、Brush 适配器迁移和设置 schema 6（默认 `brush`）。0.47 继续保持旧设置迁移到 Brush，用户之后可显式选择 gsplat。
 - 已将后端、训练输入完成状态和阶段计时字段写入项目元数据/状态；PLY 发布前现在校验标准 Gaussian 属性与二进制布局长度。
 - `gsplat` 在未安装隔离 Python/CUDA 运行时或未通过三级健康检查时明确禁用并提示切回 Brush；没有静默回退。当前开发机三级检查已通过，但产品结论仍须完整基准。
 - 已具备固定 Python/PyTorch/gsplat 版本矩阵、`sm_120` CUDA smoke 与可复现 adapter；仍缺三组同输入的 Brush/gsplat 完整质量与耗时基线，因此不能宣称 gsplat 优于 Brush。
