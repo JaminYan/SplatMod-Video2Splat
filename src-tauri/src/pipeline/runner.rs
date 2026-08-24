@@ -492,7 +492,7 @@ impl PipelineRunner {
                             adaptive_profile = Some(selection_profile);
                             adaptive_selection_tier = Some(selection_tier);
                             adaptive_selection_target = Some(minimum_selected);
-                            adaptive_proxy_frames = Some(proxy_frames);
+                            adaptive_proxy_frames = Some(proxy_frames.clone());
                             if selected.len() >= minimum_selected {
                                 let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
                                 adaptive.proxy_candidates = Some(proxy_count as u64);
@@ -557,10 +557,96 @@ impl PipelineRunner {
                                                 report.registered_images, report.input_images, report.registered_ratio * 100.0),
                                             Some(report.registered_images), Some(report.input_images), Some("帧"));
                                     }
-                                    Ok((_, report)) => adaptive_reason = Some(format!(
-                                        "精细近预算 COLMAP 验证未通过：注册 {}/{}（{:.1}%）",
-                                        report.registered_images, report.input_images, report.registered_ratio * 100.0
-                                    )),
+                                    Ok((validation_model, report)) => {
+                                        let planned = match logs {
+                                            Some(log_directory) => match write_near_budget_validation_diagnostics(
+                                                log_directory, &validation_model, &selected, &proxy_frames
+                                            ).await {
+                                                Ok(count) => count,
+                                                Err(error) => {
+                                                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log,
+                                                        EventLevel::Warning, Some(1.0), false,
+                                                        format!("无法写入近预算验证弱区诊断：{error}"), None, None, None);
+                                                    0
+                                                }
+                                            },
+                                            None => 0,
+                                        };
+                                        let repair = if planned > 0 {
+                                            let log_directory = logs.expect("planned bridge diagnostics require logs");
+                                            let bridge_plan = read_near_budget_bridge_plan(log_directory).await?;
+                                            let mut repair_selection = selected.clone();
+                                            for bridge in bridge_plan.planned_frames {
+                                                if !repair_selection.iter().any(|frame| frame.source_index == bridge.source_index) {
+                                                    repair_selection.push(SelectedSourceFrame {
+                                                        source_index: bridge.source_index, pts_seconds: bridge.pts_seconds,
+                                                        reason: SelectionReason::Bridge, motion: 0.0, inliers: bridge.inliers,
+                                                        grid_coverage: bridge.grid_coverage, sharpness: bridge.sharpness,
+                                                    });
+                                                }
+                                            }
+                                            repair_selection.sort_by_key(|frame| frame.source_index);
+                                            let repair_root = project.join("work").join("adaptive-near-budget-bridge-repair");
+                                            let repair_frames = repair_root.join("frames");
+                                            let repair_database = repair_root.join("database.db");
+                                            let repair_sparse = repair_root.join("sparse");
+                                            tokio::fs::create_dir_all(&repair_root).await?;
+                                            self.events.stage(PipelineStage::SelectingFrames, 0.97,
+                                                format!("近预算桥接 repair：正在验证 {} 张关键帧", repair_selection.len()));
+                                            let repair_result = async {
+                                                extract_selected_frames(&self.engines.ffmpeg, input, &repair_frames, &repair_root.join("ffmpeg"),
+                                                    &repair_selection, self.ffmpeg_hw_accel,
+                                                    Some(log_directory.join("ffmpeg-adaptive-near-budget-bridge-repair.log")), &self.process_manager,
+                                                    Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
+                                                        Some(repair_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                                let compute = match self.colmap_backend {
+                                                    ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+                                                    ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
+                                                };
+                                                let executable = self.colmap_executable().to_path_buf();
+                                                let repair_log = repair_root.join("colmap.log");
+                                                colmap::extract_features(&executable, &repair_database, &repair_frames,
+                                                    ColmapFeatureOptions { compute }, repair_log.clone(), &self.process_manager,
+                                                    Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                                        Some(repair_selection.len() as u64), ObserverMode::BracketProgress))).await?;
+                                                colmap::match_sequential(&executable, &repair_database,
+                                                    ColmapMatchingOptions { compute, overlap: 10 }, repair_log.clone(), &self.process_manager,
+                                                    Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                                        Some(repair_selection.len() as u64), ObserverMode::BracketProgress))).await?;
+                                                run_ceres_mapper(&executable, &repair_database, &repair_frames, &repair_sparse, repair_log,
+                                                    &self.process_manager, Some(self.process_observer(PipelineStage::SelectingFrames,
+                                                        PipelineEngine::Colmap, Some(repair_selection.len() as u64), ObserverMode::Mapper))).await
+                                            }.await;
+                                            Some((repair_selection, repair_result))
+                                        } else { None };
+                                        match repair {
+                                            Some((repair_selection, Ok((_, repair_report)))) if repair_report.quality != ReconstructionQuality::Failed
+                                                && repair_report.registered_ratio >= 0.80
+                                                && repair_report.registered_images * 4 >= repair_selection.len() as u64 * 3 => {
+                                                let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
+                                                adaptive.proxy_candidates = Some(proxy_count as u64);
+                                                adaptive.effective_fps = Some(repair_selection.len() as f64 / video.duration.max(0.001));
+                                                adaptive.estimated_frames = repair_selection.len() as u64;
+                                                plan = adaptive;
+                                                adaptive_selected = Some(repair_selection);
+                                                adaptive_selection_tier = Some("nearBudgetBridgeRepaired");
+                                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(1.0), false,
+                                                    format!("近预算桥接 repair 通过：注册 {}/{}（{:.1}%）", repair_report.registered_images,
+                                                        repair_report.input_images, repair_report.registered_ratio * 100.0),
+                                                    Some(repair_report.registered_images), Some(repair_report.input_images), Some("帧"));
+                                            }
+                                            Some((_, Ok((_, repair_report)))) => adaptive_reason = Some(format!(
+                                                "精细近预算桥接 repair 未通过：注册 {}/{}（{:.1}%）",
+                                                repair_report.registered_images, repair_report.input_images, repair_report.registered_ratio * 100.0
+                                            )),
+                                            Some((_, Err(SplatError::Cancelled))) => return Err(SplatError::Cancelled),
+                                            Some((_, Err(error))) => adaptive_reason = Some(format!("精细近预算桥接 repair 失败：{error}")),
+                                            None => adaptive_reason = Some(format!(
+                                                "精细近预算 COLMAP 验证未通过：注册 {}/{}（{:.1}%）；没有可用桥接帧",
+                                                report.registered_images, report.input_images, report.registered_ratio * 100.0
+                                            )),
+                                        }
+                                    }
                                     Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
                                     Err(error) => adaptive_reason = Some(format!("精细近预算 COLMAP 验证失败：{error}")),
                                 }
@@ -2064,8 +2150,44 @@ fn median_proxy_metric(values: impl Iterator<Item = f64>) -> f64 {
     }
 }
 
+/// Persist the registration evidence from the isolated near-budget attempt so
+/// the following bridge-repair step can be auditable and source-PTS aware.
+async fn write_near_budget_validation_diagnostics(
+    logs: &Path,
+    model: &Path,
+    selected: &[SelectedSourceFrame],
+    proxy: &[ProxyFrame],
+) -> Result<u64> {
+    let registered = ReconstructionValidator::registered_images(model)?
+        .into_iter().map(|image| image.name.to_ascii_lowercase()).collect::<HashSet<_>>();
+    let selected_log = AdaptiveSelectedFramesLog { frames: selected.iter().enumerate().map(|(index, frame)| {
+        AdaptiveSelectedFrameLog { output_file: format!("frame_{:06}.jpg", index + 1), source_index: frame.source_index, pts_seconds: frame.pts_seconds }
+    }).collect() };
+    let timeline_frames = selected_log.frames.iter().map(|frame| RegisteredFrameTimelineEntry {
+        output_file: frame.output_file.clone(), pts_seconds: frame.pts_seconds,
+        registered: registered.contains(&frame.output_file.to_ascii_lowercase()),
+    }).collect::<Vec<_>>();
+    let weak_intervals = detect_weak_intervals(&timeline_frames);
+    let timeline = RegisteredFrameTimeline {
+        selected_frames: timeline_frames.len() as u64,
+        registered_frames: timeline_frames.iter().filter(|frame| frame.registered).count() as u64,
+        frames: timeline_frames,
+        weak_intervals: weak_intervals.clone(),
+    };
+    tokio::fs::write(logs.join("adaptive-near-budget-registered-frames.json"), serde_json::to_vec_pretty(&timeline)?).await?;
+    let plan = plan_adaptive_bridges(proxy, &selected_log.frames, &weak_intervals);
+    let planned = plan.planned_frames.len() as u64;
+    tokio::fs::write(logs.join("adaptive-near-budget-bridge-plan.json"), serde_json::to_vec_pretty(&plan)?).await?;
+    Ok(planned)
+}
+
 async fn read_adaptive_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {
     let bytes = tokio::fs::read(logs.join("adaptive-bridge-plan.json")).await?;
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+async fn read_near_budget_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {
+    let bytes = tokio::fs::read(logs.join("adaptive-near-budget-bridge-plan.json")).await?;
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 

@@ -603,6 +603,10 @@ adaptiveRepairMs
 
 若精细 `minimumObservable` 达到预算的 90% 但仍差少量帧，系统先在 `work/adaptive-near-budget-validation` 重抽该完整序列，并以独立数据库、特征、顺序匹配和 Ceres Mapper 做一次仅 SfM 验证。只有注册率至少 80%、注册数至少 75% 且模型未失败时才采用该自适应序列；验证失败、取消或出错都保留 attempt 证据并回退固定高密度路径。验证 attempt 不进入训练，也不能覆盖正式 frames、数据库或稀疏模型。
 
+近预算验证未通过时，也必须把验证模型的已注册 JPEG 名映射回源 PTS，写入 `adaptive-near-budget-registered-frames.json`，并写入受限的 `adaptive-near-budget-bridge-plan.json`。计划沿用每弱区最多两张、总数不超过初选的 25% 的限制；它为后续独立桥接 repair attempt 提供可审计输入，不能与正式 attempt 混用。
+
+当前实现会立刻执行一次 `work/adaptive-near-budget-bridge-repair`：将原近预算关键帧与该计划中的桥接帧按源时间重新抽取，在独立数据库和 Ceres Mapper 中验证。仅当 repair 的注册率至少 80%、注册数至少 75% 且模型未失败时，才重新抽取该序列进入正式 COLMAP；失败、取消和没有桥接候选均保留证据并回退固定高密度路径。整个 repair 最多一次。
+
 主界面在主视频输入旁提供 `自动从原视频补帧` 勾选项，默认开启：
 
 - 开启时，系统先仅从原视频弱区补 1–2 张最清晰的桥接帧，且新增总数不超过初选的 25%。
