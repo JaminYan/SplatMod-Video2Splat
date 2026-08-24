@@ -12,3 +12,9 @@ node_modules/
 /engines/gsplat/*.log
 /engines/gsplat/*.status
 /engines/gsplat/**/__pycache__/
+/engines/*
+!/engines/manifest.json
+!/engines/README.md
+/target/
+/.git-original-20260824/
+*.tsbuildinfo

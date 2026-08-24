@@ -1,0 +1,62 @@
+OOOSplat — Third-party notices
+================================
+
+This notice indexes the three native engines directly distributed with
+OOOSplat. Each component remains subject to its own license. This direct
+component list is not represented as a complete audit of transitive
+dependencies such as Qt, Boost, Ceres, or their dependencies.
+
+FFmpeg / FFprobe
+----------------
+Version/build: n8.1.2-34-g9b6c8969e0-20260812
+Distribution: BtbN win64 LGPL shared 8.1
+License: GNU Lesser General Public License v2.1 or later
+SPDX identifier: LGPL-2.1-or-later
+License text: licenses/FFmpeg-LGPL-2.1.txt
+Upstream source: https://ffmpeg.org/download.html
+Build source and scripts: https://github.com/BtbN/FFmpeg-Builds
+Release archive: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip
+
+The selected shared build disables GPL and nonfree components. The complete
+configure string can be inspected with `ffmpeg.exe -buildconf`.
+
+COLMAP (CPU/no-CUDA)
+--------------------
+Release: 4.1.1 Windows x64 no-CUDA asset
+Binary-reported version: 4.1.1, official Windows release, without CUDA
+License: BSD 3-Clause License
+SPDX identifier: BSD-3-Clause
+License text: licenses/COLMAP-LICENSE.txt
+Release source: https://github.com/colmap/colmap/releases/tag/4.1.1
+Release archive: https://github.com/colmap/colmap/releases/download/4.1.1/colmap-x64-windows-nocuda.zip
+
+COLMAP (CUDA)
+-------------
+Release: 4.1.1 Windows x64 CUDA asset
+Binary-reported version: 4.1.1, official Windows release, with CUDA
+License: BSD 3-Clause License
+SPDX identifier: BSD-3-Clause
+License text: licenses/COLMAP-LICENSE.txt
+Release source: https://github.com/colmap/colmap/releases/tag/4.1.1
+Release archive: https://github.com/colmap/colmap/releases/download/4.1.1/colmap-x64-windows-cuda.zip
+
+COLMAP (CASPAR CUDA)
+---------------------
+Release base: COLMAP 4.1.1, local CUDA/CASPAR-enabled build
+License: BSD 3-Clause License
+SPDX identifier: BSD-3-Clause
+License text: licenses/COLMAP-LICENSE.txt
+Source base: https://github.com/colmap/colmap/tree/4.1.1
+
+Brush
+-----
+Version: v0.3.0 Windows x64
+License: Apache License 2.0
+SPDX identifier: Apache-2.0
+License text: licenses/Brush-LICENSE.txt
+Upstream source: https://github.com/ArthurBrussee/brush/tree/v0.3.0
+Release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
+
+Exact archive and executable SHA-256 values are recorded in
+engines/manifest.json. This notice does not modify any component license.
+Third-party product names and marks belong to their respective owners.
