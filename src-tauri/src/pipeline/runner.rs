@@ -404,6 +404,8 @@ impl PipelineRunner {
         let mut adaptive_selected = None;
         let mut adaptive_proxy_frames = None;
         let mut adaptive_profile = None;
+        let mut adaptive_selection_tier = None;
+        let mut adaptive_selection_target = None;
         let mut adaptive_reason = None;
         let mut frame_analysis_ms = 0;
         let mut adaptive_planning_ms = 0;
@@ -445,9 +447,53 @@ impl PipelineRunner {
                     match analysis {
                         Ok(proxy_frames) => {
                             let proxy_count = proxy_frames.len();
-                            let selected = select_adaptive_frames(&proxy_frames, profile);
+                            // 精细档以覆盖预算而不是“能否凑够一个初始化对”作为
+                            // 自适应成功条件。20% 的锚点预算保留了明显的压缩空间，
+                            // 同时避免 20 秒素材只有 9 张图就进入训练。
+                            let minimum_selected = match quality {
+                                Quality::High => ((video.duration * profile.anchor_fps * 0.20).ceil() as usize)
+                                    .clamp(12, 32),
+                                _ => 3,
+                            };
+                            let mut selection_profile = profile;
+                            let mut selection_tier = "strict";
+                            let mut selected = select_adaptive_frames(&proxy_frames, selection_profile);
+                            // 精细档的采样密度（8 FPS、80 ms、较小目标位移）不应
+                            // 与更严的代理观测门槛绑定。代理只负责筛候选；当 strict
+                            // 无法形成可初始化序列时，逐级放宽底线，再由真实 COLMAP
+                            // 质量验收裁决，避免把可重建视频直接误退回固定 FPS。
+                            if quality == Quality::High && selected.len() < minimum_selected {
+                                selection_profile.min_textured_cells = 14;
+                                selection_profile.min_matched_cells = 9;
+                                selection_profile.min_inliers_floor = 7;
+                                selection_profile.min_inlier_ratio = 0.45;
+                                selection_profile.min_three_view_floor = 3;
+                                selection_profile.min_three_view_ratio = 0.35;
+                                selected = select_adaptive_frames(&proxy_frames, selection_profile);
+                                selection_tier = "relaxed";
+                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.9), false,
+                                    format!("精细代理 strict 未达到覆盖预算，切换 relaxed 最低可观测门：{} / {} 个关键帧", selected.len(), minimum_selected),
+                                    Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
+                            }
+                            if quality == Quality::High && selected.len() < minimum_selected {
+                                // 保持精细时间密度，只采用经均衡档验证的可观测底线。
+                                selection_profile.min_textured_cells = 12;
+                                selection_profile.min_matched_cells = 8;
+                                selection_profile.min_inliers_floor = 6;
+                                selection_profile.min_inlier_ratio = 0.45;
+                                selection_profile.min_three_view_floor = 3;
+                                selection_profile.min_three_view_ratio = 0.35;
+                                selected = select_adaptive_frames(&proxy_frames, selection_profile);
+                                selection_tier = "minimumObservable";
+                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.95), false,
+                                    format!("精细代理 relaxed 未达到覆盖预算，切换 minimum-observable 门：{} / {} 个关键帧", selected.len(), minimum_selected),
+                                    Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
+                            }
+                            adaptive_profile = Some(selection_profile);
+                            adaptive_selection_tier = Some(selection_tier);
+                            adaptive_selection_target = Some(minimum_selected);
                             adaptive_proxy_frames = Some(proxy_frames);
-                            if selected.len() >= 3 {
+                            if selected.len() >= minimum_selected {
                                 let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
                                 adaptive.proxy_candidates = Some(proxy_count as u64);
                                 adaptive.effective_fps = Some(selected.len() as f64 / video.duration.max(0.001));
@@ -455,9 +501,75 @@ impl PipelineRunner {
                                 plan = adaptive;
                                 adaptive_selected = Some(selected);
                                 self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(1.0), false,
-                                    format!("自适应规划完成：{} 个代理候选 → {} 个关键帧", proxy_count, plan.estimated_frames), Some(proxy_count as u64), Some(proxy_count as u64), Some("帧"));
+                                    format!("自适应规划完成（{selection_tier}）：{} 个代理候选 → {} 个关键帧", proxy_count, plan.estimated_frames), Some(proxy_count as u64), Some(proxy_count as u64), Some("帧"));
+                            } else if quality == Quality::High
+                                && selected.len() >= (minimum_selected * 9 + 9) / 10
+                            {
+                                // 接近预算时不凭代理分数猜测：在独立目录做一次廉价
+                                // Ceres 验证。它既不使用正式 frames，也不会覆盖随后
+                                // 的固定回退；只有真实注册质量通过才允许采用这些帧。
+                                let validation_root = project.join("work").join("adaptive-near-budget-validation");
+                                let validation_frames = validation_root.join("frames");
+                                let validation_database = validation_root.join("database.db");
+                                let validation_sparse = validation_root.join("sparse");
+                                tokio::fs::create_dir_all(&validation_root).await?;
+                                self.events.stage(PipelineStage::SelectingFrames, 0.96,
+                                    format!("精细自适应接近覆盖预算（{} / {}），正在执行隔离 COLMAP 验证", selected.len(), minimum_selected));
+                                let validation = async {
+                                    extract_selected_frames(&self.engines.ffmpeg, input, &validation_frames,
+                                        &validation_root.join("ffmpeg"), &selected, self.ffmpeg_hw_accel,
+                                        logs.map(|path| path.join("ffmpeg-adaptive-near-budget-validation.log")), &self.process_manager,
+                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
+                                            Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                    let validation_backend = self.colmap_backend;
+                                    let validation_compute = match validation_backend {
+                                        ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+                                        ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
+                                    };
+                                    let validation_exe = self.colmap_executable().to_path_buf();
+                                    let validation_log = validation_root.join("colmap.log");
+                                    colmap::extract_features(&validation_exe, &validation_database, &validation_frames,
+                                        ColmapFeatureOptions { compute: validation_compute }, validation_log.clone(), &self.process_manager,
+                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                            Some(selected.len() as u64), ObserverMode::BracketProgress))).await?;
+                                    colmap::match_sequential(&validation_exe, &validation_database,
+                                        ColmapMatchingOptions { compute: validation_compute, overlap: 10 }, validation_log.clone(), &self.process_manager,
+                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                            Some(selected.len() as u64), ObserverMode::BracketProgress))).await?;
+                                    run_ceres_mapper(&validation_exe, &validation_database, &validation_frames, &validation_sparse,
+                                        validation_log, &self.process_manager,
+                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                            Some(selected.len() as u64), ObserverMode::Mapper))).await
+                                }.await;
+                                match validation {
+                                    Ok((_, report)) if report.quality != ReconstructionQuality::Failed
+                                        && report.registered_ratio >= 0.80
+                                        && report.registered_images * 4 >= selected.len() as u64 * 3 => {
+                                        let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
+                                        adaptive.proxy_candidates = Some(proxy_count as u64);
+                                        adaptive.effective_fps = Some(selected.len() as f64 / video.duration.max(0.001));
+                                        adaptive.estimated_frames = selected.len() as u64;
+                                        plan = adaptive;
+                                        adaptive_selected = Some(selected);
+                                        adaptive_selection_tier = Some("nearBudgetValidated");
+                                        self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(1.0), false,
+                                            format!("隔离 COLMAP 验证通过：注册 {}/{}（{:.1}%），采用接近预算的精细自适应帧",
+                                                report.registered_images, report.input_images, report.registered_ratio * 100.0),
+                                            Some(report.registered_images), Some(report.input_images), Some("帧"));
+                                    }
+                                    Ok((_, report)) => adaptive_reason = Some(format!(
+                                        "精细近预算 COLMAP 验证未通过：注册 {}/{}（{:.1}%）",
+                                        report.registered_images, report.input_images, report.registered_ratio * 100.0
+                                    )),
+                                    Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
+                                    Err(error) => adaptive_reason = Some(format!("精细近预算 COLMAP 验证失败：{error}")),
+                                }
                             } else {
-                                adaptive_reason = Some(format!("可靠几何关键帧不足（仅 {} 张）", selected.len()));
+                                adaptive_reason = Some(format!(
+                                    "{} 自适应关键帧覆盖不足（{} / {} 张）",
+                                    if quality == Quality::High { "精细" } else { "可靠几何" },
+                                    selected.len(), minimum_selected
+                                ));
                             }
                         }
                         Err(error) => adaptive_reason = Some(format!("代理分析失败：{error}")),
@@ -528,8 +640,10 @@ impl PipelineRunner {
         if let Some(log_directory) = logs {
             let strategy = if adaptive_selected.is_some() { "adaptiveSfm" } else { "uniformRatio" };
             let fallback = adaptive_reason.as_deref().unwrap_or("none");
+            let adaptive_tier = adaptive_selection_tier.unwrap_or("notApplicable");
+            let adaptive_target = adaptive_selection_target.unwrap_or(0);
             tokio::fs::write(log_directory.join("adaptive-frame-selection.log"), format!(
-                "strategy={strategy}\nsource_fps={:.6}\nproxy_candidates={}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
+                "strategy={strategy}\nadaptive_selection_tier={adaptive_tier}\nadaptive_selection_target={adaptive_target}\nsource_fps={:.6}\nproxy_candidates={}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
                 video.fps, plan.proxy_candidates.unwrap_or(0), selection.retained
             )).await?;
             if let Some(selected) = adaptive_selected.as_deref() {
@@ -1227,8 +1341,24 @@ impl PipelineRunner {
             ),
         );
         let phase_started = Instant::now();
-        training::prepare_standard_colmap_dataset(&paths.training_input, &paths.frames, &model)
-            .await?;
+        let training_input = match self.training_backend {
+            TrainingBackend::Brush => {
+                training::prepare_standard_colmap_dataset(&paths.training_input, &paths.frames, &model).await?;
+                paths.training_input.clone()
+            }
+            TrainingBackend::Gsplat => {
+                let undistorted = paths.gsplat.join("training-input-undistorted");
+                let temporary = paths.gsplat.join(".training-input-undistorted.tmp");
+                if temporary.exists() { tokio::fs::remove_dir_all(&temporary).await?; }
+                colmap::undistort_images(&colmap_exe, &paths.frames, &model, &temporary, paths.logs.join("colmap-undistort.log"), &self.process_manager).await?;
+                if !temporary.join("images").is_dir() || !temporary.join("sparse").join("0").join("cameras.bin").is_file() {
+                    return Err(SplatError::Process("COLMAP 去畸变输出不完整，已停止 gsplat 训练。".into()));
+                }
+                if undistorted.exists() { tokio::fs::remove_dir_all(&undistorted).await?; }
+                tokio::fs::rename(&temporary, &undistorted).await?;
+                undistorted
+            }
+        };
         metadata.timings.training_input_ms = phase_started.elapsed().as_millis() as u64;
         state.training_input_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
@@ -1265,7 +1395,7 @@ impl PipelineRunner {
             &self.engines.brush,
             &self.engines.root,
             TrainingRequest {
-                dataset_root: paths.training_input.clone(),
+                dataset_root: training_input,
                 output_directory: match self.training_backend {
                     TrainingBackend::Brush => paths.brush.clone(),
                     TrainingBackend::Gsplat => paths.gsplat.clone(),

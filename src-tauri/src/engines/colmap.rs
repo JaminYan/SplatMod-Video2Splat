@@ -231,6 +231,31 @@ pub async fn map(
     .await
 }
 
+/// Produces a pinhole COLMAP training layout whose images and cameras share
+/// the same undistorted projection contract. The caller owns promotion of the
+/// completed directory so original frames and sparse reconstruction stay intact.
+pub async fn undistort_images(
+    executable: &Path,
+    images: &Path,
+    model: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        vec![
+            "image_undistorter".into(), "--image_path".into(), images.into(),
+            "--input_path".into(), model.into(), "--output_path".into(), output.into(),
+            "--output_type".into(), "COLMAP".into(),
+        ],
+        images,
+        log,
+        manager,
+        None,
+    ).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
