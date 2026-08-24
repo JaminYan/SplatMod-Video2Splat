@@ -293,6 +293,18 @@ function GsplatSplatCapBlock() {
   return <div className="settings-block"><div className="settings-block-title">gsplat splat 上限</div><p className="settings-block-hint">MCMC 会在验证损失停滞后冻结增殖，并过滤透明无效 splat；上限不是目标数量。</p><div className="backend-toggle" role="radiogroup" aria-label="gsplat splat 上限">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setGsplatSplatCap(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
+function PhotometricModeBlock() {
+ const store = useAppStore();
+ const settings = store.settings;
+ if (!settings || settings.settings.trainingBackend !== "gsplat") return null;
+ const current = settings.settings.photometricMode;
+ const options = [
+  { value: "none" as const, title: "关闭（M0 基线）", hint: "使用标准 L1 + DSSIM，不增加 PPISP 运行时成本。" },
+  { value: "ppisp" as const, title: "PPISP（实验）", hint: "补偿曝光、白平衡、暗角与色调变化；单帧训练，PLY 不含 controller。" },
+ ];
+ return <div className="settings-block"><div className="settings-block-title">光度一致性</div><p className="settings-block-hint">仅 gsplat 生效。PPISP 适合曝光变化明显的视频；请与同素材 M0 基线对照后再用于正式交付。</p><div className="backend-toggle" role="radiogroup" aria-label="光度一致性">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
+}
+
 function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const store = useAppStore();
   return (
@@ -306,7 +318,8 @@ function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void 
         <CudaColmapFlavorBlock />
         <FfmpegHwAccelBlock />
         <TrainingBackendBlock />
-        <GsplatSplatCapBlock />
+<GsplatSplatCapBlock />
+<PhotometricModeBlock />
         <BrushTrainingPresetBlock />
         {store.settingsNotice && (
           <div className="settings-notice">

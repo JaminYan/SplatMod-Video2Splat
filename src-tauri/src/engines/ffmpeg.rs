@@ -200,6 +200,133 @@ pub async fn extract_selected_frames(
     Ok(promoted)
 }
 
+/// Re-runs the proxy's official `fps` sampler, but uses the proxy candidate
+/// order to select only the already-approved keyframes before they are encoded.
+/// This keeps VFR/source-index validation while avoiding temporary JPEG output
+/// for every rejected candidate.
+pub async fn extract_selected_proxy_frames(
+    executable: &Path,
+    input: &Path,
+    output_directory: &Path,
+    work_directory: &Path,
+    selected: &[SelectedSourceFrame],
+    proxy_candidates: &[SourceFrameTimestamp],
+    analysis_fps: f64,
+    hw_accel: FfmpegHwAccel,
+    log_path: Option<PathBuf>,
+    process_manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<u64> {
+    if !input.is_file() { return Err(SplatError::InvalidPath(input.to_path_buf())); }
+    if !analysis_fps.is_finite() || analysis_fps <= 0.0 {
+        return Err(SplatError::Process("自适应原图抽帧 FPS 无效".into()));
+    }
+    let expected = selected_proxy_candidates(selected, proxy_candidates)?;
+    tokio::fs::create_dir_all(output_directory).await?;
+    tokio::fs::create_dir_all(work_directory).await?;
+    ensure_no_jpegs(output_directory).await?;
+    let mapping_path = work_directory.join("adaptive-original-map.txt");
+    let filter_script = work_directory.join("adaptive-selected-filter.txt");
+    tokio::fs::write(&filter_script, selected_proxy_filter(analysis_fps, &expected)).await?;
+    let output_pattern = output_directory.join("frame_%06d.jpg");
+    let mut args = vec![OsString::from("-hide_banner"), OsString::from("-nostdin"), OsString::from("-nostats"), OsString::from("-y")];
+    match hw_accel {
+        FfmpegHwAccel::Off => {}
+        FfmpegHwAccel::Auto => args.extend([OsString::from("-hwaccel"), OsString::from("auto")]),
+        FfmpegHwAccel::D3d11va => args.extend([OsString::from("-hwaccel"), OsString::from("d3d11va")]),
+        FfmpegHwAccel::Cuda => args.extend([OsString::from("-hwaccel"), OsString::from("cuda")]),
+    }
+    args.extend([
+        OsString::from("-i"), input.as_os_str().to_owned(),
+        OsString::from("-filter_script:v"), filter_script.as_os_str().to_owned(),
+        OsString::from("-fps_mode:v"), OsString::from("passthrough"),
+        OsString::from("-q:v"), OsString::from("2"), OsString::from("-start_number"), OsString::from("1"),
+        OsString::from("-stats_mux_pre:v"), mapping_path.as_os_str().to_owned(),
+        OsString::from("-stats_mux_pre_fmt:v"), OsString::from("{ni} {ti}"),
+        OsString::from("-progress"), OsString::from("pipe:1"), output_pattern.as_os_str().to_owned(),
+    ]);
+    let output = process_manager.run(ProcessSpec {
+        executable: executable.to_path_buf(), args,
+        working_directory: work_directory.parent().map(Path::to_path_buf), log_path, observer,
+    }).await?;
+    if output.cancelled { return Err(SplatError::Cancelled); }
+    if !output.success { return Err(SplatError::Process(format!("FFmpeg 自适应原图定向抽帧退出码 {:?}", output.exit_code))); }
+    let mapped = parse_proxy_mapping(&tokio::fs::read_to_string(&mapping_path).await?)?;
+    if mapped.len() != expected.len() {
+        return Err(SplatError::Process(format!("自适应原图定向抽帧数量不匹配：期望 {}，实际 {}", expected.len(), mapped.len())));
+    }
+    if mapped.iter().zip(&expected).any(|(actual, expected)| actual.source_index != expected.1.source_index) {
+        return Err(SplatError::Process("自适应原图定向抽帧的源帧映射与代理候选不一致".into()));
+    }
+    let output_count = jpeg_count(output_directory).await?;
+    if output_count != expected.len() as u64 {
+        return Err(SplatError::Process(format!("自适应原图定向抽帧 JPEG 数量不匹配：期望 {}，实际 {output_count}", expected.len())));
+    }
+    Ok(output_count)
+}
+
+fn selected_proxy_candidates(
+    selected: &[SelectedSourceFrame],
+    proxy_candidates: &[SourceFrameTimestamp],
+) -> Result<Vec<(usize, SourceFrameTimestamp)>> {
+    if selected.is_empty() { return Err(SplatError::Process("自适应抽帧没有可选源帧".into())); }
+    let selected_indices = selected.iter().map(|frame| frame.source_index).collect::<BTreeSet<_>>();
+    let expected = proxy_candidates.iter().copied().enumerate()
+        .filter(|(_, candidate)| selected_indices.contains(&candidate.source_index))
+        .collect::<Vec<_>>();
+    if expected.len() != selected_indices.len() {
+        return Err(SplatError::Process(format!(
+            "自适应关键帧不在代理候选映射中：请求 {}，匹配 {}",
+            selected_indices.len(), expected.len()
+        )));
+    }
+    Ok(expected)
+}
+
+fn selected_proxy_filter(analysis_fps: f64, expected: &[(usize, SourceFrameTimestamp)]) -> String {
+    let select = balanced_select_expression(expected);
+    format!(
+        "fps=fps={analysis_fps:.8}:round=near,select='{select}',scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease"
+    )
+}
+
+/// FFmpeg's expression parser may report its generic allocation error for a
+/// long left-associative `a+b+c+...` select expression. Compact consecutive
+/// candidate ordinals into ranges, then combine the terms as a balanced tree
+/// so both the token count and parser depth remain bounded on long clips.
+fn balanced_select_expression(expected: &[(usize, SourceFrameTimestamp)]) -> String {
+    let ordinals = expected.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>();
+    let mut terms = Vec::new();
+    let mut start = ordinals[0];
+    let mut end = start;
+    for ordinal in ordinals.into_iter().skip(1) {
+        if ordinal == end + 1 {
+            end = ordinal;
+        } else {
+            terms.push(select_range_term(start, end));
+            start = ordinal;
+            end = ordinal;
+        }
+    }
+    terms.push(select_range_term(start, end));
+    while terms.len() > 1 {
+        terms = terms.chunks(2).map(|pair| match pair {
+            [left, right] => format!("max({left}\\,{right})"),
+            [only] => only.clone(),
+            _ => unreachable!("chunks(2) never returns an empty slice"),
+        }).collect();
+    }
+    terms.pop().expect("selected proxy candidates are never empty")
+}
+
+fn select_range_term(start: usize, end: usize) -> String {
+    if start == end {
+        format!("eq(n\\,{start})")
+    } else {
+        format!("between(n\\,{start}\\,{end})")
+    }
+}
+
 async fn ensure_no_jpegs(directory: &Path) -> Result<()> {
     if jpeg_count(directory).await? != 0 {
         return Err(SplatError::Process(
@@ -224,6 +351,18 @@ async fn jpeg_count(directory: &Path) -> Result<u64> {
 mod tests {
     use super::*;
 
+    fn selected(source_index: u64, pts_seconds: f64) -> SelectedSourceFrame {
+        SelectedSourceFrame {
+            source_index,
+            pts_seconds,
+            reason: crate::video::SelectionReason::MotionTarget,
+            motion: 0.0,
+            inliers: 0,
+            grid_coverage: 0.0,
+            sharpness: 0.0,
+        }
+    }
+
     #[test]
     fn proxy_mapping_uses_ffmpeg_input_indices_not_average_fps() {
         let mapped = parse_proxy_mapping("0 0.000000\n2 0.101000\n3 0.500000\n").unwrap();
@@ -244,6 +383,41 @@ mod tests {
     fn proxy_buffer_limit_never_drops_below_the_safe_minimum() {
         let (frames, _) = proxy_buffered_frame_limit(3840, 2160);
         assert!(frames >= MIN_PROXY_BUFFERED_FRAMES);
+    }
+
+    #[test]
+    fn direct_original_filter_uses_proxy_candidate_order() {
+        let candidates = [
+            SourceFrameTimestamp { source_index: 4, pts_seconds: 0.0 },
+            SourceFrameTimestamp { source_index: 11, pts_seconds: 0.2 },
+            SourceFrameTimestamp { source_index: 18, pts_seconds: 0.4 },
+        ];
+        let selected = [selected(18, 0.4), selected(4, 0.0)];
+        let expected = selected_proxy_candidates(&selected, &candidates).unwrap();
+        assert_eq!(expected.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            selected_proxy_filter(6.0, &expected),
+            "fps=fps=6.00000000:round=near,select='max(eq(n\\,0)\\,eq(n\\,2))',scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease"
+        );
+    }
+
+    #[test]
+    fn direct_original_filter_compresses_ranges_and_bounds_expression_depth() {
+        let expected = [0, 1, 2, 7, 8, 15, 20, 21, 22, 23, 30]
+            .into_iter()
+            .map(|ordinal| (ordinal, SourceFrameTimestamp { source_index: ordinal as u64, pts_seconds: ordinal as f64 }))
+            .collect::<Vec<_>>();
+        let expression = balanced_select_expression(&expected);
+        assert!(expression.contains("between(n\\,0\\,2)"));
+        assert!(expression.contains("between(n\\,20\\,23)"));
+        assert!(expression.starts_with("max("));
+    }
+
+    #[test]
+    fn direct_original_filter_rejects_missing_proxy_mapping() {
+        let selected = [selected(9, 0.0)];
+        let error = selected_proxy_candidates(&selected, &[]).unwrap_err();
+        assert!(error.to_string().contains("代理候选映射"));
     }
 }
 

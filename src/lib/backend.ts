@@ -13,6 +13,7 @@ import type {
   BrushTrainingPreset,
   GsplatSplatCap,
   TrainingBackend,
+  PhotometricMode,
   FramePlan,
   PipelineEvent,
   PipelineResult,
@@ -70,6 +71,9 @@ export async function setTrainingBackend(backend: TrainingBackend): Promise<AppS
 }
 export async function setGsplatSplatCap(cap: GsplatSplatCap): Promise<AppSettingsLike> {
   return invoke("set_gsplat_splat_cap", { cap }) as Promise<AppSettingsLike>;
+}
+export async function setPhotometricMode(mode: PhotometricMode): Promise<AppSettingsLike> {
+  return invoke("set_photometric_mode", { mode }) as Promise<AppSettingsLike>;
 }
 
 /**

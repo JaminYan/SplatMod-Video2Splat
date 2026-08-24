@@ -8,6 +8,7 @@ import {
   setBrushTrainingPreset as setBrushTrainingPresetInvoke,
   setGsplatSplatCap as setGsplatSplatCapInvoke,
   setTrainingBackend as setTrainingBackendInvoke,
+  setPhotometricMode as setPhotometricModeInvoke,
 } from "../lib/backend";
 import type {
   ColmapBackend,
@@ -19,6 +20,7 @@ import type {
   BrushTrainingPreset,
   GsplatSplatCap,
   TrainingBackend,
+  PhotometricMode,
   FramePlan,
   PipelineEvent,
   PipelineResult,
@@ -62,6 +64,7 @@ interface AppState {
   setBrushTrainingPreset: (preset: BrushTrainingPreset) => Promise<void>;
   setGsplatSplatCap: (cap: GsplatSplatCap) => Promise<void>;
   setTrainingBackend: (backend: TrainingBackend) => Promise<void>;
+  setPhotometricMode: (mode: PhotometricMode) => Promise<void>;
   downloadCudaColmap: () => Promise<void>;
   clearSettingsNotice: () => void;
   setPhase: (phase: RunPhase) => void;
@@ -172,6 +175,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!settings || settings.settings.gsplatSplatCap === cap) return;
     const next = await setGsplatSplatCapInvoke(cap);
     set({ settings: { ...settings, settings: next }, settingsNotice: `gsplat splat 上限已切换为 ${cap === "auto" ? "自动安全" : cap.toUpperCase()}。` });
+  },
+  setPhotometricMode: async (mode) => {
+    const { settings } = get();
+    if (!settings || settings.settings.photometricMode === mode) return;
+    const next = await setPhotometricModeInvoke(mode);
+    set({ settings: { ...settings, settings: next }, settingsNotice: mode === "ppisp" ? "PPISP 实验模式已开启；训练将使用单帧批次。" : "光度一致性已关闭，使用 M0 基线。" });
   },
   setTrainingBackend: async (backend) => {
     const { settings } = get();

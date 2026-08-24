@@ -21,6 +21,14 @@ pub enum TrainingBackend {
     Gsplat,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PhotometricMode {
+    #[default]
+    None,
+    Ppisp,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrainingRequest {
     pub dataset_root: PathBuf,
@@ -29,6 +37,7 @@ pub struct TrainingRequest {
     pub max_resolution: u32,
     pub max_splats: u32,
     pub seed: u64,
+    pub photometric_mode: PhotometricMode,
     pub log_path: PathBuf,
 }
 
@@ -197,7 +206,12 @@ async fn train_gsplat(
         "maxSteps": request.total_steps,
         "maxResolution": request.max_resolution,
         "maxSplats": request.max_splats,
-        "batchSize": 4,
+        "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp => 1 },
+        // M1 is opt-in until it has passed the documented three-material gate.
+        "photometricMode": match request.photometric_mode { PhotometricMode::None => "none", PhotometricMode::Ppisp => "ppisp" },
+        "ppispController": true,
+        "ppispControllerDistillation": true,
+        "canonicalExposure": "median",
         "seed": request.seed,
         "saveCheckpoints": false,
         "diagnosticsDir": request.log_path.parent().unwrap_or(&request.output_directory),

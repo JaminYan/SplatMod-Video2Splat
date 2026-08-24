@@ -5,7 +5,7 @@ use crate::{
             ColmapComputeMode, ColmapFeatureOptions, ColmapMatchingOptions, IncrementalBaBackend,
             IncrementalMapperOptions, MapperBaMode,
         },
-        ffmpeg::{extract_proxy_frames, extract_selected_frames, extract_uniform_frames},
+        ffmpeg::{extract_proxy_frames, extract_selected_frames, extract_selected_proxy_frames, extract_uniform_frames},
         ffprobe::probe_video,
         training::{self, TrainingBackend, TrainingRequest},
         ColmapBackend, CudaColmapFlavor, EngineKind, EnginePaths, FfmpegHwAccel,
@@ -307,6 +307,7 @@ pub struct PipelineRunner {
     ffmpeg_hw_accel: FfmpegHwAccel,
     brush_training_preset: crate::presets::BrushTrainingPreset,
     gsplat_splat_cap: crate::presets::GsplatSplatCap,
+    photometric_mode: crate::engines::training::PhotometricMode,
     training_backend: TrainingBackend,
     auto_bridge_frames: bool,
     process_manager: ProcessManager,
@@ -321,6 +322,7 @@ impl PipelineRunner {
         ffmpeg_hw_accel: FfmpegHwAccel,
         brush_training_preset: crate::presets::BrushTrainingPreset,
         gsplat_splat_cap: crate::presets::GsplatSplatCap,
+        photometric_mode: crate::engines::training::PhotometricMode,
         training_backend: TrainingBackend,
         auto_bridge_frames: bool,
         emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
@@ -333,6 +335,7 @@ impl PipelineRunner {
             ffmpeg_hw_accel,
             brush_training_preset,
             gsplat_splat_cap,
+            photometric_mode,
             training_backend,
             auto_bridge_frames,
             process_manager: ProcessManager::new(),
@@ -423,6 +426,7 @@ impl PipelineRunner {
         let mut plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
         let mut adaptive_selected = None;
         let mut adaptive_proxy_frames = None;
+        let mut adaptive_proxy_samples = None;
         let mut adaptive_profile = None;
         let mut adaptive_selection_tier = None;
         let mut adaptive_selection_target = None;
@@ -580,6 +584,7 @@ impl PipelineRunner {
                             adaptive_selection_tier = Some(selection_tier);
                             adaptive_selection_target = Some(minimum_selected);
                             adaptive_proxy_frames = Some(proxy_frames.clone());
+                            adaptive_proxy_samples = Some(report.frames.clone());
                             if selected.len() >= minimum_selected {
                                 let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
                                 adaptive.proxy_candidates = Some(proxy_count as u64);
@@ -841,11 +846,17 @@ impl PipelineRunner {
         let extract_started = Instant::now();
         let extracted_frames = if let Some(selected) = adaptive_selected.as_deref() {
             let candidate_total = plan.proxy_candidates.unwrap_or(selected.len() as u64);
-            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在以 {:.1} FPS 重跑 {candidate_total} 张原图候选，并保留 {} 张关键帧", plan.analysis_fps.unwrap_or(6.0), selected.len()));
-            let count = extract_selected_frames(&self.engines.ffmpeg, input, output,
-                &output.parent().expect("project frames directory has parent").join("work").join("adaptive-selected"), selected,
+            let proxy_samples = adaptive_proxy_samples.as_deref().ok_or_else(|| {
+                SplatError::Process("自适应关键帧缺少代理候选映射，无法安全定向抽取原图".into())
+            })?;
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在以 {:.1} FPS 重跑 {candidate_total} 个原图采样点，并定向编码 {} 张关键帧", plan.analysis_fps.unwrap_or(6.0), selected.len()));
+            self.events.send(PipelineStage::ExtractingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(0.0), false,
+                format!("原图定向抽帧：跳过 {} 张未入选候选 JPEG 的编码与磁盘写入", candidate_total.saturating_sub(selected.len() as u64)),
+                Some(selected.len() as u64), Some(candidate_total), Some("帧"));
+            let count = extract_selected_proxy_frames(&self.engines.ffmpeg, input, output,
+                &output.parent().expect("project frames directory has parent").join("work").join("adaptive-selected"), selected, proxy_samples,
                 plan.analysis_fps.unwrap_or(6.0), self.ffmpeg_hw_accel, logs.map(|path| path.join("ffmpeg-adaptive-selected.log")), &self.process_manager,
-                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(candidate_total), ObserverMode::Ffmpeg))).await?;
+                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
             selected_extraction_ms = extract_started.elapsed().as_millis() as u64;
             count
         } else {
@@ -1696,6 +1707,7 @@ impl PipelineRunner {
                     TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
                 },
                 seed: 42,
+                photometric_mode: self.photometric_mode,
                 log_path: paths.logs.join(match self.training_backend {
                     TrainingBackend::Brush => "brush.log",
                     TrainingBackend::Gsplat => "gsplat.log",

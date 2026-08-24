@@ -15,6 +15,7 @@ export type FfmpegHwAccel = "off" | "auto" | "d3d11va" | "cuda";
 export type BrushTrainingPreset = "a" | "b" | "c";
 export type GsplatSplatCap = "auto" | "1m" | "2m" | "4m";
 export type TrainingBackend = "brush" | "gsplat";
+export type PhotometricMode = "none" | "ppisp";
 export interface EngineStatus {
   kind: EngineKind;
   path: string;
@@ -37,6 +38,7 @@ export interface AppSettingsLike {
   brushTrainingPreset: BrushTrainingPreset;
   trainingBackend: TrainingBackend;
   gsplatSplatCap: GsplatSplatCap;
+  photometricMode: PhotometricMode;
 }
 export interface EffectiveSettings {
   settings: AppSettingsLike;

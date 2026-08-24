@@ -212,6 +212,7 @@ pub async fn start_pipeline(
         settings.ffmpeg_hw_accel,
         settings.brush_training_preset,
         settings.gsplat_splat_cap,
+        settings.photometric_mode,
         settings.training_backend,
         auto_bridge_frames,
         move |event| {
@@ -299,6 +300,10 @@ pub async fn set_brush_training_preset(preset: BrushTrainingPreset) -> Result<Ap
 #[tauri::command]
 pub async fn set_gsplat_splat_cap(cap: GsplatSplatCap) -> Result<AppSettings> {
     catalog::save_gsplat_splat_cap(cap).await
+}
+#[tauri::command]
+pub async fn set_photometric_mode(mode: crate::engines::training::PhotometricMode) -> Result<AppSettings> {
+    catalog::save_photometric_mode(mode).await
 }
 #[tauri::command]
 pub async fn set_training_backend(

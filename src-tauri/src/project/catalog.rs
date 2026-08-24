@@ -1,6 +1,6 @@
 use crate::{
     engines::{
-        ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode, TrainingBackend,
+    ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode, TrainingBackend, PhotometricMode,
     },
     error::{Result, SplatError},
     presets::{BrushTrainingPreset, GsplatSplatCap},
@@ -36,6 +36,8 @@ pub struct AppSettings {
     pub training_backend: TrainingBackend,
     #[serde(default)]
     pub gsplat_splat_cap: GsplatSplatCap,
+    #[serde(default)]
+    pub photometric_mode: PhotometricMode,
 }
 impl Default for AppSettings {
     fn default() -> Self {
@@ -49,6 +51,7 @@ impl Default for AppSettings {
             brush_training_preset: BrushTrainingPreset::A,
             training_backend: TrainingBackend::Brush,
             gsplat_splat_cap: GsplatSplatCap::Auto,
+            photometric_mode: PhotometricMode::None,
         }
     }
 }
@@ -165,6 +168,7 @@ pub async fn load_settings() -> Result<AppSettings> {
                         brush_training_preset: BrushTrainingPreset::A,
                         training_backend: TrainingBackend::Brush,
                         gsplat_splat_cap: GsplatSplatCap::Auto,
+                        photometric_mode: PhotometricMode::None,
                     });
                 }
             }
@@ -180,6 +184,7 @@ pub async fn load_settings() -> Result<AppSettings> {
         brush_training_preset: BrushTrainingPreset::A,
         training_backend: TrainingBackend::Brush,
         gsplat_splat_cap: GsplatSplatCap::Auto,
+        photometric_mode: PhotometricMode::None,
     })
 }
 pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
@@ -228,6 +233,12 @@ pub async fn save_training_backend(backend: TrainingBackend) -> Result<AppSettin
 pub async fn save_gsplat_splat_cap(cap: GsplatSplatCap) -> Result<AppSettings> {
     let mut settings = load_settings().await?;
     settings.gsplat_splat_cap = cap;
+    persist(&settings).await?;
+    Ok(settings)
+}
+pub async fn save_photometric_mode(mode: PhotometricMode) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.photometric_mode = mode;
     persist(&settings).await?;
     Ok(settings)
 }
