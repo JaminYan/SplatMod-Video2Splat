@@ -206,6 +206,26 @@ struct AdaptiveProxyDiagnostics {
     median_grid_coverage: f64,
     median_three_view_tracks: f64,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveAttemptReport {
+    selection_target: Option<u64>,
+    final_tier: Option<String>,
+    fallback_reason: Option<String>,
+    attempts: Vec<AdaptiveAttemptRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveAttemptRecord {
+    name: String,
+    input_frames: u64,
+    registered_images: Option<u64>,
+    registered_ratio: Option<f64>,
+    accepted: bool,
+    detail: String,
+}
 #[derive(Clone)]
 struct EventSink {
     emit: Arc<dyn Fn(PipelineEvent) + Send + Sync>,
@@ -407,6 +427,7 @@ impl PipelineRunner {
         let mut adaptive_selection_tier = None;
         let mut adaptive_selection_target = None;
         let mut adaptive_reason = None;
+        let mut adaptive_attempts = Vec::new();
         let mut frame_analysis_ms = 0;
         let mut adaptive_planning_ms = 0;
         let mut selected_extraction_ms = 0;
@@ -458,6 +479,11 @@ impl PipelineRunner {
                             let mut selection_profile = profile;
                             let mut selection_tier = "strict";
                             let mut selected = select_adaptive_frames(&proxy_frames, selection_profile);
+                            adaptive_attempts.push(AdaptiveAttemptRecord {
+                                name: "strict".into(), input_frames: selected.len() as u64,
+                                registered_images: None, registered_ratio: None, accepted: selected.len() >= minimum_selected,
+                                detail: format!("代理选帧 {} / {}", selected.len(), minimum_selected),
+                            });
                             // 精细档的采样密度（8 FPS、80 ms、较小目标位移）不应
                             // 与更严的代理观测门槛绑定。代理只负责筛候选；当 strict
                             // 无法形成可初始化序列时，逐级放宽底线，再由真实 COLMAP
@@ -471,6 +497,11 @@ impl PipelineRunner {
                                 selection_profile.min_three_view_ratio = 0.35;
                                 selected = select_adaptive_frames(&proxy_frames, selection_profile);
                                 selection_tier = "relaxed";
+                                adaptive_attempts.push(AdaptiveAttemptRecord {
+                                    name: "relaxed".into(), input_frames: selected.len() as u64,
+                                    registered_images: None, registered_ratio: None, accepted: selected.len() >= minimum_selected,
+                                    detail: format!("代理选帧 {} / {}", selected.len(), minimum_selected),
+                                });
                                 self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.9), false,
                                     format!("精细代理 strict 未达到覆盖预算，切换 relaxed 最低可观测门：{} / {} 个关键帧", selected.len(), minimum_selected),
                                     Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
@@ -485,6 +516,11 @@ impl PipelineRunner {
                                 selection_profile.min_three_view_ratio = 0.35;
                                 selected = select_adaptive_frames(&proxy_frames, selection_profile);
                                 selection_tier = "minimumObservable";
+                                adaptive_attempts.push(AdaptiveAttemptRecord {
+                                    name: "minimumObservable".into(), input_frames: selected.len() as u64,
+                                    registered_images: None, registered_ratio: None, accepted: selected.len() >= minimum_selected,
+                                    detail: format!("代理选帧 {} / {}", selected.len(), minimum_selected),
+                                });
                                 self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.95), false,
                                     format!("精细代理 relaxed 未达到覆盖预算，切换 minimum-observable 门：{} / {} 个关键帧", selected.len(), minimum_selected),
                                     Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
@@ -545,6 +581,11 @@ impl PipelineRunner {
                                     Ok((_, report)) if report.quality != ReconstructionQuality::Failed
                                         && report.registered_ratio >= 0.80
                                         && report.registered_images * 4 >= selected.len() as u64 * 3 => {
+                                        adaptive_attempts.push(AdaptiveAttemptRecord {
+                                            name: "nearBudgetValidation".into(), input_frames: selected.len() as u64,
+                                            registered_images: Some(report.registered_images), registered_ratio: Some(report.registered_ratio),
+                                            accepted: true, detail: "隔离 Ceres 验证通过".into(),
+                                        });
                                         let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
                                         adaptive.proxy_candidates = Some(proxy_count as u64);
                                         adaptive.effective_fps = Some(selected.len() as f64 / video.duration.max(0.001));
@@ -558,6 +599,11 @@ impl PipelineRunner {
                                             Some(report.registered_images), Some(report.input_images), Some("帧"));
                                     }
                                     Ok((validation_model, report)) => {
+                                        adaptive_attempts.push(AdaptiveAttemptRecord {
+                                            name: "nearBudgetValidation".into(), input_frames: selected.len() as u64,
+                                            registered_images: Some(report.registered_images), registered_ratio: Some(report.registered_ratio),
+                                            accepted: false, detail: "隔离 Ceres 验证未达到接受门槛".into(),
+                                        });
                                         let planned = match logs {
                                             Some(log_directory) => match write_near_budget_validation_diagnostics(
                                                 log_directory, &validation_model, &selected, &proxy_frames
@@ -623,6 +669,9 @@ impl PipelineRunner {
                                             Some((repair_selection, Ok((_, repair_report)))) if repair_report.quality != ReconstructionQuality::Failed
                                                 && repair_report.registered_ratio >= 0.80
                                                 && repair_report.registered_images * 4 >= repair_selection.len() as u64 * 3 => {
+                                                adaptive_attempts.push(AdaptiveAttemptRecord { name: "bridgeRepair".into(), input_frames: repair_selection.len() as u64,
+                                                    registered_images: Some(repair_report.registered_images), registered_ratio: Some(repair_report.registered_ratio),
+                                                    accepted: true, detail: "桥接 repair 通过".into() });
                                                 let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
                                                 adaptive.proxy_candidates = Some(proxy_count as u64);
                                                 adaptive.effective_fps = Some(repair_selection.len() as f64 / video.duration.max(0.001));
@@ -635,10 +684,70 @@ impl PipelineRunner {
                                                         repair_report.input_images, repair_report.registered_ratio * 100.0),
                                                     Some(repair_report.registered_images), Some(repair_report.input_images), Some("帧"));
                                             }
-                                            Some((_, Ok((_, repair_report)))) => adaptive_reason = Some(format!(
-                                                "精细近预算桥接 repair 未通过：注册 {}/{}（{:.1}%）",
-                                                repair_report.registered_images, repair_report.input_images, repair_report.registered_ratio * 100.0
-                                            )),
+                                            Some((repair_selection, Ok((_, repair_report)))) => {
+                                                adaptive_attempts.push(AdaptiveAttemptRecord { name: "bridgeRepair".into(), input_frames: repair_selection.len() as u64,
+                                                    registered_images: Some(repair_report.registered_images), registered_ratio: Some(repair_report.registered_ratio),
+                                                    accepted: false, detail: "桥接 repair 未达到接受门槛".into() });
+                                                let dense_selection = densify_with_proxy_anchors(&repair_selection, &proxy_frames, 0.5);
+                                                let dense_root = project.join("work").join("adaptive-density-validation");
+                                                let dense_frames = dense_root.join("frames");
+                                                let dense_database = dense_root.join("database.db");
+                                                let dense_sparse = dense_root.join("sparse");
+                                                tokio::fs::create_dir_all(&dense_root).await?;
+                                                self.events.stage(PipelineStage::SelectingFrames, 0.98,
+                                                    format!("桥接 repair 未通过，正在验证 {:.1} FPS 自适应密度升级（{} 张）", 2.0, dense_selection.len()));
+                                                let dense_result = async {
+                                                    extract_selected_frames(&self.engines.ffmpeg, input, &dense_frames, &dense_root.join("ffmpeg"),
+                                                        &dense_selection, self.ffmpeg_hw_accel,
+                                                        logs.map(|path| path.join("ffmpeg-adaptive-density-validation.log")), &self.process_manager,
+                                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
+                                                            Some(dense_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                                    let compute = match self.colmap_backend {
+                                                        ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+                                                        ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
+                                                    };
+                                                    let executable = self.colmap_executable().to_path_buf();
+                                                    let dense_log = dense_root.join("colmap.log");
+                                                    colmap::extract_features(&executable, &dense_database, &dense_frames,
+                                                        ColmapFeatureOptions { compute }, dense_log.clone(), &self.process_manager,
+                                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                                            Some(dense_selection.len() as u64), ObserverMode::BracketProgress))).await?;
+                                                    colmap::match_sequential(&executable, &dense_database,
+                                                        ColmapMatchingOptions { compute, overlap: 10 }, dense_log.clone(), &self.process_manager,
+                                                        Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
+                                                            Some(dense_selection.len() as u64), ObserverMode::BracketProgress))).await?;
+                                                    run_ceres_mapper(&executable, &dense_database, &dense_frames, &dense_sparse, dense_log,
+                                                        &self.process_manager, Some(self.process_observer(PipelineStage::SelectingFrames,
+                                                            PipelineEngine::Colmap, Some(dense_selection.len() as u64), ObserverMode::Mapper))).await
+                                                }.await;
+                                                match dense_result {
+                                                    Ok((_, dense_report)) if dense_report.quality != ReconstructionQuality::Failed
+                                                        && dense_report.registered_ratio >= 0.80
+                                                        && dense_report.registered_images * 4 >= dense_selection.len() as u64 * 3 => {
+                                                        adaptive_attempts.push(AdaptiveAttemptRecord { name: "densityValidation".into(), input_frames: dense_selection.len() as u64,
+                                                            registered_images: Some(dense_report.registered_images), registered_ratio: Some(dense_report.registered_ratio),
+                                                            accepted: true, detail: "中等密度验证通过".into() });
+                                                        let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
+                                                        adaptive.proxy_candidates = Some(proxy_count as u64);
+                                                        adaptive.effective_fps = Some(dense_selection.len() as f64 / video.duration.max(0.001));
+                                                        adaptive.estimated_frames = dense_selection.len() as u64;
+                                                        plan = adaptive;
+                                                        adaptive_selected = Some(dense_selection);
+                                                        adaptive_selection_tier = Some("densityValidated");
+                                                        self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(1.0), false,
+                                                            format!("自适应密度验证通过：注册 {}/{}（{:.1}%）", dense_report.registered_images,
+                                                                dense_report.input_images, dense_report.registered_ratio * 100.0),
+                                                            Some(dense_report.registered_images), Some(dense_report.input_images), Some("帧"));
+                                                    }
+                                                    Ok((_, dense_report)) => adaptive_reason = Some(format!(
+                                                        "精细自适应密度验证未通过：注册 {}/{}（{:.1}%）；桥接 repair 为 {}/{}（{:.1}%）",
+                                                        dense_report.registered_images, dense_report.input_images, dense_report.registered_ratio * 100.0,
+                                                        repair_report.registered_images, repair_report.input_images, repair_report.registered_ratio * 100.0
+                                                    )),
+                                                    Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
+                                                    Err(error) => adaptive_reason = Some(format!("精细自适应密度验证失败：{error}")),
+                                                }
+                                            }
                                             Some((_, Err(SplatError::Cancelled))) => return Err(SplatError::Cancelled),
                                             Some((_, Err(error))) => adaptive_reason = Some(format!("精细近预算桥接 repair 失败：{error}")),
                                             None => adaptive_reason = Some(format!(
@@ -732,6 +841,16 @@ impl PipelineRunner {
                 "strategy={strategy}\nadaptive_selection_tier={adaptive_tier}\nadaptive_selection_target={adaptive_target}\nsource_fps={:.6}\nproxy_candidates={}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
                 video.fps, plan.proxy_candidates.unwrap_or(0), selection.retained
             )).await?;
+            let attempt_report = AdaptiveAttemptReport {
+                selection_target: adaptive_selection_target.map(|value| value as u64),
+                final_tier: adaptive_selection_tier.map(str::to_owned),
+                fallback_reason: adaptive_reason.clone(),
+                attempts: adaptive_attempts,
+            };
+            tokio::fs::write(
+                log_directory.join("adaptive-attempts.json"),
+                serde_json::to_vec_pretty(&attempt_report)?,
+            ).await?;
             if let Some(selected) = adaptive_selected.as_deref() {
                 let entries = selected.iter().enumerate().map(|(index, frame)| serde_json::json!({
                     "outputFile": format!("frame_{:06}.jpg", index + 1),
@@ -2179,6 +2298,37 @@ async fn write_near_budget_validation_diagnostics(
     let planned = plan.planned_frames.len() as u64;
     tokio::fs::write(logs.join("adaptive-near-budget-bridge-plan.json"), serde_json::to_vec_pretty(&plan)?).await?;
     Ok(planned)
+}
+
+/// Adds PTS-preserving medium-density anchors from the already decoded proxy
+/// map. This is a bounded escalation after targeted bridges fail; it avoids
+/// inventing timestamps from average FPS and remains cheaper than 4 FPS fixed.
+fn densify_with_proxy_anchors(
+    selected: &[SelectedSourceFrame],
+    proxy: &[ProxyFrame],
+    spacing_seconds: f64,
+) -> Vec<SelectedSourceFrame> {
+    let mut result = selected.to_vec();
+    let start = proxy.first().map_or(0.0, |frame| frame.pts_seconds);
+    let end = proxy.last().map_or(start, |frame| frame.pts_seconds);
+    let mut target = start;
+    while target <= end + spacing_seconds * 0.25 {
+        if let Some(frame) = proxy.iter().min_by(|left, right| {
+            (left.pts_seconds - target).abs().partial_cmp(&(right.pts_seconds - target).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            if !result.iter().any(|existing| existing.source_index == frame.source_index) {
+                result.push(SelectedSourceFrame {
+                    source_index: frame.source_index, pts_seconds: frame.pts_seconds,
+                    reason: SelectionReason::Bridge, motion: frame.background_motion,
+                    inliers: frame.inliers, grid_coverage: frame.grid_coverage, sharpness: frame.sharpness,
+                });
+            }
+        }
+        target += spacing_seconds;
+    }
+    result.sort_by_key(|frame| frame.source_index);
+    result
 }
 
 async fn read_adaptive_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {
