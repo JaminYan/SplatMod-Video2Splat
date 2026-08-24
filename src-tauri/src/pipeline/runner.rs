@@ -26,7 +26,7 @@ use crate::{
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
     video::{
-        adaptive_plan, analyze_proxy_images_with_progress, passes_proxy_geometry, select_adaptive_frames,
+        adaptive_plan, analyze_prepared_proxy_images_with_progress, passes_proxy_geometry, prepare_proxy_tracking_pyramids_with_progress, proxy_analysis_worker_count, select_adaptive_frames,
         AdaptiveFrameProfile, FramePlan, FrameSelectionReport, FrameSelectionStrategy,
         ProxyFrame, SelectedSourceFrame, SelectionReason, UniformRatioFrameSelection, VideoInfo,
         select_useful_frames_parallel_with_progress,
@@ -429,6 +429,10 @@ impl PipelineRunner {
         let mut adaptive_reason = None;
         let mut adaptive_attempts = Vec::new();
         let mut frame_analysis_ms = 0;
+        let mut proxy_analysis_workers = None;
+        let mut proxy_jpeg_decode_ms = 0;
+        let mut proxy_tracking_prepare_ms = 0;
+        let mut proxy_grid_analysis_ms = 0;
         let mut adaptive_planning_ms = 0;
         let mut selected_extraction_ms = 0;
         if let Some(profile) = AdaptiveFrameProfile::for_quality(quality, video.fps) {
@@ -452,22 +456,69 @@ impl PipelineRunner {
                     let proxy_directory = proxy_dir.clone();
                     let proxy_source_frames = report.frames.clone();
                     let analysis_events = self.events.clone();
+                    let analysis_workers = proxy_analysis_worker_count();
+                    proxy_analysis_workers = Some(analysis_workers);
+                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info,
+                        Some(0.0), false, format!("CPU 代理网格分析：{analysis_workers} 个工作线程"),
+                        Some(analysis_workers as u64), Some(analysis_workers as u64), Some("线程"));
                     let analysis = tokio::task::spawn_blocking(move || {
+                        let proxy_decode_started = Instant::now();
                         let mut paths = std::fs::read_dir(proxy_directory)?.filter_map(|entry| entry.ok().map(|entry| entry.path()))
                             .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))).collect::<Vec<_>>();
                         paths.sort();
                         let images = paths.into_iter().map(|path| image::open(&path).map_err(|error| SplatError::Process(format!("无法读取代理图 {}：{error}", path.display())))).collect::<Result<Vec<_>>>()?;
-                        analyze_proxy_images_with_progress(&proxy_source_frames, &images, |current, total| {
+                        let proxy_jpeg_decode_ms = proxy_decode_started.elapsed().as_millis() as u64;
+                        let pool = rayon::ThreadPoolBuilder::new().num_threads(analysis_workers).build()
+                            .map_err(|error| SplatError::Process(format!("无法创建 CPU 代理分析线程池：{error}")))?;
+                        analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.0), false,
+                            format!("正在并行准备 {} 张代理灰度图与跟踪金字塔", images.len()), Some(0), Some(images.len() as u64), Some("帧"));
+                        let tracking_prepare_started = Instant::now();
+                        let tracking_pyramids = pool.install(|| prepare_proxy_tracking_pyramids_with_progress(&images, |current, total| {
                             if current == total || current % 5 == 0 {
-                                analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(current as f32 / total.max(1) as f32), false,
+                                analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.25 * current as f32 / total.max(1) as f32), false,
+                                    format!("正在并行准备代理灰度图与跟踪金字塔 {current} / {total}"), Some(current), Some(total), Some("帧"));
+                            }
+                        }));
+                        let proxy_tracking_prepare_ms = tracking_prepare_started.elapsed().as_millis() as u64;
+                        analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.25), false,
+                            format!("代理灰度图与跟踪金字塔准备完成：{} 张", images.len()), Some(images.len() as u64), Some(images.len() as u64), Some("帧"));
+                        let grid_analysis_started = Instant::now();
+                        let proxy_frames = pool.install(|| analyze_prepared_proxy_images_with_progress(&proxy_source_frames, &images, &tracking_pyramids, |current, total| {
+                            if current == total || current % 5 == 0 {
+                                analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.25 + 0.75 * current as f32 / total.max(1) as f32), false,
                                     format!("正在分析代理画面 {current} / {total}"), Some(current), Some(total), Some("帧"));
                             }
-                        })
+                        }))?;
+                        Ok::<_, SplatError>((proxy_frames, proxy_jpeg_decode_ms, proxy_tracking_prepare_ms, grid_analysis_started.elapsed().as_millis() as u64))
                     }).await.map_err(|error| SplatError::Process(format!("代理分析任务异常结束：{error}")))?;
                     frame_analysis_ms = analysis_started.elapsed().as_millis() as u64;
                     match analysis {
-                        Ok(proxy_frames) => {
+                        Ok((proxy_frames, jpeg_decode_ms, tracking_prepare_ms, grid_analysis_ms)) => {
+                            proxy_jpeg_decode_ms = jpeg_decode_ms;
+                            proxy_tracking_prepare_ms = tracking_prepare_ms;
+                            proxy_grid_analysis_ms = grid_analysis_ms;
                             let proxy_count = proxy_frames.len();
+                            let analysis_seconds = proxy_grid_analysis_ms as f64 / 1_000.0;
+                            let pair_count = proxy_count.saturating_sub(1) as u64;
+                            let pairs_per_second = if analysis_seconds > 0.0 {
+                                pair_count as f64 / analysis_seconds
+                            } else {
+                                0.0
+                            };
+                            self.events.send(
+                                PipelineStage::SelectingFrames,
+                                Some(PipelineEngine::System),
+                                EventKind::Log,
+                                EventLevel::Info,
+                                Some(0.0),
+                                false,
+                                format!(
+                                    "CPU 网格匹配基准：{proxy_count} 帧、{pair_count} 对，{analysis_seconds:.2} 秒，{pairs_per_second:.2} 对/秒（{analysis_workers} 线程；JPEG 读取 {proxy_jpeg_decode_ms} ms；金字塔准备 {proxy_tracking_prepare_ms} ms；总阶段 {frame_analysis_ms} ms）"
+                                ),
+                                Some(pair_count),
+                                Some(pair_count),
+                                Some("帧对"),
+                            );
                             // 精细档以覆盖预算而不是“能否凑够一个初始化对”作为
                             // 自适应成功条件。20% 的锚点预算保留了明显的压缩空间，
                             // 同时避免 20 秒素材只有 9 张图就进入训练。
@@ -553,10 +604,10 @@ impl PipelineRunner {
                                     format!("精细自适应接近覆盖预算（{} / {}），正在执行隔离 COLMAP 验证", selected.len(), minimum_selected));
                                 let validation = async {
                                     extract_selected_frames(&self.engines.ffmpeg, input, &validation_frames,
-                                        &validation_root.join("ffmpeg"), &selected, self.ffmpeg_hw_accel,
+                                        &validation_root.join("ffmpeg"), &selected, profile.analysis_fps, self.ffmpeg_hw_accel,
                                         logs.map(|path| path.join("ffmpeg-adaptive-near-budget-validation.log")), &self.process_manager,
                                         Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                            Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                            Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
                                     let validation_backend = self.colmap_backend;
                                     let validation_compute = match validation_backend {
                                         ColmapBackend::Cpu => ColmapComputeMode::Cpu,
@@ -641,10 +692,10 @@ impl PipelineRunner {
                                                 format!("近预算桥接 repair：正在验证 {} 张关键帧", repair_selection.len()));
                                             let repair_result = async {
                                                 extract_selected_frames(&self.engines.ffmpeg, input, &repair_frames, &repair_root.join("ffmpeg"),
-                                                    &repair_selection, self.ffmpeg_hw_accel,
+                                                    &repair_selection, profile.analysis_fps, self.ffmpeg_hw_accel,
                                                     Some(log_directory.join("ffmpeg-adaptive-near-budget-bridge-repair.log")), &self.process_manager,
                                                     Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                                        Some(repair_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                                        Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
                                                 let compute = match self.colmap_backend {
                                                     ColmapBackend::Cpu => ColmapComputeMode::Cpu,
                                                     ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
@@ -698,10 +749,10 @@ impl PipelineRunner {
                                                     format!("桥接 repair 未通过，正在验证 {:.1} FPS 自适应密度升级（{} 张）", 2.0, dense_selection.len()));
                                                 let dense_result = async {
                                                     extract_selected_frames(&self.engines.ffmpeg, input, &dense_frames, &dense_root.join("ffmpeg"),
-                                                        &dense_selection, self.ffmpeg_hw_accel,
+                                                        &dense_selection, profile.analysis_fps, self.ffmpeg_hw_accel,
                                                         logs.map(|path| path.join("ffmpeg-adaptive-density-validation.log")), &self.process_manager,
                                                         Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                                            Some(dense_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
+                                                            Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
                                                     let compute = match self.colmap_backend {
                                                         ColmapBackend::Cpu => ColmapComputeMode::Cpu,
                                                         ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
@@ -789,11 +840,12 @@ impl PipelineRunner {
         });
         let extract_started = Instant::now();
         let extracted_frames = if let Some(selected) = adaptive_selected.as_deref() {
-            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在按源帧索引提取 {} 张原图关键帧", selected.len()));
+            let candidate_total = plan.proxy_candidates.unwrap_or(selected.len() as u64);
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在以 {:.1} FPS 重跑 {candidate_total} 张原图候选，并保留 {} 张关键帧", plan.analysis_fps.unwrap_or(6.0), selected.len()));
             let count = extract_selected_frames(&self.engines.ffmpeg, input, output,
                 &output.parent().expect("project frames directory has parent").join("work").join("adaptive-selected"), selected,
-                self.ffmpeg_hw_accel, logs.map(|path| path.join("ffmpeg-adaptive-selected.log")), &self.process_manager,
-                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
+                plan.analysis_fps.unwrap_or(6.0), self.ffmpeg_hw_accel, logs.map(|path| path.join("ffmpeg-adaptive-selected.log")), &self.process_manager,
+                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(candidate_total), ObserverMode::Ffmpeg))).await?;
             selected_extraction_ms = extract_started.elapsed().as_millis() as u64;
             count
         } else {
@@ -837,9 +889,17 @@ impl PipelineRunner {
             let fallback = adaptive_reason.as_deref().unwrap_or("none");
             let adaptive_tier = adaptive_selection_tier.unwrap_or("notApplicable");
             let adaptive_target = adaptive_selection_target.unwrap_or(0);
+            let analysis_workers = proxy_analysis_workers.unwrap_or(0);
+            let proxy_candidates = plan.proxy_candidates.unwrap_or(0);
+            let pair_count = proxy_candidates.saturating_sub(1);
+            let pairs_per_second = if proxy_grid_analysis_ms > 0 {
+                pair_count as f64 / (proxy_grid_analysis_ms as f64 / 1_000.0)
+            } else {
+                0.0
+            };
             tokio::fs::write(log_directory.join("adaptive-frame-selection.log"), format!(
-                "strategy={strategy}\nadaptive_selection_tier={adaptive_tier}\nadaptive_selection_target={adaptive_target}\nsource_fps={:.6}\nproxy_candidates={}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
-                video.fps, plan.proxy_candidates.unwrap_or(0), selection.retained
+                "strategy={strategy}\nadaptive_selection_tier={adaptive_tier}\nadaptive_selection_target={adaptive_target}\nsource_fps={:.6}\nproxy_candidates={proxy_candidates}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nproxy_analysis_workers={analysis_workers}\nproxy_analysis_pairs={pair_count}\nproxy_jpeg_decode_ms={proxy_jpeg_decode_ms}\nproxy_tracking_prepare_ms={proxy_tracking_prepare_ms}\nproxy_grid_analysis_ms={proxy_grid_analysis_ms}\nproxy_analysis_pairs_per_second={pairs_per_second:.3}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
+                video.fps, selection.retained
             )).await?;
             let attempt_report = AdaptiveAttemptReport {
                 selection_target: adaptive_selection_target.map(|value| value as u64),
@@ -871,6 +931,27 @@ impl PipelineRunner {
                     .map_err(|error| SplatError::Process(format!("无法写入自适应帧清单：{error}")))?).await?;
             }
             if let Some(proxy_frames) = adaptive_proxy_frames.as_deref() {
+                let proxy_pairs = proxy_frames.len().saturating_sub(1) as u64;
+                let proxy_pairs_per_second = if proxy_grid_analysis_ms > 0 {
+                    proxy_pairs as f64 / (proxy_grid_analysis_ms as f64 / 1_000.0)
+                } else {
+                    0.0
+                };
+                let benchmark = serde_json::json!({
+                    "proxyCandidates": proxy_frames.len(),
+                    "matchedFramePairs": proxy_pairs,
+                    "gridCellsPerPair": 160,
+                    "workers": proxy_analysis_workers,
+                    "proxyJpegDecodeMs": proxy_jpeg_decode_ms,
+                    "trackingPyramidPrepareMs": proxy_tracking_prepare_ms,
+                    "gridAnalysisMs": proxy_grid_analysis_ms,
+                    "totalAnalysisStageMs": frame_analysis_ms,
+                    "matchedPairsPerSecond": proxy_pairs_per_second,
+                });
+                tokio::fs::write(
+                    log_directory.join("adaptive-analysis-benchmark.json"),
+                    serde_json::to_vec_pretty(&benchmark)?,
+                ).await?;
                 let proxy_manifest = serde_json::json!({
                     "strategy": "adaptiveSfm",
                     "frames": proxy_frames,
@@ -1468,7 +1549,8 @@ impl PipelineRunner {
             tokio::fs::create_dir_all(&bridge_attempt).await?;
             self.events.stage(PipelineStage::ValidatingReconstruction, 0.55, "自动补帧 attempt 1：正在提取完整时间序列");
             extract_selected_frames(&self.engines.ffmpeg, &metadata.source_path, &bridge_frames,
-                &bridge_attempt.join("ffmpeg"), &combined_selection, self.ffmpeg_hw_accel,
+                &bridge_attempt.join("ffmpeg"), &combined_selection,
+                state.frames.as_ref().and_then(|frames| frames.analysis_fps).unwrap_or(quality.preset().target_sampling_fps), self.ffmpeg_hw_accel,
                 Some(paths.logs.join("ffmpeg-adaptive-bridge.log")), &self.process_manager, None).await?;
             self.events.stage(PipelineStage::ValidatingReconstruction, 0.65, "自动补帧 attempt 1：正在提取独立 COLMAP 特征");
             colmap::extract_features(&colmap_exe, &bridge_database, &bridge_frames,
@@ -1536,6 +1618,7 @@ impl PipelineRunner {
                 report.registered_ratio * 100.0
             )
         });
+        append_final_adaptive_attempt(&paths.logs, &report, ba_backend).await?;
         let model = promote_colmap_attempt(&database, &model, &paths.colmap)?;
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
@@ -1556,7 +1639,8 @@ impl PipelineRunner {
                 let temporary = paths.gsplat.join(".training-input-undistorted.tmp");
                 if temporary.exists() { tokio::fs::remove_dir_all(&temporary).await?; }
                 colmap::undistort_images(&colmap_exe, &paths.frames, &model, &temporary, paths.logs.join("colmap-undistort.log"), &self.process_manager).await?;
-                if !temporary.join("images").is_dir() || !temporary.join("sparse").join("0").join("cameras.bin").is_file() {
+                let sparse_model = normalize_undistorted_sparse_layout(&temporary).await?;
+                if !temporary.join("images").is_dir() || !sparse_model.join("cameras.bin").is_file() {
                     return Err(SplatError::Process("COLMAP 去畸变输出不完整，已停止 gsplat 训练。".into()));
                 }
                 if undistorted.exists() { tokio::fs::remove_dir_all(&undistorted).await?; }
@@ -1986,6 +2070,26 @@ mod progress_tests {
         assert!(sample.1.contains("5920 splats"));
     }
 
+    #[tokio::test]
+    async fn normalizes_direct_undistorter_sparse_layout_for_gsplat() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sparse = temporary.path().join("sparse");
+        std::fs::create_dir_all(&sparse).unwrap();
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "frames.bin", "rigs.bin"] {
+            std::fs::write(sparse.join(name), b"colmap").unwrap();
+        }
+
+        let model = normalize_undistorted_sparse_layout(temporary.path())
+            .await
+            .unwrap();
+
+        assert_eq!(model, sparse.join("0"));
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "frames.bin", "rigs.bin"] {
+            assert!(model.join(name).is_file());
+            assert!(!sparse.join(name).exists());
+        }
+    }
+
     #[test]
     fn hides_colmap_info_but_keeps_actionable_errors() {
         assert!(!is_user_visible_diagnostic(
@@ -2341,6 +2445,33 @@ async fn read_near_budget_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan>
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 
+/// Adds the production mapper outcome to the report that was created before
+/// formal extraction. Missing reports are normal for fixed/FPS-only runs.
+async fn append_final_adaptive_attempt(
+    logs: &Path,
+    report: &ReconstructionReport,
+    mapper_backend: &str,
+) -> Result<()> {
+    let path = logs.join("adaptive-attempts.json");
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let attempt = serde_json::json!({
+        "name": "finalMapper",
+        "inputFrames": report.input_images,
+        "registeredImages": report.registered_images,
+        "registeredRatio": report.registered_ratio,
+        "accepted": report.quality != ReconstructionQuality::Failed,
+        "detail": format!("正式 {mapper_backend} Mapper 结果；三维点 {}", report.points_3d),
+    });
+    document["attempts"].as_array_mut().map(|items| items.push(attempt));
+    tokio::fs::write(path, serde_json::to_vec_pretty(&document)?).await?;
+    Ok(())
+}
+
 async fn combined_bridge_selection(logs: &Path, plan: &AdaptiveBridgePlan) -> Result<Vec<SelectedSourceFrame>> {
     let selected: AdaptiveSelectedFramesLog = serde_json::from_slice(&tokio::fs::read(logs.join("adaptive-selected-frames.json")).await?)?;
     let proxy: AdaptiveProxyAnalysisLog = serde_json::from_slice(&tokio::fs::read(logs.join("adaptive-proxy-analysis.json")).await?)?;
@@ -2585,6 +2716,30 @@ fn detect_weak_intervals(frames: &[RegisteredFrameTimelineEntry]) -> Vec<WeakFra
 
 /// Promotes only a validated attempt into the stable layout consumed by
 /// training. Failed attempts remain untouched under `colmap-attempts`.
+async fn normalize_undistorted_sparse_layout(output: &Path) -> Result<PathBuf> {
+    let sparse = output.join("sparse");
+    let nested_model = sparse.join("0");
+    if nested_model.is_dir() {
+        return Ok(nested_model);
+    }
+
+    let required = ["cameras.bin", "images.bin", "points3D.bin"];
+    if !required.iter().all(|name| sparse.join(name).is_file()) {
+        return Err(SplatError::Process(
+            "COLMAP 去畸变输出缺少稀疏模型文件，已停止 gsplat 训练。".into(),
+        ));
+    }
+
+    tokio::fs::create_dir_all(&nested_model).await?;
+    for name in ["cameras.bin", "images.bin", "points3D.bin", "frames.bin", "rigs.bin"] {
+        let source = sparse.join(name);
+        if source.is_file() {
+            tokio::fs::rename(&source, nested_model.join(name)).await?;
+        }
+    }
+    Ok(nested_model)
+}
+
 fn promote_colmap_attempt(database: &Path, model: &Path, canonical_root: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(canonical_root)?;
     std::fs::copy(database, canonical_root.join("database.db"))

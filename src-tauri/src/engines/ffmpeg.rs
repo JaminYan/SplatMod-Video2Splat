@@ -1,10 +1,10 @@
-use std::{ffi::OsString, path::{Path, PathBuf}};
+use std::{collections::BTreeSet, ffi::OsString, path::{Path, PathBuf}};
 
 use crate::{
     engines::FfmpegHwAccel,
     error::{Result, SplatError},
     process::{ProcessManager, ProcessObserver, ProcessSpec},
-    video::{source_indices_select_script, FramePlan, SelectedSourceFrame, SourceFrameTimestamp},
+    video::{FramePlan, SelectedSourceFrame, SourceFrameTimestamp},
 };
 
 #[derive(Debug, Clone)]
@@ -125,29 +125,38 @@ fn parse_proxy_mapping(text: &str) -> Result<Vec<SourceFrameTimestamp>> {
     Ok(mapped)
 }
 
-/// Extract original-resolution selected frames; proxy images never enter the
-/// COLMAP frame directory. The count check prevents a silently shifted map.
+/// Re-run the same official `fps` sampler used by proxy analysis at high
+/// resolution, then promote only selected source indices. `stats_mux_pre` is
+/// the binding between every output JPEG and its decoded input-frame index;
+/// this avoids a long per-frame equality filter entirely.
 pub async fn extract_selected_frames(
     executable: &Path,
     input: &Path,
     output_directory: &Path,
     work_directory: &Path,
     selected: &[SelectedSourceFrame],
+    analysis_fps: f64,
     hw_accel: FfmpegHwAccel,
     log_path: Option<PathBuf>,
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<u64> {
     if !input.is_file() { return Err(SplatError::InvalidPath(input.to_path_buf())); }
-    let script = source_indices_select_script(selected.iter().map(|frame| frame.source_index))
-        .ok_or_else(|| SplatError::Process("自适应抽帧没有可选源帧".into()))?;
+    if !analysis_fps.is_finite() || analysis_fps <= 0.0 {
+        return Err(SplatError::Process("自适应原图抽帧 FPS 无效".into()));
+    }
+    if selected.is_empty() {
+        return Err(SplatError::Process("自适应抽帧没有可选源帧".into()));
+    }
     tokio::fs::create_dir_all(output_directory).await?;
     tokio::fs::create_dir_all(work_directory).await?;
     ensure_no_jpegs(output_directory).await?;
-    let filter_script = work_directory.join("adaptive-selected-frames.ffscript");
-    let filter = format!("{},scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease\n", script.trim_end());
-    tokio::fs::write(&filter_script, filter).await?;
-    let output_pattern = output_directory.join("frame_%06d.jpg");
+    let candidates = work_directory.join("fps-candidates");
+    tokio::fs::create_dir_all(&candidates).await?;
+    ensure_no_jpegs(&candidates).await?;
+    let mapping_path = work_directory.join("adaptive-original-map.txt");
+    let filter = format!("fps=fps={analysis_fps:.8}:round=near,scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease");
+    let output_pattern = candidates.join("candidate_%06d.jpg");
     let mut args = vec![OsString::from("-hide_banner"), OsString::from("-nostdin"), OsString::from("-nostats"), OsString::from("-y")];
     match hw_accel {
         FfmpegHwAccel::Off => {}
@@ -157,20 +166,38 @@ pub async fn extract_selected_frames(
     }
     args.extend([
         OsString::from("-i"), input.as_os_str().to_owned(),
-        OsString::from("-filter_script:v"), filter_script.as_os_str().to_owned(),
+        OsString::from("-vf"), OsString::from(filter),
         OsString::from("-q:v"), OsString::from("2"), OsString::from("-start_number"), OsString::from("1"),
+        OsString::from("-stats_mux_pre:v"), mapping_path.as_os_str().to_owned(),
+        OsString::from("-stats_mux_pre_fmt:v"), OsString::from("{ni} {ti}"),
         OsString::from("-progress"), OsString::from("pipe:1"), output_pattern.as_os_str().to_owned(),
     ]);
     let output = process_manager.run(ProcessSpec {
         executable: executable.to_path_buf(), args,
         working_directory: work_directory.parent().map(Path::to_path_buf), log_path, observer,
     }).await?;
-    if !output.success { return Err(SplatError::Process(format!("FFmpeg 自适应原图抽帧退出码 {:?}", output.exit_code))); }
-    let count = jpeg_count(output_directory).await?;
-    if count != selected.len() as u64 {
-        return Err(SplatError::Process(format!("自适应原图抽帧数量不匹配：请求 {} 帧，实际输出 {count} 帧", selected.len())));
+    if !output.success { return Err(SplatError::Process(format!("FFmpeg 自适应原图候选抽帧退出码 {:?}", output.exit_code))); }
+    let mapped = parse_proxy_mapping(&tokio::fs::read_to_string(&mapping_path).await?)?;
+    let candidate_count = jpeg_count(&candidates).await?;
+    if candidate_count != mapped.len() as u64 {
+        return Err(SplatError::Process(format!("自适应原图候选映射 {} 帧，实际输出 {candidate_count} 帧", mapped.len())));
     }
-    Ok(count)
+    let selected_indices = selected.iter().map(|frame| frame.source_index).collect::<BTreeSet<_>>();
+    let mut promoted = 0_u64;
+    for (index, source) in mapped.iter().enumerate() {
+        let candidate = candidates.join(format!("candidate_{:06}.jpg", index + 1));
+        if selected_indices.contains(&source.source_index) {
+            let destination = output_directory.join(format!("frame_{:06}.jpg", promoted + 1));
+            tokio::fs::rename(&candidate, destination).await?;
+            promoted += 1;
+        } else {
+            tokio::fs::remove_file(&candidate).await?;
+        }
+    }
+    if promoted != selected_indices.len() as u64 {
+        return Err(SplatError::Process(format!("自适应原图映射未覆盖全部关键帧：请求 {} 帧，匹配 {promoted} 帧", selected_indices.len())));
+    }
+    Ok(promoted)
 }
 
 async fn ensure_no_jpegs(directory: &Path) -> Result<()> {

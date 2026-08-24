@@ -4,9 +4,13 @@
 //! scan supplies `ProxyFrame` measurements; keeping the decision logic pure
 //! makes it testable and prevents average FPS from becoming a hidden time base.
 
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 
 use image::{imageops::FilterType, DynamicImage, GrayImage};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::presets::Quality;
@@ -28,6 +32,15 @@ const MAX_FULL_SEARCH_RADIUS: i32 = COARSE_SEARCH_RADIUS * 4 + REFINE_SEARCH_RAD
 const MIN_PATCH_TEXTURE: f64 = 18.0;
 const MAX_MATCH_ERROR: f64 = 32.0;
 const INLIER_RESIDUAL: f64 = 2.5;
+
+/// Bounds the independent grid-cell matcher without starving the UI or later
+/// engine processes. Frames remain ordered because three-view track state is
+/// intentionally carried only between consecutive frames.
+pub fn proxy_analysis_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get().saturating_sub(1).max(1).min(12))
+        .unwrap_or(1)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +139,50 @@ pub fn analyze_proxy_images(
 pub fn analyze_proxy_images_with_progress<F>(
     samples: &[SourceFrameTimestamp],
     images: &[DynamicImage],
+    on_progress: F,
+) -> crate::error::Result<Vec<ProxyFrame>>
+where
+    F: FnMut(u64, u64),
+{
+    let pyramids = prepare_proxy_tracking_pyramids_with_progress(images, |_, _| {});
+    analyze_prepared_proxy_images_with_progress(samples, images, &pyramids, on_progress)
+}
+
+/// Precomputes the 320px grayscale image and its three-level tracking pyramid
+/// once per proxy frame. The work is independent between images and is reused
+/// by both adjacent frame pairs, instead of rebuilding the middle frame's
+/// pyramid twice.
+pub fn prepare_proxy_tracking_pyramids_with_progress<F>(
+    images: &[DynamicImage],
+    on_progress: F,
+) -> Vec<Vec<GrayImage>>
+where
+    F: Fn(u64, u64) + Sync,
+{
+    let total = images.len() as u64;
+    let completed = AtomicU64::new(0);
+    let update_interval = (total / 100).max(1);
+    images
+        .par_iter()
+        .map(|image| {
+            let gray = to_tracking_gray(image);
+            let pyramid = tracking_pyramid(&gray);
+            let current = completed.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if current == total || current % update_interval == 0 {
+                on_progress(current, total);
+            }
+            pyramid
+        })
+        .collect()
+}
+
+/// Measures ordered proxy-frame motion using previously prepared tracking
+/// pyramids. Consecutive frame state stays ordered, while each frame pair's
+/// independent grid cells are matched in parallel.
+pub fn analyze_prepared_proxy_images_with_progress<F>(
+    samples: &[SourceFrameTimestamp],
+    images: &[DynamicImage],
+    pyramids: &[Vec<GrayImage>],
     mut on_progress: F,
 ) -> crate::error::Result<Vec<ProxyFrame>>
 where
@@ -136,7 +193,12 @@ where
             "代理时间戳与图像数量不一致：{} / {}", samples.len(), images.len()
         )));
     }
-    let normalized = images.iter().map(to_tracking_gray).collect::<Vec<_>>();
+    if pyramids.len() != images.len() || pyramids.iter().any(|pyramid| pyramid.is_empty()) {
+        return Err(crate::error::SplatError::Process(format!(
+            "代理跟踪金字塔与图像数量不一致：{} / {}",
+            pyramids.len(), images.len()
+        )));
+    }
     let mut result = Vec::with_capacity(samples.len());
     let mut previous_inliers = vec![false; (GRID_COLUMNS * GRID_ROWS) as usize];
     for (index, (sample, image)) in samples.iter().zip(images.iter()).enumerate() {
@@ -144,7 +206,7 @@ where
             if index == 0 {
                 (0.0, 0, 0, 0, 0.0, 0, false, previous_inliers.clone())
             } else {
-                measure_background_motion(&normalized[index - 1], &normalized[index], &previous_inliers)
+                measure_background_motion(&pyramids[index - 1], &pyramids[index], &previous_inliers)
             };
         previous_inliers = current_inliers;
         result.push(ProxyFrame {
@@ -170,26 +232,28 @@ fn to_tracking_gray(image: &DynamicImage) -> GrayImage {
 }
 
 fn measure_background_motion(
-    previous: &GrayImage,
-    current: &GrayImage,
+    previous_pyramid: &[GrayImage],
+    current_pyramid: &[GrayImage],
     previous_inliers: &[bool],
 ) -> (f64, u32, u32, u32, f64, u32, bool, Vec<bool>) {
     let positions = grid_positions();
-    let previous_pyramid = tracking_pyramid(previous);
-    let current_pyramid = tracking_pyramid(current);
-    let mut matches = Vec::new();
-    let mut textured_cells = 0_u32;
-    for (index, (x, y)) in positions.iter().copied().enumerate() {
-        if patch_texture(previous, x, y) < MIN_PATCH_TEXTURE {
-            continue;
-        }
-        textured_cells += 1;
-        if let Some((dx, dy, error)) = best_patch_match_pyramid(&previous_pyramid, &current_pyramid, x, y) {
-            if error <= MAX_MATCH_ERROR {
-                matches.push((index, dx, dy));
-            }
-        }
-    }
+    let previous = &previous_pyramid[0];
+    let current = &current_pyramid[0];
+    // Each grid cell is read-only with respect to both pyramids. Parallelize
+    // this expensive patch search, then restore the stable grid order before
+    // median/inlier reduction so results stay deterministic.
+    let probes = positions.par_iter().copied().enumerate().map(|(index, (x, y))| {
+        let textured = patch_texture(previous, x, y) >= MIN_PATCH_TEXTURE;
+        let matched = textured
+            .then(|| best_patch_match_pyramid(previous_pyramid, current_pyramid, x, y))
+            .flatten()
+            .filter(|(_, _, error)| *error <= MAX_MATCH_ERROR)
+            .map(|(dx, dy, _)| (index, dx, dy));
+        (textured, matched)
+    }).collect::<Vec<_>>();
+    let textured_cells = probes.iter().filter(|(textured, _)| *textured).count() as u32;
+    let mut matches = probes.into_iter().filter_map(|(_, matched)| matched).collect::<Vec<_>>();
+    matches.sort_by_key(|(index, _, _)| *index);
     let mut current_inliers = vec![false; positions.len()];
     if matches.is_empty() {
         return (0.0, textured_cells, 0, 0, 0.0, 0, scene_cut(previous, current, 0), current_inliers);
@@ -407,32 +471,6 @@ pub fn choose_proxy_samples(
     samples
 }
 
-/// Generates a filter script rather than an argv-sized expression. Callers
-/// write it into an isolated attempt directory and pass `-filter_script:v`.
-pub fn exact_source_select_script(frames: &[SelectedSourceFrame]) -> Option<String> {
-    source_indices_select_script(frames.iter().map(|frame| frame.source_index))
-}
-
-/// The shared selector used for both low-resolution proxy analysis and final
-/// original-resolution extraction. It never serializes timestamps into an FPS
-/// expression; FFmpeg receives decoded source indices only.
-pub fn source_indices_select_script(
-    indices: impl IntoIterator<Item = u64>,
-) -> Option<String> {
-    let mut indices = indices.into_iter().collect::<Vec<_>>();
-    indices.sort_unstable();
-    indices.dedup();
-    if indices.is_empty() {
-        return None;
-    }
-    let clauses = indices
-        .iter()
-        .map(|index| format!("eq(n\\,{index})"))
-        .collect::<Vec<_>>()
-        .join("+");
-    Some(format!("select='{clauses}',setpts=N/FRAME_RATE/TB\n"))
-}
-
 /// Select source frames from proxy measurements. It is deliberately
 /// conservative: frames that fail co-visibility gates never win a sharpness
 /// tie, and pHash can suppress a candidate only when geometric motion is low.
@@ -588,15 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn source_select_script_uses_indices_and_never_pts_as_a_fake_fps() {
-        let selected = vec![
-            selection(&frame(41, 1.37, 0.0), SelectionReason::SegmentStart, 0.0),
-            selection(&frame(9, 0.17, 0.0), SelectionReason::MotionTarget, 0.0),
-        ];
-        assert_eq!(exact_source_select_script(&selected).as_deref(), Some("select='eq(n\\,9)+eq(n\\,41)',setpts=N/FRAME_RATE/TB\n"));
-    }
-
-    #[test]
     fn proxy_analysis_preserves_source_pts_and_confirms_untrackable_cut() {
         let black = DynamicImage::ImageLuma8(ImageBuffer::from_pixel(160, 120, Luma([0])));
         let white = DynamicImage::ImageLuma8(ImageBuffer::from_pixel(160, 120, Luma([255])));
@@ -636,7 +665,7 @@ mod tests {
         }
 
         let (motion, textured, matched, inliers, _, _, _, _) =
-            measure_background_motion(&previous, &current, &vec![false; (GRID_COLUMNS * GRID_ROWS) as usize]);
+            measure_background_motion(&tracking_pyramid(&previous), &tracking_pyramid(&current), &vec![false; (GRID_COLUMNS * GRID_ROWS) as usize]);
         assert!(textured >= 12);
         assert!(matched >= 8);
         assert!(inliers >= 6);

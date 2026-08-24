@@ -18,3 +18,4 @@ node_modules/
 /target/
 /.git-original-20260824/
 *.tsbuildinfo
+/.tsbuildinfo-node/

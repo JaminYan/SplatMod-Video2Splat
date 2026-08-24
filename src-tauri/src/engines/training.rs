@@ -200,6 +200,7 @@ async fn train_gsplat(
         "batchSize": 4,
         "seed": request.seed,
         "saveCheckpoints": false,
+        "diagnosticsDir": request.log_path.parent().unwrap_or(&request.output_directory),
     });
     tokio::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).await?;
     let started = std::time::Instant::now();

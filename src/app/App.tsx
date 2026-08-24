@@ -107,6 +107,8 @@ function ProjectRow({ project, busy, opening, onDelete, onView }: { project: Pro
       <div><dt>耗时</dt><dd>{formatDuration(project.durationMs)}</dd></div>
       <div><dt>训练</dt><dd>{trainingLabel(project)}</dd></div>
       <div><dt>档位</dt><dd>{qualityLabel(project.quality)}</dd></div>
+      <div><dt>SfM 注册</dt><dd>{project.registeredRatio == null ? "—" : `${(project.registeredRatio * 100).toFixed(1)}%`}</dd></div>
+      <div><dt>三维点</dt><dd>{project.points3d?.toLocaleString() ?? "—"}</dd></div>
     </dl>}
   </article>;
 }

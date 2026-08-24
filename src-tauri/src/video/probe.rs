@@ -25,7 +25,7 @@ struct FrameProbeEntry {
     best_effort_timestamp_time: Option<String>,
 }
 
-/// A decoded source frame addressed by FFmpeg's `select=n` index.
+/// A decoded source-frame index reported by FFmpeg's FPS mapping diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceFrameTimestamp {
     pub source_index: u64,
