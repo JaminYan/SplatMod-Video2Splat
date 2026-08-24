@@ -1,0 +1,2258 @@
+use crate::{
+    engines::{
+        self, brush, colmap,
+        colmap::{
+            ColmapComputeMode, ColmapFeatureOptions, ColmapMatchingOptions, IncrementalBaBackend,
+            IncrementalMapperOptions, MapperBaMode,
+        },
+        ffmpeg::{extract_proxy_frames, extract_selected_frames, extract_uniform_frames},
+        ffprobe::probe_video,
+        training::{self, TrainingBackend, TrainingRequest},
+        ColmapBackend, CudaColmapFlavor, EngineKind, EnginePaths, FfmpegHwAccel,
+    },
+    error::{Result, SplatError},
+    pipeline::{
+        progress::stage_progress_range, ColmapExecution, EventKind, EventLevel, PipelineEngine,
+        PipelineEvent, PipelineStage, SupplementRequirement,
+    },
+    presets::Quality,
+    process::{ProcessManager, ProcessObserver, ProcessUpdate},
+    project::{
+        FrameState, PipelineStateFile, ProjectManager, ProjectMetadata, ProjectOutput,
+        ProjectPaths, ProjectStatus,
+    },
+    reconstruction::{
+        ply::inspect_gaussian_ply,
+        validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
+    },
+    video::{
+        adaptive_plan, analyze_proxy_images_with_progress, passes_proxy_geometry, select_adaptive_frames,
+        AdaptiveFrameProfile, FramePlan, FrameSelectionReport, FrameSelectionStrategy,
+        ProxyFrame, SelectedSourceFrame, SelectionReason, UniformRatioFrameSelection, VideoInfo,
+        select_useful_frames_parallel_with_progress,
+    },
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+
+/// CASPAR has a fixed startup/initialization cost. On smaller sequences Ceres
+/// is both more predictable and usually faster; use CASPAR only where its GPU
+/// bundle adjustment can amortize that cost.
+const CASPAR_MINIMUM_IMAGES: u64 = 151;
+
+fn should_use_caspar(
+    backend: ColmapBackend,
+    caspar_available: bool,
+    mode: MapperBaMode,
+    retained: u64,
+) -> bool {
+    backend == ColmapBackend::Cuda
+        && caspar_available
+        && match mode {
+            MapperBaMode::Auto => retained >= CASPAR_MINIMUM_IMAGES,
+            MapperBaMode::Ceres => false,
+            MapperBaMode::Caspar => true,
+        }
+}
+pub struct PreparedFrames {
+    pub video: VideoInfo,
+    pub plan: FramePlan,
+    pub extracted_frames: u64,
+    pub selection: FrameSelectionReport,
+    pub probe_ms: u64,
+    pub extract_ms: u64,
+    pub select_ms: u64,
+    pub frame_analysis_ms: u64,
+    pub adaptive_planning_ms: u64,
+    pub selected_extraction_ms: u64,
+    pub adaptive_fallback_reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineResult {
+    pub project_id: String,
+    pub project_path: PathBuf,
+    pub final_ply: PathBuf,
+    pub file_size: u64,
+    pub splat_count: u64,
+    pub input_images: u64,
+    pub registered_images: u64,
+    pub registered_ratio: f64,
+    pub points_3d: u64,
+    pub duration_ms: u64,
+    pub completed_at: chrono::DateTime<Utc>,
+    pub warning: Option<String>,
+    pub logs_directory: PathBuf,
+    pub colmap_backend: ColmapBackend,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveSelectedFramesLog {
+    frames: Vec<AdaptiveSelectedFrameLog>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveProxyAnalysisLog {
+    frames: Vec<ProxyFrame>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveSelectedFrameLog {
+    output_file: String,
+    source_index: u64,
+    pts_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisteredFrameTimeline {
+    selected_frames: u64,
+    registered_frames: u64,
+    frames: Vec<RegisteredFrameTimelineEntry>,
+    weak_intervals: Vec<WeakFrameInterval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisteredFrameTimelineEntry {
+    output_file: String,
+    pts_seconds: f64,
+    registered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WeakFrameInterval {
+    reason: &'static str,
+    start_pts_seconds: f64,
+    end_pts_seconds: f64,
+    unregistered_frames: u64,
+    first_output_file: String,
+    last_output_file: String,
+    before_anchor: Option<WeakIntervalAnchor>,
+    after_anchor: Option<WeakIntervalAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WeakIntervalAnchor {
+    output_file: String,
+    pts_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegistrationTimelineSummary {
+    selected_frames: u64,
+    registered_frames: u64,
+    weak_intervals: u64,
+    planned_bridge_frames: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveBridgePlan {
+    max_additional_frames: u64,
+    planned_frames: Vec<AdaptiveBridgeFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveBridgeFrame {
+    source_index: u64,
+    pts_seconds: f64,
+    weak_interval_index: u64,
+    reason: String,
+    sharpness: f64,
+    inliers: u32,
+    grid_coverage: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdaptiveProxyDiagnostics {
+    proxy_candidates: u64,
+    selected_frames: u64,
+    min_textured_cells: u32,
+    min_matched_cells: u32,
+    min_inliers_floor: u32,
+    min_inlier_ratio: f64,
+    min_three_view_floor: u32,
+    min_three_view_ratio: f64,
+    geometry_qualified_frames: u64,
+    below_min_textured_cells: u64,
+    below_min_matched_cells: u64,
+    below_min_inlier_floor: u64,
+    below_min_inlier_ratio: u64,
+    below_min_three_view_floor: u64,
+    below_min_three_view_ratio: u64,
+    confirmed_scene_changes: u64,
+    median_inliers: f64,
+    median_textured_cells: f64,
+    median_matched_cells: f64,
+    median_grid_coverage: f64,
+    median_three_view_tracks: f64,
+}
+#[derive(Clone)]
+struct EventSink {
+    emit: Arc<dyn Fn(PipelineEvent) + Send + Sync>,
+    sequence: Arc<AtomicU64>,
+    dispatch: Arc<std::sync::Mutex<()>>,
+    started: Instant,
+    task_log: Arc<std::sync::Mutex<Option<PathBuf>>>,
+}
+impl EventSink {
+    #[allow(clippy::too_many_arguments)]
+    fn send(
+        &self,
+        stage: PipelineStage,
+        engine: Option<PipelineEngine>,
+        kind: EventKind,
+        level: EventLevel,
+        stage_progress: Option<f32>,
+        indeterminate: bool,
+        message: impl Into<String>,
+        current: Option<u64>,
+        total: Option<u64>,
+        unit: Option<&str>,
+    ) {
+        let (start, end) = stage_progress_range(stage);
+        let progress = stage_progress
+            .map(|value| start + (end - start) * value.clamp(0.0, 1.0))
+            .unwrap_or(start);
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let event = PipelineEvent {
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            timestamp: Utc::now(),
+            kind,
+            level,
+            stage,
+            engine,
+            progress,
+            stage_progress: stage_progress.map(|value| value.clamp(0.0, 1.0) * 100.0),
+            indeterminate,
+            message: message.into(),
+            current,
+            total,
+            unit: unit.map(str::to_owned),
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+        };
+        if let Some(path) = self.task_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let engine = event.engine.map(|value| format!("{value:?}")).unwrap_or_else(|| "System".into());
+                let _ = writeln!(file, "{}\t{:?}\t{}\t{}", event.timestamp.to_rfc3339(), event.level, engine, event.message);
+            }
+        }
+        (self.emit)(event);
+    }
+    fn stage(&self, stage: PipelineStage, progress: f32, message: impl Into<String>) {
+        self.send(
+            stage,
+            Some(PipelineEngine::System),
+            EventKind::Stage,
+            EventLevel::Info,
+            Some(progress),
+            false,
+            message,
+            None,
+            None,
+            None,
+        );
+    }
+    fn set_task_log(&self, path: PathBuf) {
+        *self.task_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    }
+}
+pub struct PipelineRunner {
+    engines: EnginePaths,
+    colmap_backend: ColmapBackend,
+    cuda_colmap_flavor: CudaColmapFlavor,
+    mapper_ba_mode: MapperBaMode,
+    ffmpeg_hw_accel: FfmpegHwAccel,
+    brush_training_preset: crate::presets::BrushTrainingPreset,
+    gsplat_splat_cap: crate::presets::GsplatSplatCap,
+    training_backend: TrainingBackend,
+    auto_bridge_frames: bool,
+    process_manager: ProcessManager,
+    events: EventSink,
+}
+impl PipelineRunner {
+    pub fn new(
+        engines: EnginePaths,
+        colmap_backend: ColmapBackend,
+        cuda_colmap_flavor: CudaColmapFlavor,
+        mapper_ba_mode: MapperBaMode,
+        ffmpeg_hw_accel: FfmpegHwAccel,
+        brush_training_preset: crate::presets::BrushTrainingPreset,
+        gsplat_splat_cap: crate::presets::GsplatSplatCap,
+        training_backend: TrainingBackend,
+        auto_bridge_frames: bool,
+        emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            engines,
+            colmap_backend,
+            cuda_colmap_flavor,
+            mapper_ba_mode,
+            ffmpeg_hw_accel,
+            brush_training_preset,
+            gsplat_splat_cap,
+            training_backend,
+            auto_bridge_frames,
+            process_manager: ProcessManager::new(),
+            events: EventSink {
+                emit: Arc::new(emit),
+                sequence: Arc::new(AtomicU64::new(0)),
+                dispatch: Arc::new(std::sync::Mutex::new(())),
+                started: Instant::now(),
+                task_log: Arc::new(std::sync::Mutex::new(None)),
+            },
+        }
+    }
+    pub async fn cancel(&self) {
+        // Window-close confirmation must not leave a GPU training child behind.
+        self.process_manager.kill().await;
+    }
+    pub fn colmap_backend(&self) -> ColmapBackend {
+        self.colmap_backend
+    }
+    fn colmap_executable(&self) -> &Path {
+        self.engines
+            .colmap_for(self.colmap_backend, self.cuda_colmap_flavor)
+    }
+    pub async fn verify_pipeline_engines(&self) -> Result<()> {
+        let statuses = self.engines.check_all().await;
+        for required in [
+            EngineKind::Ffmpeg,
+            EngineKind::Ffprobe,
+            EngineKind::Colmap,
+            EngineKind::Brush,
+        ] {
+            let status = statuses
+                .iter()
+                .find(|status| status.kind == required)
+                .expect("all engine kinds returned");
+            if !status.exists {
+                return Err(SplatError::EngineMissing(status.path.display().to_string()));
+            }
+            if !status.can_start {
+                return Err(SplatError::EngineStart {
+                    engine: format!("{required:?}"),
+                    detail: status.detail.clone(),
+                });
+            }
+        }
+        match self.colmap_backend {
+            ColmapBackend::Cpu => engines::require_cpu_colmap(&self.engines).await?,
+            ColmapBackend::Cuda => {
+                engines::require_cuda_colmap(&self.engines, self.cuda_colmap_flavor).await?
+            }
+        }
+        colmap::require_verified_cli(self.colmap_executable())?;
+        if self.training_backend == TrainingBackend::Brush {
+            brush::require_verified_cli(&self.engines.brush)
+        } else if engines::training::gsplat_runtime_healthy(&self.engines.root).await {
+            Ok(())
+        } else {
+            Err(SplatError::UnsupportedEngine(
+                "gsplat CUDA 实验运行时尚未安装或未通过健康检查；请改用 Brush。".into(),
+            ))
+        }
+    }
+    pub async fn prepare_frames(
+        &self,
+        input: &Path,
+        quality: Quality,
+        output: &Path,
+        logs: Option<&Path>,
+    ) -> Result<PreparedFrames> {
+        self.events
+            .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
+        let probe_started = Instant::now();
+        let video = probe_video(
+            &self.engines.ffprobe,
+            input,
+            logs.map(|path| path.join("ffprobe.log")),
+        )
+        .await?;
+        let probe_ms = probe_started.elapsed().as_millis() as u64;
+        self.events.stage(
+            PipelineStage::ProbingVideo,
+            1.0,
+            format!(
+                "视频 {:.1} 秒 · {:.2} FPS · {}×{}",
+                video.duration, video.fps, video.width, video.height
+            ),
+        );
+        let mut plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        let mut adaptive_selected = None;
+        let mut adaptive_proxy_frames = None;
+        let mut adaptive_profile = None;
+        let mut adaptive_reason = None;
+        let mut frame_analysis_ms = 0;
+        let mut adaptive_planning_ms = 0;
+        let mut selected_extraction_ms = 0;
+        if let Some(profile) = AdaptiveFrameProfile::for_quality(quality, video.fps) {
+            adaptive_profile = Some(profile);
+            self.events.stage(PipelineStage::PlanningFrames, 0.0, "正在规划自适应 SfM 关键帧");
+            let planning_started = Instant::now();
+            let estimated_proxy_frames = (video.duration * profile.analysis_fps).ceil().max(1.0) as u64;
+            let project = output.parent().ok_or_else(|| SplatError::Process("无法定位自适应抽帧工作目录".into()))?;
+            let proxy_dir = project.join("work").join("adaptive-proxy").join("frames");
+            let proxy_work = project.join("work").join("adaptive-proxy");
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在以 {:.1} FPS 提取低分辨率代理画面并同步映射 PTS", profile.analysis_fps));
+            let proxy_result = extract_proxy_frames(&self.engines.ffmpeg, input, &proxy_dir, &proxy_work, video.width, video.height, profile.analysis_fps,
+                logs.map(|path| path.join("ffmpeg-adaptive-proxy.log")), &self.process_manager,
+                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(estimated_proxy_frames), ObserverMode::Ffmpeg))).await;
+            match proxy_result {
+                Ok(report) => {
+                    self.events.stage(PipelineStage::ExtractingFrames, 1.0, format!("高速代理抽帧完成：{} 帧（已同步映射源 PTS，缓存上限 {} 帧 / {:.1} GiB）", report.frames.len(), report.buffered_frame_limit, report.memory_budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0));
+                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.0), false,
+                        format!("正在分析 {} 个代理画面的背景运动", report.frames.len()), Some(0), Some(report.frames.len() as u64), Some("帧"));
+                    let analysis_started = Instant::now();
+                    let proxy_directory = proxy_dir.clone();
+                    let proxy_source_frames = report.frames.clone();
+                    let analysis_events = self.events.clone();
+                    let analysis = tokio::task::spawn_blocking(move || {
+                        let mut paths = std::fs::read_dir(proxy_directory)?.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))).collect::<Vec<_>>();
+                        paths.sort();
+                        let images = paths.into_iter().map(|path| image::open(&path).map_err(|error| SplatError::Process(format!("无法读取代理图 {}：{error}", path.display())))).collect::<Result<Vec<_>>>()?;
+                        analyze_proxy_images_with_progress(&proxy_source_frames, &images, |current, total| {
+                            if current == total || current % 5 == 0 {
+                                analysis_events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(current as f32 / total.max(1) as f32), false,
+                                    format!("正在分析代理画面 {current} / {total}"), Some(current), Some(total), Some("帧"));
+                            }
+                        })
+                    }).await.map_err(|error| SplatError::Process(format!("代理分析任务异常结束：{error}")))?;
+                    frame_analysis_ms = analysis_started.elapsed().as_millis() as u64;
+                    match analysis {
+                        Ok(proxy_frames) => {
+                            let proxy_count = proxy_frames.len();
+                            let selected = select_adaptive_frames(&proxy_frames, profile);
+                            adaptive_proxy_frames = Some(proxy_frames);
+                            if selected.len() >= 3 {
+                                let mut adaptive = adaptive_plan(&video, quality).expect("profile exists for adaptive quality");
+                                adaptive.proxy_candidates = Some(proxy_count as u64);
+                                adaptive.effective_fps = Some(selected.len() as f64 / video.duration.max(0.001));
+                                adaptive.estimated_frames = selected.len() as u64;
+                                plan = adaptive;
+                                adaptive_selected = Some(selected);
+                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(1.0), false,
+                                    format!("自适应规划完成：{} 个代理候选 → {} 个关键帧", proxy_count, plan.estimated_frames), Some(proxy_count as u64), Some(proxy_count as u64), Some("帧"));
+                            } else {
+                                adaptive_reason = Some(format!("可靠几何关键帧不足（仅 {} 张）", selected.len()));
+                            }
+                        }
+                        Err(error) => adaptive_reason = Some(format!("代理分析失败：{error}")),
+                    }
+                }
+                Err(error) if matches!(error, SplatError::Cancelled) => return Err(error),
+                Err(error) => adaptive_reason = Some(format!("代理抽帧或 PTS 映射失败：{error}")),
+            }
+            adaptive_planning_ms = planning_started.elapsed().as_millis() as u64;
+        }
+        if let Some(reason) = &adaptive_reason {
+            let diagnostics_hint = adaptive_proxy_frames
+                .is_some()
+                .then_some("；代理门禁诊断将写入 logs/adaptive-proxy-diagnostics.json")
+                .unwrap_or_default();
+            self.events.send(PipelineStage::PlanningFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(1.0), false,
+                format!("自适应抽帧回退到固定策略：{reason}{diagnostics_hint}"), None, None, None);
+        }
+        self.events.stage(PipelineStage::PlanningFrames, 1.0, match &adaptive_selected {
+            Some(_) => format!("自适应 SfM 计划：{} 个关键帧", plan.estimated_frames),
+            None => format!("固定抽帧计划：预计 {} 帧", plan.estimated_frames),
+        });
+        let extract_started = Instant::now();
+        let extracted_frames = if let Some(selected) = adaptive_selected.as_deref() {
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, format!("正在按源帧索引提取 {} 张原图关键帧", selected.len()));
+            let count = extract_selected_frames(&self.engines.ffmpeg, input, output,
+                &output.parent().expect("project frames directory has parent").join("work").join("adaptive-selected"), selected,
+                self.ffmpeg_hw_accel, logs.map(|path| path.join("ffmpeg-adaptive-selected.log")), &self.process_manager,
+                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
+            selected_extraction_ms = extract_started.elapsed().as_millis() as u64;
+            count
+        } else {
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, "FFmpeg 开始固定策略抽帧");
+            extract_uniform_frames(&self.engines.ffmpeg, input, output, &plan, self.ffmpeg_hw_accel,
+                logs.map(|path| path.join("ffmpeg.log")), &self.process_manager,
+                Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(plan.estimated_frames), ObserverMode::Ffmpeg))).await?
+        };
+        let extract_ms = extract_started.elapsed().as_millis() as u64;
+        self.events.stage(PipelineStage::ExtractingFrames, 1.0, format!("原图抽帧完成：{extracted_frames} 帧"));
+        let select_started = Instant::now();
+        let selection = if adaptive_selected.is_some() {
+            self.events.stage(PipelineStage::SelectingFrames, 0.0, "自适应关键帧已通过几何门禁；正在保护桥接帧");
+            let report = FrameSelectionReport { candidates: extracted_frames, retained: extracted_frames, removed_near_duplicates: 0 };
+            self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(1.0), false,
+                format!("自适应路径保留 {extracted_frames} 张关键帧；未进行可能删除桥接帧的二次 pHash 去重"), Some(extracted_frames), Some(extracted_frames), Some("张"));
+            report
+        } else {
+            self.events.stage(PipelineStage::SelectingFrames, 0.0, "正在用 pHash 合并近重复画面，并保留清晰帧");
+            let events = self.events.clone();
+            let selection_directory = output.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                select_useful_frames_parallel_with_progress(&selection_directory, move |current, total| {
+                    let stage_progress = current as f32 / total.max(1) as f32;
+                    events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info,
+                        Some(stage_progress), false, format!("正在并行筛选画面 {current} / {total}"), Some(current), Some(total), Some("张"));
+                })
+            }).await.map_err(|error| SplatError::Process(format!("帧筛选任务异常结束：{error}")))??
+        };
+        let select_ms = select_started.elapsed().as_millis() as u64;
+        self.events.stage(
+            PipelineStage::SelectingFrames,
+            1.0,
+            format!(
+                "保留 {} / {} 帧（移除 {} 张近重复）",
+                selection.retained, selection.candidates, selection.removed_near_duplicates
+            ),
+        );
+        if let Some(log_directory) = logs {
+            let strategy = if adaptive_selected.is_some() { "adaptiveSfm" } else { "uniformRatio" };
+            let fallback = adaptive_reason.as_deref().unwrap_or("none");
+            tokio::fs::write(log_directory.join("adaptive-frame-selection.log"), format!(
+                "strategy={strategy}\nsource_fps={:.6}\nproxy_candidates={}\nselected_frames={}\nextracted_frames={extracted_frames}\nfallback_reason={fallback}\nframe_analysis_ms={frame_analysis_ms}\nadaptive_planning_ms={adaptive_planning_ms}\nselected_extraction_ms={selected_extraction_ms}\n",
+                video.fps, plan.proxy_candidates.unwrap_or(0), selection.retained
+            )).await?;
+            if let Some(selected) = adaptive_selected.as_deref() {
+                let entries = selected.iter().enumerate().map(|(index, frame)| serde_json::json!({
+                    "outputFile": format!("frame_{:06}.jpg", index + 1),
+                    "sourceIndex": frame.source_index,
+                    "ptsSeconds": frame.pts_seconds,
+                    "reason": frame.reason,
+                    "motion": frame.motion,
+                    "inliers": frame.inliers,
+                    "gridCoverage": frame.grid_coverage,
+                    "sharpness": frame.sharpness,
+                })).collect::<Vec<_>>();
+                let manifest = serde_json::json!({
+                    "strategy": "adaptiveSfm",
+                    "sourceVideo": video.path,
+                    "frames": entries,
+                });
+                tokio::fs::write(log_directory.join("adaptive-selected-frames.json"), serde_json::to_vec_pretty(&manifest)
+                    .map_err(|error| SplatError::Process(format!("无法写入自适应帧清单：{error}")))?).await?;
+            }
+            if let Some(proxy_frames) = adaptive_proxy_frames.as_deref() {
+                let proxy_manifest = serde_json::json!({
+                    "strategy": "adaptiveSfm",
+                    "frames": proxy_frames,
+                });
+                tokio::fs::write(log_directory.join("adaptive-proxy-analysis.json"), serde_json::to_vec_pretty(&proxy_manifest)
+                    .map_err(|error| SplatError::Process(format!("无法写入自适应代理分析：{error}")))?).await?;
+                if let Some(profile) = adaptive_profile {
+                    let diagnostics = summarize_proxy_diagnostics(
+                        proxy_frames,
+                        profile,
+                        adaptive_selected.as_ref().map_or(0, Vec::len),
+                    );
+                    tokio::fs::write(
+                        log_directory.join("adaptive-proxy-diagnostics.json"),
+                        serde_json::to_vec_pretty(&diagnostics)?,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(PreparedFrames {
+            video,
+            plan,
+            extracted_frames,
+            selection,
+            probe_ms,
+            extract_ms,
+            select_ms,
+            frame_analysis_ms,
+            adaptive_planning_ms,
+            selected_extraction_ms,
+            adaptive_fallback_reason: adaptive_reason,
+        })
+    }
+    pub async fn generate(
+        &self,
+        input: &Path,
+        quality: Quality,
+        projects_root: &Path,
+    ) -> Result<PipelineResult> {
+        self.generate_with_manager(
+            input,
+            quality,
+            ProjectManager::with_root(projects_root.to_path_buf()),
+        )
+        .await
+    }
+    pub async fn generate_for_diagnostics(
+        &self,
+        input: &Path,
+        quality: Quality,
+        projects_root: &Path,
+    ) -> Result<PipelineResult> {
+        self.generate_with_manager(
+            input,
+            quality,
+            ProjectManager::for_diagnostics(projects_root.to_path_buf()),
+        )
+        .await
+    }
+    async fn generate_with_manager(
+        &self,
+        input: &Path,
+        quality: Quality,
+        project_manager: ProjectManager,
+    ) -> Result<PipelineResult> {
+        self.verify_pipeline_engines().await?;
+        let (paths, mut metadata) = project_manager.create(input, quality).await?;
+        self.events.set_task_log(paths.logs.join("task.log"));
+        let started = Instant::now();
+        let result = self
+            .run_project(&project_manager, &paths, &mut metadata, quality)
+            .await;
+        if let Err(error) = &result {
+            let cancelled = matches!(error, SplatError::Cancelled);
+            let needs_supplement = matches!(error, SplatError::NeedsSupplement(_));
+            metadata.status = if cancelled {
+                ProjectStatus::Cancelled
+            } else if needs_supplement {
+                ProjectStatus::NeedsSupplement
+            } else {
+                ProjectStatus::Failed
+            };
+            metadata.completed_at = Some(Utc::now());
+            metadata.duration_ms = Some(started.elapsed().as_millis() as u64);
+            metadata.failure_message = Some(error.to_string());
+            let _ = project_manager
+                .write_metadata(&paths.metadata, &metadata)
+                .await;
+            if !needs_supplement {
+                let mut state = PipelineStateFile::created(quality);
+                state.stage = if cancelled {
+                    PipelineStage::Cancelled
+                } else {
+                    PipelineStage::Failed
+                };
+                let _ = project_manager.write_state(&paths.state, &state).await;
+            }
+        }
+        result
+    }
+    async fn run_project(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        metadata: &mut ProjectMetadata,
+        quality: Quality,
+    ) -> Result<PipelineResult> {
+        let mut state = PipelineStateFile::created(quality);
+        let initial_colmap_execution = ColmapExecution {
+            requested_backend: Some(self.colmap_backend),
+            requested_ba_mode: Some(self.mapper_ba_mode),
+            ..Default::default()
+        };
+        state.colmap_execution = initial_colmap_execution.clone();
+        metadata.colmap_execution = initial_colmap_execution;
+        state.training_backend = self.training_backend;
+        state.auto_bridge_frames = self.auto_bridge_frames;
+        metadata.training_backend = self.training_backend;
+        metadata.brush_training_preset = self.brush_training_preset;
+        metadata.gsplat_splat_cap = self.gsplat_splat_cap;
+        let total_started = Instant::now();
+        let prepared = self
+            .prepare_frames(
+                &metadata.source_path,
+                quality,
+                &paths.frames,
+                Some(&paths.logs),
+            )
+            .await?;
+        metadata.timings.probe_ms = prepared.probe_ms;
+        metadata.timings.extract_ms = prepared.extract_ms;
+        metadata.timings.select_ms = prepared.select_ms;
+        metadata.timings.frame_analysis_ms = prepared.frame_analysis_ms;
+        metadata.timings.adaptive_planning_ms = prepared.adaptive_planning_ms;
+        metadata.timings.selected_extraction_ms = prepared.selected_extraction_ms;
+        state.video = Some(prepared.video);
+        let mut frames = FrameState::from(&prepared.plan);
+        frames.extracted_frames = Some(prepared.extracted_frames);
+        frames.selected_frames = Some(prepared.selection.retained);
+        frames.removed_near_duplicates = Some(prepared.selection.removed_near_duplicates);
+        frames.adaptive_fallback_used = prepared.adaptive_fallback_reason.is_some();
+        frames.adaptive_fallback_reason = prepared.adaptive_fallback_reason;
+        frames.auto_bridge_frames = self.auto_bridge_frames;
+        state.frames = Some(frames);
+        state.stage = PipelineStage::SelectingFrames;
+        project_manager.write_state(&paths.state, &state).await?;
+        // Each backend owns its database and sparse output. This prevents a
+        // failed CUDA feature/matching run from ever contaminating a later CPU
+        // retry or a manually selected CPU run.
+        let mut effective_backend = self.colmap_backend;
+        let attempt_name = match effective_backend {
+            ColmapBackend::Cpu => "cpu",
+            ColmapBackend::Cuda => "cuda",
+        };
+        let mut attempt_root = paths
+            .project
+            .join("work")
+            .join("colmap-attempts")
+            .join(attempt_name);
+        tokio::fs::create_dir_all(&attempt_root).await?;
+        let mut database = attempt_root.join("database.db");
+        let mut colmap_log = attempt_root.join("colmap.log");
+        // COLMAP 4.1.x 的 OptionManager 无法用相对路径（如 ../frames）解析
+        // --image_path，`ExistsDir` 校验会直接失败。这里传入绝对路径；
+        // COLMAP 4.1.1 的 bitmap loader 已能正确处理 UTF-8/宽字符绝对路径。
+        let colmap_images = paths.frames.as_path();
+        let mut colmap_exe = self.colmap_executable().to_path_buf();
+        let mut backend_label = match effective_backend {
+            ColmapBackend::Cpu => "CPU",
+            ColmapBackend::Cuda => "CUDA",
+        };
+        let mut colmap_compute = match effective_backend {
+            ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+            ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
+        };
+        self.events.stage(
+            PipelineStage::ExtractingFeatures,
+            0.0,
+            format!("COLMAP 正在使用 {backend_label} 提取特征"),
+        );
+        let phase_started = Instant::now();
+        let feature_result = colmap::extract_features(
+            &colmap_exe,
+            &database,
+            colmap_images,
+            ColmapFeatureOptions {
+                compute: colmap_compute,
+            },
+            colmap_log.clone(),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ExtractingFeatures,
+                PipelineEngine::Colmap,
+                Some(prepared.selection.retained),
+                ObserverMode::BracketProgress,
+            )),
+        )
+        .await;
+        if let Err(error) = feature_result {
+            if effective_backend != ColmapBackend::Cuda || !colmap::is_cuda_runtime_error(&error) {
+                return Err(error);
+            }
+            self.events.stage(
+                PipelineStage::ExtractingFeatures,
+                0.0,
+                "CUDA SIFT 运行时失败，正在使用独立 CPU 数据库重试",
+            );
+            effective_backend = ColmapBackend::Cpu;
+            attempt_root = paths
+                .project
+                .join("work")
+                .join("colmap-attempts")
+                .join("cpu-fallback");
+            tokio::fs::create_dir_all(&attempt_root).await?;
+            database = attempt_root.join("database.db");
+            colmap_log = attempt_root.join("colmap.log");
+            colmap_exe = self
+                .engines
+                .colmap_for(effective_backend, self.cuda_colmap_flavor)
+                .to_path_buf();
+            colmap_compute = ColmapComputeMode::Cpu;
+            backend_label = "CPU（CUDA 回退）";
+            colmap::extract_features(
+                &colmap_exe,
+                &database,
+                colmap_images,
+                ColmapFeatureOptions {
+                    compute: colmap_compute,
+                },
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(prepared.selection.retained),
+                    ObserverMode::BracketProgress,
+                )),
+            )
+            .await?;
+        }
+        metadata.timings.colmap_features_ms = phase_started.elapsed().as_millis() as u64;
+        state.stage = PipelineStage::ExtractingFeatures;
+        state.features_complete = true;
+        project_manager.write_state(&paths.state, &state).await?;
+        self.events.stage(
+            PipelineStage::ExtractingFeatures,
+            1.0,
+            format!("{backend_label} 特征提取完成"),
+        );
+        self.events.stage(
+            PipelineStage::Matching,
+            0.0,
+            format!("COLMAP 正在进行 {backend_label} 顺序匹配"),
+        );
+        let phase_started = Instant::now();
+        let matching_result = colmap::match_sequential(
+            &colmap_exe,
+            &database,
+            ColmapMatchingOptions {
+                compute: colmap_compute,
+                overlap: 10,
+            },
+            colmap_log.clone(),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::Matching,
+                PipelineEngine::Colmap,
+                Some(prepared.selection.retained),
+                ObserverMode::BracketProgress,
+            )),
+        )
+        .await;
+        if let Err(error) = matching_result {
+            if effective_backend != ColmapBackend::Cuda || !colmap::is_cuda_runtime_error(&error) {
+                return Err(error);
+            }
+            self.events.stage(
+                PipelineStage::Matching,
+                0.0,
+                "CUDA SIFT 匹配运行时失败，正在使用独立 CPU 数据库重试",
+            );
+            effective_backend = ColmapBackend::Cpu;
+            attempt_root = paths
+                .project
+                .join("work")
+                .join("colmap-attempts")
+                .join("cpu-fallback");
+            tokio::fs::create_dir_all(&attempt_root).await?;
+            database = attempt_root.join("database.db");
+            colmap_log = attempt_root.join("colmap.log");
+            colmap_exe = self
+                .engines
+                .colmap_for(effective_backend, self.cuda_colmap_flavor)
+                .to_path_buf();
+            colmap_compute = ColmapComputeMode::Cpu;
+            backend_label = "CPU（CUDA 回退）";
+            colmap::extract_features(
+                &colmap_exe,
+                &database,
+                colmap_images,
+                ColmapFeatureOptions {
+                    compute: colmap_compute,
+                },
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(prepared.selection.retained),
+                    ObserverMode::BracketProgress,
+                )),
+            )
+            .await?;
+            colmap::match_sequential(
+                &colmap_exe,
+                &database,
+                ColmapMatchingOptions {
+                    compute: colmap_compute,
+                    overlap: 10,
+                },
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Matching,
+                    PipelineEngine::Colmap,
+                    Some(prepared.selection.retained),
+                    ObserverMode::BracketProgress,
+                )),
+            )
+            .await?;
+        }
+        metadata.timings.colmap_matching_ms = phase_started.elapsed().as_millis() as u64;
+        let fallback_used =
+            self.colmap_backend == ColmapBackend::Cuda && effective_backend == ColmapBackend::Cpu;
+        let execution = ColmapExecution {
+            requested_backend: Some(self.colmap_backend),
+            effective_backend: Some(effective_backend),
+            feature_compute_device: Some(
+                if effective_backend == ColmapBackend::Cuda {
+                    "cuda"
+                } else {
+                    "cpu"
+                }
+                .into(),
+            ),
+            matching_compute_device: Some(
+                if effective_backend == ColmapBackend::Cuda {
+                    "cuda"
+                } else {
+                    "cpu"
+                }
+                .into(),
+            ),
+            gpu_index: (effective_backend == ColmapBackend::Cuda).then_some(-1),
+            cuda_fallback_used: fallback_used,
+            cuda_fallback_reason: fallback_used
+                .then(|| "CUDA feature extraction or matching runtime failure".into()),
+            ..Default::default()
+        };
+        state.colmap_execution = execution.clone();
+        metadata.colmap_execution = execution;
+        state.stage = PipelineStage::Matching;
+        state.matching_complete = true;
+        project_manager.write_state(&paths.state, &state).await?;
+        self.events.stage(
+            PipelineStage::Matching,
+            1.0,
+            format!("{backend_label} 顺序匹配完成"),
+        );
+        let caspar_available = if effective_backend == ColmapBackend::Cuda {
+            engines::cuda_colmap_supports_caspar(&self.engines, self.cuda_colmap_flavor).await?
+        } else {
+            false
+        };
+        if self.mapper_ba_mode == MapperBaMode::Caspar && !caspar_available {
+            return Err(SplatError::UnsupportedEngine(
+                "当前 CUDA COLMAP 未以 CASPAR_ENABLED 编译；请切换 Ceres，或安装已验证的 CASPAR 构建。".into(),
+            ));
+        }
+        let use_caspar = should_use_caspar(
+            effective_backend,
+            caspar_available,
+            self.mapper_ba_mode,
+            prepared.selection.retained,
+        );
+        let ceres_sparse = attempt_root.join("incremental-ceres").join("sparse");
+        let caspar_sparse = attempt_root.join("incremental-caspar").join("sparse");
+        let mut caspar_fallback_reason = None;
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            0.0,
+            if use_caspar {
+                "正在使用 CASPAR GPU 增量重建相机轨迹"
+            } else {
+                "正在使用 Ceres 增量重建相机轨迹"
+            },
+        );
+        let phase_started = Instant::now();
+        let mapper_observer = || {
+            Some(self.process_observer(
+                PipelineStage::Reconstructing,
+                PipelineEngine::Colmap,
+                Some(prepared.selection.retained),
+                ObserverMode::Mapper,
+            ))
+        };
+        let (mut model, mut report, mut ba_backend) = if use_caspar {
+            let caspar_options = IncrementalMapperOptions {
+                ba_backend: IncrementalBaBackend::Caspar { gpu_index: -1 },
+            };
+            let caspar_result = colmap::map(
+                &colmap_exe,
+                &database,
+                colmap_images,
+                &caspar_sparse,
+                caspar_options,
+                colmap_log.clone(),
+                &self.process_manager,
+                mapper_observer(),
+            )
+            .await
+            .and_then(|_| best_sparse_model(&paths.frames, &caspar_sparse));
+            match caspar_result {
+                Ok((model, report)) if report.quality != ReconstructionQuality::Failed => {
+                    (model, report, "caspar")
+                }
+                Ok((_, report)) => {
+                    caspar_fallback_reason = Some(format!(
+                        "CASPAR 注册率 {:.1}% 低于 50% 阈值",
+                        report.registered_ratio * 100.0
+                    ));
+                    self.events.stage(
+                        PipelineStage::Reconstructing,
+                        0.0,
+                        "CASPAR 重建质量不足，正在回退 Ceres",
+                    );
+                    let (model, report) = run_ceres_mapper(
+                        &colmap_exe,
+                        &database,
+                        colmap_images,
+                        &ceres_sparse,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        mapper_observer(),
+                    )
+                    .await?;
+                    (model, report, "ceres")
+                }
+                Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
+                Err(error) => {
+                    caspar_fallback_reason = Some(error.to_string());
+                    self.events.stage(
+                        PipelineStage::Reconstructing,
+                        0.0,
+                        "CASPAR 不可用，正在回退 Ceres",
+                    );
+                    let (model, report) = run_ceres_mapper(
+                        &colmap_exe,
+                        &database,
+                        colmap_images,
+                        &ceres_sparse,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        mapper_observer(),
+                    )
+                    .await?;
+                    (model, report, "ceres")
+                }
+            }
+        } else {
+            let (model, report) = run_ceres_mapper(
+                &colmap_exe,
+                &database,
+                colmap_images,
+                &ceres_sparse,
+                colmap_log.clone(),
+                &self.process_manager,
+                mapper_observer(),
+            )
+            .await?;
+            (model, report, "ceres")
+        };
+        metadata.timings.colmap_mapping_ms = phase_started.elapsed().as_millis() as u64;
+        state.colmap_execution.effective_ba_backend = Some(ba_backend.into());
+        state.colmap_execution.caspar_fallback_used = caspar_fallback_reason.is_some();
+        state.colmap_execution.caspar_fallback_reason = caspar_fallback_reason.clone();
+        metadata.colmap_execution = state.colmap_execution.clone();
+        state.stage = PipelineStage::Reconstructing;
+        state.reconstruction_complete = true;
+        project_manager.write_state(&paths.state, &state).await?;
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            1.0,
+            format!(
+                "{} 增量重建完成",
+                if ba_backend == "caspar" {
+                    "CASPAR"
+                } else {
+                    "Ceres"
+                }
+            ),
+        );
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            0.0,
+            "正在核验注册率和三维点",
+        );
+        let mut registration_summary = match write_registered_frame_timeline(
+            &paths.logs,
+            &model,
+            self.auto_bridge_frames,
+        )
+        .await
+        {
+            Ok(Some(summary)) => {
+                self.events.send(
+                    PipelineStage::ValidatingReconstruction,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Info,
+                    Some(0.5),
+                    false,
+                    format!(
+                        "已将 COLMAP 注册结果关联到 {}/{} 个自适应关键帧",
+                        summary.registered_frames, summary.selected_frames
+                    ),
+                    Some(summary.registered_frames),
+                    Some(summary.selected_frames),
+                    Some("帧"),
+                );
+                if summary.weak_intervals > 0 {
+                    self.events.send(
+                        PipelineStage::ValidatingReconstruction,
+                        Some(PipelineEngine::System),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        Some(0.5),
+                        false,
+                        format!(
+                            "检测到 {} 个未注册关键帧弱区；已写入补帧诊断",
+                            summary.weak_intervals
+                        ),
+                        Some(summary.weak_intervals),
+                        Some(summary.weak_intervals),
+                        Some("区间"),
+                    );
+                    if summary.planned_bridge_frames > 0 {
+                        self.events.send(
+                            PipelineStage::ValidatingReconstruction,
+                            Some(PipelineEngine::System),
+                            EventKind::Log,
+                            EventLevel::Info,
+                            Some(0.5),
+                            false,
+                            format!(
+                                "已为弱区规划 {} 张原视频桥接帧，等待隔离补帧 attempt 执行",
+                                summary.planned_bridge_frames
+                            ),
+                            Some(summary.planned_bridge_frames),
+                            Some(summary.planned_bridge_frames),
+                            Some("帧"),
+                        );
+                    }
+                }
+                Some(summary)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.events.send(
+                    PipelineStage::ValidatingReconstruction,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Warning,
+                    Some(0.5),
+                    false,
+                    format!("无法写入自适应关键帧注册时间轴：{error}"),
+                    None,
+                    None,
+                    None,
+                );
+                None
+            }
+        };
+        if self.auto_bridge_frames && report.registered_ratio < 0.80
+            && registration_summary.as_ref().is_some_and(|summary| summary.planned_bridge_frames > 0) {
+            self.events.stage(PipelineStage::ValidatingReconstruction, 0.55, "自动补帧 attempt 1：正在准备隔离重建");
+            let bridge_plan = read_adaptive_bridge_plan(&paths.logs).await?;
+            let combined_selection = combined_bridge_selection(&paths.logs, &bridge_plan).await?;
+            let bridge_attempt = paths.project.join("work").join("colmap-attempts").join("supplemented-1");
+            let bridge_frames = bridge_attempt.join("frames");
+            let bridge_database = bridge_attempt.join("database.db");
+            let bridge_log = bridge_attempt.join("colmap.log");
+            let _bridge_sparse = bridge_attempt.join("incremental-ceres").join("sparse");
+            tokio::fs::create_dir_all(&bridge_attempt).await?;
+            self.events.stage(PipelineStage::ValidatingReconstruction, 0.55, "自动补帧 attempt 1：正在提取完整时间序列");
+            extract_selected_frames(&self.engines.ffmpeg, &metadata.source_path, &bridge_frames,
+                &bridge_attempt.join("ffmpeg"), &combined_selection, self.ffmpeg_hw_accel,
+                Some(paths.logs.join("ffmpeg-adaptive-bridge.log")), &self.process_manager, None).await?;
+            self.events.stage(PipelineStage::ValidatingReconstruction, 0.65, "自动补帧 attempt 1：正在提取独立 COLMAP 特征");
+            colmap::extract_features(&colmap_exe, &bridge_database, &bridge_frames,
+                ColmapFeatureOptions { compute: colmap_compute }, bridge_log.clone(), &self.process_manager, None).await?;
+            self.events.stage(PipelineStage::ValidatingReconstruction, 0.75, "自动补帧 attempt 1：正在进行独立顺序匹配");
+            colmap::match_sequential(&colmap_exe, &bridge_database,
+                ColmapMatchingOptions { compute: colmap_compute, overlap: 10 }, bridge_log.clone(), &self.process_manager, None).await?;
+            self.events.stage(PipelineStage::ValidatingReconstruction, 0.85, "自动补帧 attempt 1：正在使用 Ceres 验证重建质量");
+            let candidate = run_ceres_mapper(&colmap_exe, &bridge_database, &bridge_frames, &_bridge_sparse,
+                bridge_log, &self.process_manager, None).await;
+            match candidate {
+                Ok((candidate_model, candidate_report)) if accepts_bridge_attempt(&report, &candidate_report) => {
+                    promote_supplemented_frames(&paths.frames, &bridge_frames, &bridge_attempt.join("original-frames"))?;
+                    write_adaptive_selection_manifest(&paths.logs, &metadata.source_path, &combined_selection).await?;
+                    database = bridge_database;
+                    model = candidate_model;
+                    report = candidate_report;
+                    ba_backend = "ceres-supplemented";
+                    registration_summary = write_registered_frame_timeline(&paths.logs, &model, false).await?;
+                    self.events.stage(PipelineStage::ValidatingReconstruction, 0.95, "自动补帧 attempt 1 已通过质量验收");
+                }
+                Ok((_, candidate_report)) => self.events.stage(PipelineStage::ValidatingReconstruction, 0.95,
+                    format!("自动补帧 attempt 1 未采用：注册率 {:.1}% 未达到提升门槛", candidate_report.registered_ratio * 100.0)),
+                Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
+                Err(error) => self.events.stage(PipelineStage::ValidatingReconstruction, 0.95,
+                    format!("自动补帧 attempt 1 失败，继续使用原 attempt：{error}")),
+            }
+        }
+        if let Some(summary) = registration_summary.filter(|summary| summary.weak_intervals > 0) {
+            if !self.auto_bridge_frames {
+                let requirement = SupplementRequirement {
+                    reason: "自动补帧已关闭，检测到未注册关键帧弱区".into(),
+                    weak_interval_count: summary.weak_intervals,
+                    diagnostics_path: paths.logs.join("adaptive-registered-frames.json"),
+                };
+                state.needs_supplement = Some(requirement.clone());
+                state.stage = PipelineStage::NeedsSupplement;
+                metadata.needs_supplement = Some(requirement);
+                project_manager.write_state(&paths.state, &state).await?;
+                self.events.stage(
+                    PipelineStage::NeedsSupplement,
+                    1.0,
+                    format!(
+                        "已停止在训练前：{} 个弱区需要补充素材",
+                        summary.weak_intervals
+                    ),
+                );
+                return Err(SplatError::NeedsSupplement(format!(
+                    "检测到 {} 个弱区；请查看 logs/adaptive-registered-frames.json 并上传补充素材，或重新启用自动补帧。",
+                    summary.weak_intervals
+                )));
+            }
+        }
+        if report.quality == ReconstructionQuality::Failed {
+            return Err(SplatError::Process(format!(
+                "素材重建失败：注册 {}/{} 张（{:.1}%），低于 50% 阈值",
+                report.registered_images,
+                report.input_images,
+                report.registered_ratio * 100.0
+            )));
+        }
+        let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
+            format!(
+                "注册率 {:.1}%：低于 80%，结果质量可能受影响",
+                report.registered_ratio * 100.0
+            )
+        });
+        let model = promote_colmap_attempt(&database, &model, &paths.colmap)?;
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            1.0,
+            format!(
+                "注册 {}/{} 张 · 三维点 {}",
+                report.registered_images, report.input_images, report.points_3d
+            ),
+        );
+        let phase_started = Instant::now();
+        training::prepare_standard_colmap_dataset(&paths.training_input, &paths.frames, &model)
+            .await?;
+        metadata.timings.training_input_ms = phase_started.elapsed().as_millis() as u64;
+        state.training_input_complete = true;
+        project_manager.write_state(&paths.state, &state).await?;
+        let preset = match self.training_backend {
+            TrainingBackend::Brush => self.brush_training_preset.apply(quality.preset()),
+            TrainingBackend::Gsplat => quality.preset(),
+        };
+        let engine = match self.training_backend {
+            TrainingBackend::Brush => PipelineEngine::Brush,
+            TrainingBackend::Gsplat => PipelineEngine::Gsplat,
+        };
+        let backend_name = match self.training_backend {
+            TrainingBackend::Brush => "Brush",
+            TrainingBackend::Gsplat => "gsplat CUDA",
+        };
+        self.events.send(
+            PipelineStage::TrainingSplats,
+            Some(engine),
+            EventKind::Stage,
+            EventLevel::Info,
+            Some(0.0),
+            false,
+            format!(
+                "{backend_name} · 0/{}",
+                preset.brush_iterations
+            ),
+            Some(0),
+            Some(preset.brush_iterations as u64),
+            Some("iterations"),
+        );
+        let phase_started = Instant::now();
+        let training_output = training::train(
+            self.training_backend,
+            &self.engines.brush,
+            &self.engines.root,
+            TrainingRequest {
+                dataset_root: paths.training_input.clone(),
+                output_directory: match self.training_backend {
+                    TrainingBackend::Brush => paths.brush.clone(),
+                    TrainingBackend::Gsplat => paths.gsplat.clone(),
+                },
+                total_steps: preset.brush_iterations,
+                max_resolution: preset.brush_max_resolution,
+                max_splats: match self.training_backend {
+                    TrainingBackend::Brush => preset.brush_max_splats,
+                    TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
+                },
+                seed: 42,
+                log_path: paths.logs.join(match self.training_backend {
+                    TrainingBackend::Brush => "brush.log",
+                    TrainingBackend::Gsplat => "gsplat.log",
+                }),
+            },
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::TrainingSplats,
+                engine,
+                Some(preset.brush_iterations as u64),
+                match self.training_backend {
+                    TrainingBackend::Brush => ObserverMode::Brush(paths.brush.clone()),
+                    TrainingBackend::Gsplat => ObserverMode::Gsplat,
+                },
+            )),
+        )
+        .await?;
+        metadata.timings.training_ms = phase_started.elapsed().as_millis() as u64;
+        let candidate = training_output.candidate_ply;
+        state.stage = PipelineStage::TrainingSplats;
+        // Keep the legacy field truthful for resumed projects; the selected
+        // backend is recorded separately in `training_backend`.
+        state.brush_complete = self.training_backend == TrainingBackend::Brush;
+        project_manager.write_state(&paths.state, &state).await?;
+        self.events.stage(
+            PipelineStage::TrainingSplats,
+            1.0,
+            format!("{backend_name} 完成"),
+        );
+        self.events
+            .stage(PipelineStage::Exporting, 0.0, "正在校验并发布 PLY");
+        let phase_started = Instant::now();
+        let ply = inspect_gaussian_ply(&candidate)?;
+        metadata.timings.ply_validation_ms = phase_started.elapsed().as_millis() as u64;
+        let output_stem = metadata
+            .source_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("splat");
+        let final_ply = paths.project.join(format!("{output_stem}.ply"));
+        tokio::fs::rename(&candidate, &final_ply).await?;
+        state.stage = PipelineStage::Completed;
+        project_manager.write_state(&paths.state, &state).await?;
+        let completed_at = Utc::now();
+        let duration_ms = metadata
+            .started_at
+            .map(|started| (completed_at - started).num_milliseconds().max(0) as u64)
+            .unwrap_or(0);
+        metadata.status = ProjectStatus::Completed;
+        metadata.completed_at = Some(completed_at);
+        metadata.duration_ms = Some(duration_ms);
+        metadata.timings.total_ms = total_started.elapsed().as_millis() as u64;
+        let output = ProjectOutput {
+            final_ply: final_ply.clone(),
+            file_size: ply.file_size,
+            splat_count: ply.splat_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+        };
+        metadata.output = Some(output.clone());
+        project_manager
+            .write_metadata(&paths.metadata, metadata)
+            .await?;
+        self.events.stage(
+            PipelineStage::Exporting,
+            1.0,
+            format!(
+                "{} 已发布",
+                final_ply
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("PLY")
+            ),
+        );
+        self.events.stage(PipelineStage::Completed, 1.0, "任务完成");
+        Ok(PipelineResult {
+            project_id: metadata.id.to_string(),
+            project_path: paths.project.clone(),
+            final_ply,
+            file_size: ply.file_size,
+            splat_count: ply.splat_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+            duration_ms,
+            completed_at,
+            warning,
+            logs_directory: paths.logs.clone(),
+            colmap_backend: self.colmap_backend,
+        })
+    }
+    fn process_observer(
+        &self,
+        stage: PipelineStage,
+        engine: PipelineEngine,
+        total: Option<u64>,
+        mode: ObserverMode,
+    ) -> ProcessObserver {
+        let events = self.events.clone();
+        // A caller that supplies a total has established a determinate stage,
+        // even when the external tool has not yet emitted its first counter.
+        // Keeping the zero value here prevents the periodic heartbeat from
+        // replacing the initial `0 / total` with the UI's "持续运行" fallback.
+        let initial_unit = match mode {
+            ObserverMode::Brush(_) | ObserverMode::Gsplat => Some("iterations".to_string()),
+            _ => None,
+        };
+        let stage_progress = Arc::new(std::sync::Mutex::new((
+            0.0_f32,
+            total.map(|_| 0_u64),
+            total,
+            initial_unit,
+        )));
+        Arc::new(move |update| match update {
+            ProcessUpdate::Line { stream, line } => {
+                if let Some(progress) = parse_progress(&line, &mode, total) {
+                    *stage_progress.lock().unwrap_or_else(|p| p.into_inner()) =
+                        (progress.0, Some(progress.2), progress.3, progress.4.clone());
+                    events.send(
+                        stage,
+                        Some(engine),
+                        EventKind::Progress,
+                        EventLevel::Info,
+                        Some(progress.0),
+                        false,
+                        progress.1,
+                        Some(progress.2),
+                        progress.3,
+                        progress.4.as_deref(),
+                    );
+                } else if is_user_visible_diagnostic(&line) {
+                    // External tools (especially COLMAP) emit verbose INFO lines
+                    // such as focal length and camera parameters. They remain in
+                    // the per-project log file, but the live UI is reserved for
+                    // meaningful progress and actionable failures.
+                    let (progress, current, total, unit) = stage_progress
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    events.send(
+                        stage,
+                        Some(engine),
+                        EventKind::Log,
+                        match stream {
+                            crate::process::ProcessStream::Stderr => EventLevel::Warning,
+                            crate::process::ProcessStream::Stdout => EventLevel::Info,
+                        },
+                        Some(progress),
+                        total.is_none(),
+                        line,
+                        current,
+                        total,
+                        unit.as_deref(),
+                    );
+                }
+            }
+            ProcessUpdate::Heartbeat { elapsed_ms } => {
+                if let ObserverMode::Brush(directory) = &mode {
+                    if let Some(step) = brush_checkpoint_step(directory) {
+                        let bounded = total.map(|value| step.min(value)).unwrap_or(step);
+                        let ratio = total.filter(|value| *value > 0).map(|value| bounded as f32 / value as f32).unwrap_or(0.0);
+                        *stage_progress.lock().unwrap_or_else(|p| p.into_inner()) = (ratio, Some(bounded), total, Some("iterations".into()));
+                    }
+                }
+                let (progress, current, total, unit) = stage_progress
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                let message = match (engine, current, total) {
+                    (PipelineEngine::Brush, Some(current), Some(total)) if current > 0 => {
+                        format!("Brush · {current}/{total}")
+                    }
+                    (PipelineEngine::Brush, _, _) => format!("Brush · {} 秒", elapsed_ms / 1000),
+                    _ => format!("运行中 · {} 秒", elapsed_ms / 1000),
+                };
+                events.send(
+                    stage,
+                    Some(engine),
+                    EventKind::Heartbeat,
+                    EventLevel::Info,
+                    Some(progress),
+                    total.is_none(),
+                    message,
+                    current,
+                    total,
+                    unit.as_deref(),
+                );
+            }
+            ProcessUpdate::Started { .. } => {}
+        })
+    }
+}
+
+fn is_user_visible_diagnostic(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("ERROR")
+        || line.starts_with("Error")
+        || line.starts_with("error:")
+        || line.starts_with("fatal:")
+        // COLMAP/GLOG uses `Eyyyymmdd ...` for failures and `I...` for
+        // informational diagnostics. Never surface the latter in real time.
+        || (line.starts_with('E')
+            && line.as_bytes().get(1).is_some_and(|byte| byte.is_ascii_digit()))
+}
+pub fn default_engine_paths(engine_dir: Option<PathBuf>) -> EnginePaths {
+    match engine_dir {
+        Some(path) => EnginePaths::from_root(path),
+        None => EnginePaths::discover(None),
+    }
+}
+#[derive(Clone)]
+enum ObserverMode {
+    Ffmpeg,
+    BracketProgress,
+    Mapper,
+    Brush(PathBuf),
+    Gsplat,
+}
+type ProgressSample = (f32, String, u64, Option<u64>, Option<String>);
+
+#[derive(Deserialize)]
+struct GsplatProgressEvent {
+    event: String,
+    step: Option<u64>,
+    total: Option<u64>,
+    loss: Option<f64>,
+    splats: Option<u64>,
+}
+
+fn brush_checkpoint_step(directory: &Path) -> Option<u64> {
+    std::fs::read_dir(directory).ok()?.flatten().filter_map(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        name.strip_prefix("checkpoint_")?.split('.').next()?.parse::<u64>().ok()
+    }).max()
+}
+fn parse_progress(line: &str, mode: &ObserverMode, total: Option<u64>) -> Option<ProgressSample> {
+    match mode {
+        ObserverMode::Ffmpeg => {
+            // FFmpeg writes `frame=42` lines.
+            if let Some(rest) = line.strip_prefix("frame=") {
+                if let Some(value) = rest.split_whitespace().next() {
+                    if let Ok(parsed) = value.parse::<u64>() {
+                        let ratio = total
+                            .filter(|t| *t > 0)
+                            .map(|t| parsed.min(t) as f32 / t as f32)
+                            .unwrap_or(0.0);
+                        return Some((
+                            ratio,
+                            format!("已处理 {parsed} 帧"),
+                            parsed,
+                            total,
+                            Some("张".into()),
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        ObserverMode::BracketProgress => {
+            // Generic `<X>/<Y>` bracket counter, e.g. `processed 12/100`.
+            for token in line.split_whitespace() {
+                if let Some((left, right)) = token.split_once('/') {
+                    if let (Ok(current), Ok(total)) = (
+                        left.trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse::<u64>(),
+                        right
+                            .trim_end_matches(|c: char| !c.is_ascii_digit())
+                            .parse::<u64>(),
+                    ) {
+                        let ratio = if total > 0 {
+                            current.min(total) as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        return Some((
+                            ratio,
+                            line.to_string(),
+                            current,
+                            Some(total),
+                            Some("步".into()),
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        ObserverMode::Mapper => {
+            // COLMAP/GLOG prefixes each line and reports the meaningful count
+            // as `num_reg_frames=N`, e.g. `I... Registering image #61
+            // (num_reg_frames=2)`. Do not require the message at column zero.
+            if let Some((_, rest)) = line.split_once("num_reg_frames=") {
+                if let Some(value) = rest.split(|c: char| !c.is_ascii_digit()).next() {
+                    if let Ok(parsed) = value.parse::<u64>() {
+                        let ratio = total
+                            .filter(|t| *t > 0)
+                            .map(|t| parsed.min(t) as f32 / t as f32)
+                            .unwrap_or(0.0);
+                        return Some((
+                            ratio,
+                            format!("正在注册 {parsed}"),
+                            parsed,
+                            total,
+                            Some("张".into()),
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        ObserverMode::Brush(_) => {
+            if let Some(rest) = line.strip_prefix("step=") {
+                if let Some(value) = rest.split_whitespace().next() {
+                    if let Ok(parsed) = value.parse::<u64>() {
+                        let ratio = total
+                            .filter(|t| *t > 0)
+                            .map(|t| parsed.min(t) as f32 / t as f32)
+                            .unwrap_or(0.0);
+                        return Some((
+                            ratio,
+                            format!("Brush · {parsed}"),
+                            parsed,
+                            total,
+                            Some("iterations".into()),
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        ObserverMode::Gsplat => {
+            let event = serde_json::from_str::<GsplatProgressEvent>(line).ok()?;
+            if event.event != "progress" {
+                return None;
+            }
+            let (step, event_total) = (event.step?, event.total?);
+            if event_total == 0 || step > event_total {
+                return None;
+            }
+            let loss = event
+                .loss
+                .map(|value| format!(" · loss {value:.5}"))
+                .unwrap_or_default();
+            let splats = event
+                .splats
+                .map(|value| format!(" · {value} splats"))
+                .unwrap_or_default();
+            Some((
+                step as f32 / event_total as f32,
+                format!("gsplat 训练 {step}/{event_total}{loss}{splats}"),
+                step,
+                Some(event_total),
+                Some("iterations".into()),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn parses_gsplat_jsonl_progress_for_live_ui() {
+        let line = r#"{"event":"progress","step":13700,"total":15000,"loss":0.01941635087132454,"splats":5920}"#;
+        let sample = parse_progress(line, &ObserverMode::Gsplat, None).unwrap();
+        assert_eq!(sample.2, 13_700);
+        assert_eq!(sample.3, Some(15_000));
+        assert!(sample.1.contains("loss 0.01942"));
+        assert!(sample.1.contains("5920 splats"));
+    }
+
+    #[test]
+    fn hides_colmap_info_but_keeps_actionable_errors() {
+        assert!(!is_user_visible_diagnostic(
+            "I20260822 15:26:11.953427 24288 feature_extraction.cc:289] Focal Length: 2304.00px"
+        ));
+        assert!(is_user_visible_diagnostic(
+            "E20260822 15:26:12.0 mapper.cc:1] reconstruction failed"
+        ));
+    }
+
+    #[test]
+    fn parses_glog_mapper_registration_counter() {
+        let sample = parse_progress(
+            "I20260823 02:34:08 incremental_pipeline.cc:537] Registering image #61 (num_reg_frames=2)",
+            &ObserverMode::Mapper,
+            Some(273),
+        )
+        .unwrap();
+        assert_eq!(sample.2, 2);
+        assert_eq!(sample.3, Some(273));
+    }
+
+    #[test]
+    fn parses_ffmpeg_frame_progress_as_a_determinate_counter() {
+        let sample = parse_progress("frame=42", &ObserverMode::Ffmpeg, Some(120)).unwrap();
+        assert_eq!(sample.0, 0.35);
+        assert_eq!(sample.1, "已处理 42 帧");
+        assert_eq!(sample.2, 42);
+        assert_eq!(sample.3, Some(120));
+        assert_eq!(sample.4.as_deref(), Some("张"));
+    }
+
+    #[test]
+    fn mapper_ba_mode_routes_cuda_and_cpu_deterministically() {
+        assert!(!should_use_caspar(
+            ColmapBackend::Cuda,
+            true,
+            MapperBaMode::Auto,
+            150
+        ));
+        assert!(should_use_caspar(
+            ColmapBackend::Cuda,
+            true,
+            MapperBaMode::Auto,
+            151
+        ));
+        assert!(!should_use_caspar(
+            ColmapBackend::Cuda,
+            true,
+            MapperBaMode::Ceres,
+            631
+        ));
+        assert!(should_use_caspar(
+            ColmapBackend::Cuda,
+            true,
+            MapperBaMode::Caspar,
+            42
+        ));
+        assert!(!should_use_caspar(
+            ColmapBackend::Cuda,
+            false,
+            MapperBaMode::Caspar,
+            631
+        ));
+        assert!(!should_use_caspar(
+            ColmapBackend::Cpu,
+            true,
+            MapperBaMode::Caspar,
+            631
+        ));
+    }
+
+    #[test]
+    fn groups_adjacent_unregistered_frames_with_registered_anchors() {
+        let frames = vec![
+            timeline_frame("frame_000001.jpg", 0.0, true),
+            timeline_frame("frame_000002.jpg", 0.5, false),
+            timeline_frame("frame_000003.jpg", 1.0, false),
+            timeline_frame("frame_000004.jpg", 1.5, true),
+            timeline_frame("frame_000005.jpg", 2.0, false),
+        ];
+
+        let intervals = detect_weak_intervals(&frames);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].start_pts_seconds, 0.5);
+        assert_eq!(intervals[0].end_pts_seconds, 1.0);
+        assert_eq!(intervals[0].unregistered_frames, 2);
+        assert_eq!(
+            intervals[0].before_anchor.as_ref().map(|anchor| anchor.pts_seconds),
+            Some(0.0)
+        );
+        assert_eq!(
+            intervals[0].after_anchor.as_ref().map(|anchor| anchor.pts_seconds),
+            Some(1.5)
+        );
+        assert!(intervals[1].after_anchor.is_none());
+    }
+
+    #[test]
+    fn bridge_plan_respects_global_cap_and_excludes_selected_frames() {
+        let selected = vec![
+            selected_log("frame_000001.jpg", 1, 0.0),
+            selected_log("frame_000004.jpg", 4, 3.0),
+            selected_log("frame_000007.jpg", 7, 5.0),
+            selected_log("frame_000008.jpg", 8, 6.0),
+        ];
+        let weak = WeakFrameInterval {
+            reason: "unregisteredSelectedFrames",
+            start_pts_seconds: 1.0,
+            end_pts_seconds: 2.0,
+            unregistered_frames: 1,
+            first_output_file: "frame_000004.jpg".into(),
+            last_output_file: "frame_000004.jpg".into(),
+            before_anchor: Some(WeakIntervalAnchor { output_file: "frame_000001.jpg".into(), pts_seconds: 0.0 }),
+            after_anchor: Some(WeakIntervalAnchor { output_file: "frame_000007.jpg".into(), pts_seconds: 5.0 }),
+        };
+        let mut lower_sharpness = proxy_frame(2, 1.0, 2.0);
+        let mut higher_sharpness = proxy_frame(3, 2.0, 9.0);
+        lower_sharpness.inliers = 100;
+        higher_sharpness.inliers = 100;
+
+        let plan = plan_adaptive_bridges(&[lower_sharpness, higher_sharpness], &selected, &[weak]);
+        assert_eq!(plan.max_additional_frames, 1);
+        assert_eq!(plan.planned_frames.len(), 1);
+        assert_eq!(plan.planned_frames[0].source_index, 3);
+    }
+
+    #[test]
+    fn proxy_diagnostics_exposes_the_failing_geometry_gate() {
+        let mut qualifying = proxy_frame(2, 0.5, 2.0);
+        qualifying.textured_cells = 30;
+        qualifying.matched_cells = 20;
+        qualifying.inliers = 12;
+        qualifying.grid_coverage = 0.4;
+        qualifying.three_view_tracks = 6;
+        let mut rejected = proxy_frame(1, 0.0, 1.0);
+        rejected.grid_coverage = 0.1;
+        let diagnostics = summarize_proxy_diagnostics(
+            &[rejected, qualifying],
+            AdaptiveFrameProfile {
+                anchor_fps: 2.0,
+                analysis_fps: 6.0,
+                local_refine_fps: 12.0,
+                target_motion: 0.035,
+                max_motion: 0.08,
+                min_interval_ms: 120,
+                min_textured_cells: 12,
+                min_matched_cells: 8,
+                min_inliers_floor: 6,
+                min_inlier_ratio: 0.45,
+                min_three_view_floor: 3,
+                min_three_view_ratio: 0.35,
+            },
+            1,
+        );
+        assert_eq!(diagnostics.proxy_candidates, 2);
+        assert_eq!(diagnostics.geometry_qualified_frames, 1);
+        assert_eq!(diagnostics.below_min_textured_cells, 1);
+        assert_eq!(diagnostics.below_min_matched_cells, 1);
+        assert_eq!(diagnostics.below_min_inlier_floor, 1);
+    }
+
+    fn timeline_frame(output_file: &str, pts_seconds: f64, registered: bool) -> RegisteredFrameTimelineEntry {
+        RegisteredFrameTimelineEntry {
+            output_file: output_file.into(),
+            pts_seconds,
+            registered,
+        }
+    }
+
+    fn selected_log(output_file: &str, source_index: u64, pts_seconds: f64) -> AdaptiveSelectedFrameLog {
+        AdaptiveSelectedFrameLog { output_file: output_file.into(), source_index, pts_seconds }
+    }
+
+    fn proxy_frame(source_index: u64, pts_seconds: f64, sharpness: f64) -> ProxyFrame {
+        ProxyFrame {
+            source_index,
+            pts_seconds,
+            phash: source_index,
+            sharpness,
+            textured_cells: 4,
+            matched_cells: 4,
+            background_motion: 0.02,
+            inliers: 0,
+            grid_coverage: 0.5,
+            three_view_tracks: 20,
+            confirmed_scene_change: false,
+        }
+    }
+}
+fn summarize_proxy_diagnostics(
+    frames: &[ProxyFrame],
+    profile: AdaptiveFrameProfile,
+    selected_frames: usize,
+) -> AdaptiveProxyDiagnostics {
+    let geometry_qualified_frames = frames
+        .iter()
+        .filter(|frame| passes_proxy_geometry(frame, profile))
+        .count();
+    AdaptiveProxyDiagnostics {
+        proxy_candidates: u64::try_from(frames.len()).expect("usize always fits u64"),
+        selected_frames: u64::try_from(selected_frames).expect("usize always fits u64"),
+        min_textured_cells: profile.min_textured_cells,
+        min_matched_cells: profile.min_matched_cells,
+        min_inliers_floor: profile.min_inliers_floor,
+        min_inlier_ratio: profile.min_inlier_ratio,
+        min_three_view_floor: profile.min_three_view_floor,
+        min_three_view_ratio: profile.min_three_view_ratio,
+        geometry_qualified_frames: u64::try_from(geometry_qualified_frames)
+            .expect("usize always fits u64"),
+        below_min_textured_cells: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.textured_cells < profile.min_textured_cells)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        below_min_matched_cells: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.matched_cells < profile.min_matched_cells)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        below_min_inlier_floor: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.inliers < profile.min_inliers_floor)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        below_min_inlier_ratio: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.matched_cells == 0 || frame.inliers as f64 / (frame.matched_cells as f64) < profile.min_inlier_ratio)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        below_min_three_view_floor: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.three_view_tracks < profile.min_three_view_floor)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        below_min_three_view_ratio: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.inliers == 0 || frame.three_view_tracks as f64 / (frame.inliers as f64) < profile.min_three_view_ratio)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        confirmed_scene_changes: u64::try_from(
+            frames
+                .iter()
+                .filter(|frame| frame.confirmed_scene_change)
+                .count(),
+        )
+        .expect("usize always fits u64"),
+        median_inliers: median_proxy_metric(frames.iter().map(|frame| frame.inliers as f64)),
+        median_textured_cells: median_proxy_metric(frames.iter().map(|frame| frame.textured_cells as f64)),
+        median_matched_cells: median_proxy_metric(frames.iter().map(|frame| frame.matched_cells as f64)),
+        median_grid_coverage: median_proxy_metric(frames.iter().map(|frame| frame.grid_coverage)),
+        median_three_view_tracks: median_proxy_metric(
+            frames.iter().map(|frame| frame.three_view_tracks as f64),
+        ),
+    }
+}
+
+fn median_proxy_metric(values: impl Iterator<Item = f64>) -> f64 {
+    let mut values = values.filter(|value| value.is_finite()).collect::<Vec<_>>();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+async fn read_adaptive_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {
+    let bytes = tokio::fs::read(logs.join("adaptive-bridge-plan.json")).await?;
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+async fn combined_bridge_selection(logs: &Path, plan: &AdaptiveBridgePlan) -> Result<Vec<SelectedSourceFrame>> {
+    let selected: AdaptiveSelectedFramesLog = serde_json::from_slice(&tokio::fs::read(logs.join("adaptive-selected-frames.json")).await?)?;
+    let proxy: AdaptiveProxyAnalysisLog = serde_json::from_slice(&tokio::fs::read(logs.join("adaptive-proxy-analysis.json")).await?)?;
+    let mut frames = selected.frames.into_iter().map(|frame| {
+        let source = proxy.frames.iter().find(|candidate| candidate.source_index == frame.source_index);
+        SelectedSourceFrame { source_index: frame.source_index, pts_seconds: frame.pts_seconds, reason: SelectionReason::MotionTarget,
+            motion: source.map_or(0.0, |value| value.background_motion), inliers: source.map_or(0, |value| value.inliers),
+            grid_coverage: source.map_or(0.0, |value| value.grid_coverage), sharpness: source.map_or(0.0, |value| value.sharpness) }
+    }).collect::<Vec<_>>();
+    for bridge in &plan.planned_frames {
+        if !frames.iter().any(|frame| frame.source_index == bridge.source_index) {
+            frames.push(SelectedSourceFrame { source_index: bridge.source_index, pts_seconds: bridge.pts_seconds, reason: SelectionReason::Bridge,
+                motion: 0.0, inliers: bridge.inliers, grid_coverage: bridge.grid_coverage, sharpness: bridge.sharpness });
+        }
+    }
+    frames.sort_by_key(|frame| frame.source_index);
+    Ok(frames)
+}
+
+fn accepts_bridge_attempt(original: &ReconstructionReport, candidate: &ReconstructionReport) -> bool {
+    candidate.quality != ReconstructionQuality::Failed && candidate.registered_ratio >= 0.80
+        && candidate.registered_images > original.registered_images
+}
+
+fn promote_supplemented_frames(canonical: &Path, supplemented: &Path, backup: &Path) -> Result<()> {
+    if backup.exists() { return Err(SplatError::Process(format!("补帧备份目录已存在：{}", backup.display()))); }
+    std::fs::rename(canonical, backup).map_err(|error| SplatError::Process(format!("无法保留原关键帧：{error}")))?;
+    std::fs::rename(supplemented, canonical).map_err(|error| SplatError::Process(format!("无法提升补帧关键帧：{error}")))?;
+    Ok(())
+}
+
+async fn write_adaptive_selection_manifest(logs: &Path, source: &Path, frames: &[SelectedSourceFrame]) -> Result<()> {
+    let entries = frames.iter().enumerate().map(|(index, frame)| serde_json::json!({
+        "outputFile": format!("frame_{:06}.jpg", index + 1), "sourceIndex": frame.source_index,
+        "ptsSeconds": frame.pts_seconds, "reason": frame.reason, "motion": frame.motion,
+        "inliers": frame.inliers, "gridCoverage": frame.grid_coverage, "sharpness": frame.sharpness,
+    })).collect::<Vec<_>>();
+    tokio::fs::write(logs.join("adaptive-selected-frames.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "strategy": "adaptiveSfmSupplemented", "sourceVideo": source, "frames": entries,
+    }))?).await?;
+    Ok(())
+}
+
+/// Write the durable join between adaptive source PTS and COLMAP registration.
+/// A missing manifest is expected for the fixed-FPS fallback and older projects.
+async fn write_registered_frame_timeline(
+    logs: &Path,
+    model: &Path,
+    auto_bridge_frames: bool,
+) -> Result<Option<RegistrationTimelineSummary>> {
+    let manifest_path = logs.join("adaptive-selected-frames.json");
+    let manifest_bytes = match tokio::fs::read(&manifest_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest: AdaptiveSelectedFramesLog = serde_json::from_slice(&manifest_bytes)?;
+    let registered_names = ReconstructionValidator::registered_images(model)?
+        .into_iter()
+        .map(|image| image.name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let frames = manifest
+        .frames
+        .iter()
+        .map(|frame| {
+            let registered = registered_names.contains(&frame.output_file.to_ascii_lowercase());
+            RegisteredFrameTimelineEntry {
+                output_file: frame.output_file.clone(),
+                pts_seconds: frame.pts_seconds,
+                registered,
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = u64::try_from(frames.len()).map_err(|_| {
+        SplatError::Process("自适应关键帧数量超过可记录范围".into())
+    })?;
+    let registered = u64::try_from(frames.iter().filter(|frame| frame.registered).count())
+        .map_err(|_| SplatError::Process("已注册关键帧数量超过可记录范围".into()))?;
+    let weak_intervals = detect_weak_intervals(&frames);
+    let timeline = RegisteredFrameTimeline {
+        selected_frames: selected,
+        registered_frames: registered,
+        frames,
+        weak_intervals,
+    };
+    tokio::fs::write(
+        logs.join("adaptive-registered-frames.json"),
+        serde_json::to_vec_pretty(&timeline)?,
+    )
+    .await?;
+    let weak_intervals = u64::try_from(timeline.weak_intervals.len())
+        .map_err(|_| SplatError::Process("弱区数量超过可记录范围".into()))?;
+    let planned_bridge_frames = if auto_bridge_frames && !timeline.weak_intervals.is_empty() {
+        write_adaptive_bridge_plan(logs, &manifest, &timeline.weak_intervals).await?
+    } else {
+        0
+    };
+    Ok(Some(RegistrationTimelineSummary {
+        selected_frames: selected,
+        registered_frames: registered,
+        weak_intervals,
+        planned_bridge_frames,
+    }))
+}
+
+async fn write_adaptive_bridge_plan(
+    logs: &Path,
+    selected: &AdaptiveSelectedFramesLog,
+    weak_intervals: &[WeakFrameInterval],
+) -> Result<u64> {
+    let path = logs.join("adaptive-proxy-analysis.json");
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let proxy: AdaptiveProxyAnalysisLog = serde_json::from_slice(&bytes)?;
+    let plan = plan_adaptive_bridges(&proxy.frames, &selected.frames, weak_intervals);
+    let planned = u64::try_from(plan.planned_frames.len())
+        .map_err(|_| SplatError::Process("桥接帧数量超过可记录范围".into()))?;
+    tokio::fs::write(
+        logs.join("adaptive-bridge-plan.json"),
+        serde_json::to_vec_pretty(&plan)?,
+    )
+    .await?;
+    Ok(planned)
+}
+
+/// Choose at most two high-quality unselected proxy frames per weak interval,
+/// while keeping the total at or below 25% of the original adaptive selection.
+fn plan_adaptive_bridges(
+    proxy_frames: &[ProxyFrame],
+    selected_frames: &[AdaptiveSelectedFrameLog],
+    weak_intervals: &[WeakFrameInterval],
+) -> AdaptiveBridgePlan {
+    let max_additional_frames = u64::try_from(selected_frames.len() / 4)
+        .expect("usize always fits u64 on supported platforms");
+    let selected_indices = selected_frames
+        .iter()
+        .map(|frame| frame.source_index)
+        .collect::<HashSet<_>>();
+    let mut planned_frames = Vec::new();
+    for (weak_interval_index, interval) in weak_intervals.iter().enumerate() {
+        if planned_frames.len() >= max_additional_frames as usize {
+            break;
+        }
+        let start = interval
+            .before_anchor
+            .as_ref()
+            .map(|anchor| anchor.pts_seconds)
+            .unwrap_or(interval.start_pts_seconds);
+        let end = interval
+            .after_anchor
+            .as_ref()
+            .map(|anchor| anchor.pts_seconds)
+            .unwrap_or(interval.end_pts_seconds);
+        let remaining = max_additional_frames as usize - planned_frames.len();
+        let mut candidates = proxy_frames
+            .iter()
+            .filter(|frame| {
+                !selected_indices.contains(&frame.source_index)
+                    && !frame.confirmed_scene_change
+                    && frame.pts_seconds >= start
+                    && frame.pts_seconds <= end
+                    && frame.sharpness.is_finite()
+                    && frame.sharpness > 0.0
+                    && frame.inliers > 0
+                    && frame.grid_coverage > 0.0
+                    && frame.three_view_tracks > 0
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .sharpness
+                .partial_cmp(&left.sharpness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.source_index.cmp(&right.source_index))
+        });
+        for candidate in candidates.into_iter().take(remaining.min(2)) {
+            planned_frames.push(AdaptiveBridgeFrame {
+                source_index: candidate.source_index,
+                pts_seconds: candidate.pts_seconds,
+                weak_interval_index: u64::try_from(weak_interval_index)
+                    .expect("usize always fits u64 on supported platforms"),
+                reason: "unregisteredGapBridge".to_string(),
+                sharpness: candidate.sharpness,
+                inliers: candidate.inliers,
+                grid_coverage: candidate.grid_coverage,
+            });
+        }
+    }
+    AdaptiveBridgePlan {
+        max_additional_frames,
+        planned_frames,
+    }
+}
+
+/// A run of unregistered selected frames is a diagnosable coverage gap. It is
+/// intentionally only a diagnostic at this stage: a later quality gate decides
+/// whether to insert bridge frames, request supplementary media, or accept the
+/// reconstruction as-is.
+fn detect_weak_intervals(frames: &[RegisteredFrameTimelineEntry]) -> Vec<WeakFrameInterval> {
+    let mut intervals = Vec::new();
+    let mut index = 0;
+    while index < frames.len() {
+        if frames[index].registered {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < frames.len() && !frames[index].registered {
+            index += 1;
+        }
+        let end = index - 1;
+        let before_anchor = start.checked_sub(1).and_then(|anchor_index| {
+            let anchor = &frames[anchor_index];
+            anchor.registered.then(|| WeakIntervalAnchor {
+                output_file: anchor.output_file.clone(),
+                pts_seconds: anchor.pts_seconds,
+            })
+        });
+        let after_anchor = frames.get(index).and_then(|anchor| {
+            anchor.registered.then(|| WeakIntervalAnchor {
+                output_file: anchor.output_file.clone(),
+                pts_seconds: anchor.pts_seconds,
+            })
+        });
+        intervals.push(WeakFrameInterval {
+            reason: "unregisteredSelectedFrames",
+            start_pts_seconds: frames[start].pts_seconds,
+            end_pts_seconds: frames[end].pts_seconds,
+            unregistered_frames: u64::try_from(end - start + 1)
+                .expect("frame slice length always fits u64"),
+            first_output_file: frames[start].output_file.clone(),
+            last_output_file: frames[end].output_file.clone(),
+            before_anchor,
+            after_anchor,
+        });
+    }
+    intervals
+}
+
+/// Promotes only a validated attempt into the stable layout consumed by
+/// training. Failed attempts remain untouched under `colmap-attempts`.
+fn promote_colmap_attempt(database: &Path, model: &Path, canonical_root: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(canonical_root)?;
+    std::fs::copy(database, canonical_root.join("database.db"))
+        .map_err(|error| SplatError::Process(format!("无法提升已验证的 COLMAP 数据库：{error}")))?;
+    let target = canonical_root.join("sparse").join("0");
+    if target.exists() {
+        std::fs::remove_dir_all(&target).map_err(|error| {
+            SplatError::Process(format!(
+                "无法替换正式稀疏模型 {}：{error}",
+                target.display()
+            ))
+        })?;
+    }
+    std::fs::create_dir_all(&target)?;
+    for entry in std::fs::read_dir(model)? {
+        let entry = entry?;
+        let source = entry.path();
+        if source.is_file() {
+            std::fs::copy(&source, target.join(entry.file_name()))?;
+        }
+    }
+    Ok(target)
+}
+
+async fn run_ceres_mapper(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    sparse: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<(PathBuf, ReconstructionReport)> {
+    colmap::map(
+        executable,
+        database,
+        images,
+        sparse,
+        IncrementalMapperOptions {
+            ba_backend: IncrementalBaBackend::Ceres,
+        },
+        log,
+        manager,
+        observer,
+    )
+    .await?;
+    best_sparse_model(images, sparse)
+}
+
+fn best_sparse_model(frames: &Path, sparse_root: &Path) -> Result<(PathBuf, ReconstructionReport)> {
+    let mut best: Option<(PathBuf, ReconstructionReport)> = None;
+    let entries = std::fs::read_dir(sparse_root)
+        .map_err(|error| SplatError::Process(format!("无法列出稀疏重建目录：{error}")))?;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if !candidate.is_dir() {
+            continue;
+        }
+        match ReconstructionValidator::validate(frames, &candidate) {
+            Ok(report) => {
+                let replace = match &best {
+                    None => true,
+                    Some((_, current)) => report.registered_images > current.registered_images,
+                };
+                if replace {
+                    best = Some((candidate, report));
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    best.ok_or_else(|| SplatError::Process("稀疏重建没有可用子模型".into()))
+}

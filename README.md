@@ -1,0 +1,128 @@
+# OOOSplat 本地升级版 0.46
+
+Windows 本地视频转 3D Gaussian Splatting 桌面应用。选择 MP4/MOV 视频后，应用在本机完成抽帧、COLMAP 稀疏重建与训练，并生成标准 Gaussian PLY。默认训练后端为 Brush；gsplat CUDA 是通过运行时健康检查后才可选的实验后端。
+
+> MOD By Jamin。项目基于 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的桌面流水线继续演进；不会上传视频或训练数据。
+
+## 相对原项目的升级
+
+| 能力 | 本地升级内容 |
+| --- | --- |
+| 有界候选抽帧 | 不再按源视频的每一帧抽取。质量档位固定为快速 **1 FPS**、均衡 **2 FPS**、精细 **4 FPS**，避免 30/60 FPS 视频产生过量候选帧。 |
+| 有效视图筛选 | 基于 Rayon 对候选帧在最多 8 个 CPU 线程中并行计算 pHash 与 Laplacian 指标；全部计算成功后，按时间顺序合并连续近重复画面，并以 Laplacian 方差保留更清晰的一帧。 |
+| COLMAP 双后端 | 同时提供 CPU/no-CUDA 与可选 CUDA COLMAP。桌面应用默认选择 CUDA；CUDA SIFT 与 SIFT_BRUTEFORCE 匹配会实际传递 GPU 参数，CPU 后端强制关闭 GPU。 |
+| CASPAR CUDA 引擎 | 官方 CUDA 与自编译 CASPAR CUDA 并存，不互相覆盖。选择 CASPAR 会自动绑定 CASPAR 全局 BA，适合中大型项目；同一 273 帧素材实测建图 430 秒降至 126 秒，注册率均为 100%。 |
+| Brush 训练预设 | A/B/C 三档独立于抽帧质量：A 稳定均衡、B 显存优先、C 质量优先；训练时会传入对应的步数、最大分辨率与 splat 上限。 |
+| 双训练后端 | Brush 为默认稳定后端。gsplat 使用隔离 Python/CUDA 运行时，读取同一份 `work/training-input`；只有 Python、CUDA 和 rasterization 健康检查均通过才可选择。 |
+| gsplat 显存与模型控制 | 自动识别显存，GPU 图片 LRU 缓存限制为 256–1024 MB；可选自动安全、100 万、200 万、400 万 splat 硬上限。MCMC 采用 opacity/scale 正则、验证损失停滞冻结增殖与透明 splat 导出过滤，cap 不代表质量目标。 |
+| Brush 数据集与查看 | 自动创建含 `images/`、`sparse/0/` COLMAP 二进制模型的 `dataset.zip`；历史任务可通过“查看 3D”启动 Brush 内置查看器。 |
+| 可观测性 | 总任务进度和阶段进度区分显示；相机重建解析 `num_reg_frames`；Brush 每 10% 写入 checkpoint，据真实 checkpoint 更新训练计数。 |
+| 历史任务 | 首屏仅读取项目元数据，不扫描大型 PLY；详情按需展开，保留查看 3D、资源管理器与删除操作。 |
+| 任务产物 | 项目目录采用 `YYYYMMDD_视频文件名`；最终 PLY 使用原视频文件名，例如 `20260822_walkthrough/walkthrough.ply`。 |
+
+## 流程
+
+```text
+视频
+  → FFprobe 验证视频流并读取元数据
+  → FFmpeg 按 1 / 2 / 4 FPS 生成候选帧
+  → 并行 pHash / Laplacian 指标 → 顺序去连续近重复 + 清晰帧选择
+  → COLMAP CPU 或 CUDA SIFT 特征提取 / SIFT_BRUTEFORCE 匹配 / 稀疏重建
+  → 标准 training-input（images/ + sparse/0/）
+  → Brush（默认）或 gsplat CUDA（实验）训练
+  → 校验并发布 <视频文件名>.ply
+```
+
+COLMAP 注册率低于 50% 时任务停止；50%–80% 时继续完成，但会提示质量风险。
+
+## 使用
+
+1. 启动应用，确认 FFmpeg、COLMAP 和 Brush 状态正常。默认训练后端为 **Brush**。
+2. 打开设置：默认选择 **COLMAP CUDA**。中大型项目可选 **CASPAR CUDA**；它自动使用 CASPAR 全局 BA，小项目可能受初始化开销影响。
+3. 选择视频、项目根目录和画质档位（快速 1 FPS / 均衡 2 FPS / 精细 4 FPS）。
+4. 在设置中按显存与质量需求选择 Brush 训练预设；需要实验 gsplat 时，先通过其 CUDA 健康检查，再选择后端与 splat 上限。
+5. 点击“开始生成”。左侧显示整体进度，任务日志在右侧历史/详情中查看。
+6. 完成后在历史任务中打开项目目录、点击“查看 3D”，或直接取得同名 PLY。
+
+### Brush 训练预设
+
+| 预设 | 适用场景 | 训练参数取舍 |
+| --- | --- | --- |
+| A（默认） | 大多数设备 | 稳定均衡；按画质使用 7k / 15k / 30k 步，splat 上限为 1.5M / 3M / 5M。 |
+| B | 6–8 GB 显存或希望减少中断 | 保持步数，降低最大分辨率与 splat 上限为 1M / 2M / 3M。 |
+| C | 建议 12 GB 以上显存、优先质量 | 步数提升至 1.5 倍，splat 上限为 2M / 5M / 8M；耗时与显存需求更高。 |
+
+这些预设只影响 Brush 训练，不改变 1 / 2 / 4 FPS 候选抽帧档位。
+
+### 项目目录
+
+```text
+<projects-root>/20260822_<视频文件名>/
+  frames/                       # 经过 pHash / 清晰度筛选后送入 COLMAP 的 JPEG
+  work/colmap-attempts/<cpu|cuda>/ # 后端独立的 database.db、sparse/ 与 colmap.log
+  work/brush/dataset.zip        # Brush 输入归档
+  work/brush/                   # Brush 训练过程及临时输出
+  work/training-input/          # 统一训练输入：images/ + sparse/0/
+  work/gsplat/                  # gsplat 请求、训练过程及临时输出（选择该后端时）
+  logs/                         # ffmpeg / colmap / brush / gsplat 完整日志
+  <视频文件名>.ply              # 最终产物
+  project.json                  # 项目元数据与最终 PLY 路径
+  state.json                    # 可恢复的流水线状态
+```
+
+## 安装与开发
+
+环境要求：Windows 10/11 x64、WebView2、Node.js 22+、Rust stable、Visual Studio 2022 Build Tools。
+
+```powershell
+npm install
+npm run setup:engines
+# 需要 COLMAP CUDA 时执行；默认安装只部署 CPU/no-CUDA 版本
+npm run setup:engines:optional
+npm run tauri -- dev
+```
+
+### gsplat CUDA 双包安装
+
+基础 NSIS 安装包默认仅包含 Brush 等核心引擎。gsplat CUDA Python 运行时约 3 GB，超过 NSIS 单安装包的可靠容量，须作为独立运行时包分发，且不应提交到 Git。
+
+发布者在已验证本机 CUDA 运行时后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-gsplat-runtime.ps1
+```
+
+生成的 ZIP 位于 `.tmp\runtime-packages`，不含 `engines\gsplat\source` 或构建日志。用户先安装基础包，再解压 ZIP 并运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-gsplat-runtime.ps1
+```
+
+脚本会请求 Windows 管理员权限，识别 OOOSplat 的 `engines` 或 `resources\engines` 布局后安装 `gsplat`，并将既有运行时改名备份而不删除。完成后重新启动应用，设置页的 gsplat CUDA 状态会重新健康检查。
+
+常用校验与构建命令：
+
+```powershell
+npm test
+cargo test --manifest-path src-tauri\Cargo.toml
+npm run verify:engines
+npm run verify:licenses
+npm run build:bundle             # 打包前完整校验：引擎 + 许可 + 前端构建
+npm run tauri -- build
+```
+
+`engines/manifest.json` 使用 schemaVersion 3。它将 Windows CPU/CUDA COLMAP 归档固定到官方 `4.1.1` 发行物与完整 SHA-256，并锁定 CUDA `colmap.exe` 哈希。`npm run verify:engines` 会检查 CPU/no-CUDA、CUDA 支持、特征/匹配 GPU 参数及 Mapper BA 参数。请不要手工修改归档 SHA-256。
+
+## 当前进度
+
+详细的已完成项、验证状态、性能证据边界和待办事项见 [PROJECT_PROGRESS.md](PROJECT_PROGRESS.md)。
+
+## 限制与许可
+
+- CUDA 是默认偏好，不是必需条件。实际的 COLMAP 加速效果取决于显卡、驱动与 COLMAP 参数；CPU/no-CUDA 可作为回退。
+- Brush 是默认训练后端；gsplat CUDA 为实验功能。相同画质档不承诺生成相同数量的 splat，也不能凭单次训练宣称速度或质量更优。
+- CUDA 与 CPU 的 COLMAP 尝试目录彼此隔离。仅 CUDA/驱动/显存等运行时故障才会自动切换到独立 CPU 尝试；素材质量问题不会被误判为回退条件。CUDA 且筛选后保留至少 151 帧时，Mapper 会先尝试 CASPAR GPU BA；启动、Mapper、模型解析或注册率低于 50% 时，会在独立目录回退 Ceres，并把实际 BA 后端与原因写入项目记录。CASPAR 仍是实验路径，尚未完成 631 帧真实样本的性能/质量验收。
+- CASPAR 由“COLMAP 引擎版本”统一控制：选择 CASPAR CUDA 自动使用 CASPAR 全局 BA；官方 CUDA 使用自动 Ceres 路径。COLMAP 4.1.1 不支持 CASPAR local BA，局部 BA 始终使用 Ceres。
+- FFmpeg 硬件加速可在设置中选择关闭、自动、D3D11VA 或 CUDA。若驱动或运行时不支持，应切换为“自动”或“关闭”。
+- 重建质量受拍摄覆盖、纹理、运动模糊、显卡、驱动及 COLMAP 注册率影响。建议围绕目标物体缓慢移动，并保持充足视角重叠。
+- 项目代码采用 Apache-2.0；FFmpeg、COLMAP、Brush 分别适用其自身许可证。详见 [NOTICE](NOTICE)、[licenses/THIRD_PARTY_NOTICES.txt](licenses/THIRD_PARTY_NOTICES.txt) 与 [GENERATED_OUTPUTS.md](GENERATED_OUTPUTS.md)。

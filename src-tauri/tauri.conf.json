@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OOOSplat",
+  "version": "0.46.0",
+  "identifier": "studio.ooo.splat",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:bundle",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "OOOSplat",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 820,
+        "minHeight": 620,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#eef1f5"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost",
+      "assetProtocol": {
+        "enable": false,
+        "scope": []
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "targets": ["nsis"],
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../NOTICE": "NOTICE",
+      "../TRADEMARK_POLICY.md": "TRADEMARK_POLICY.md",
+      "../GENERATED_OUTPUTS.md": "GENERATED_OUTPUTS.md",
+      "../licenses/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
+      "../licenses/FFmpeg-LGPL-2.1.txt": "licenses/FFmpeg-LGPL-2.1.txt",
+      "../licenses/COLMAP-LICENSE.txt": "licenses/COLMAP-LICENSE.txt",
+      "../licenses/Brush-LICENSE.txt": "licenses/Brush-LICENSE.txt",
+      "../engines/manifest.json": "engines/manifest.json",
+      "../engines/ffmpeg": "engines/ffmpeg",
+      "../engines/colmap": "engines/colmap",
+      "../engines/colmap-cuda": "engines/colmap-cuda",
+      "../engines/colmap-caspar": "engines/colmap-caspar",
+      "../engines/brush": "engines/brush"
+    },
+    "windows": {
+      "nsis": {
+        "installerIcon": null,
+        "installMode": "perMachine",
+        "compression": "bzip2"
+      }
+    }
+  }
+}

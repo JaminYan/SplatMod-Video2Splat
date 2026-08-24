@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 3,
+  "generatedAt": "2026-08-22",
+  "engines": [
+    {
+      "name": "FFmpeg / FFprobe",
+      "requestedSeries": "8.1",
+      "actualVersion": "n8.1.2-34-g9b6c8969e0-20260812",
+      "distribution": "BtbN win64 LGPL shared 8.1",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
+      "archiveSha256": "C0692B85D56F2995656406425C095700117DFD7A84F8CA5AF75EBF92ED08B8A9",
+      "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
+      "licenseFiles": [
+        "licenses/FFmpeg-LGPL-2.1.txt"
+      ],
+      "install": {
+        "archiveName": "ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
+        "destination": "engines/ffmpeg",
+        "anchorFile": "ffmpeg.exe",
+        "rootFromAnchorParent": 0
+      }
+    },
+    {
+      "name": "COLMAP (CPU/no-CUDA)",
+      "releaseTag": "4.1.1",
+      "actualVersion": "4.1.0.dev0, commit 5b76f53, 2026-04-27, without CUDA",
+      "sourceUrl": "https://github.com/colmap/colmap/releases/download/4.1.1/colmap-x64-windows-nocuda.zip",
+      "archiveSha256": "FAF1247D2EC90933AA8BD003709790ABF0211CDC132CCEEC4C831718F2E0895A",
+      "license": "BSD-3-Clause",
+      "licenseFiles": [
+        "licenses/COLMAP-LICENSE.txt"
+      ],
+      "runtimePolicy": "CLI-only invocation; CPU SIFT and CPU matching; no CUDA/cuDNN runtime filenames",
+      "install": {
+        "archiveName": "colmap-x64-windows-nocuda.zip",
+        "destination": "engines/colmap",
+        "anchorFile": "colmap.exe",
+        "rootFromAnchorParent": 1
+      }
+    },
+    {
+      "name": "COLMAP (CUDA)",
+      "optional": true,
+      "releaseTag": "4.1.1",
+      "actualVersion": "4.1.1, commit a0d785f, 2026-07-17, with CUDA",
+      "sourceUrl": "https://github.com/colmap/colmap/releases/download/4.1.1/colmap-x64-windows-cuda.zip",
+      "archiveSha256": "B06064E7E4BD34F5B4EF71B442D3537D95D57C666DBEC5A3B475902CCD832B9B",
+      "license": "BSD-3-Clause",
+      "licenseFiles": [
+        "licenses/COLMAP-LICENSE.txt"
+      ],
+      "runtimePolicy": "Optional CLI-only CUDA backend; installed only when explicitly requested.",
+      "install": {
+        "archiveName": "colmap-x64-windows-cuda.zip",
+        "destination": "engines/colmap-cuda",
+        "anchorFile": "colmap.exe",
+        "rootFromAnchorParent": 1
+      }
+    },
+    {
+      "name": "Brush",
+      "version": "0.3.0",
+      "sourceUrl": "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip",
+      "archiveSha256": "B68E3E9CF052D51BF3EE30776FA5A364DE7F2BA13B58443128FF797BB7BCFCD6",
+      "license": "Apache-2.0",
+      "licenseFiles": [
+        "licenses/Brush-LICENSE.txt"
+      ],
+      "install": {
+        "archiveName": "brush-app-x86_64-pc-windows-msvc.zip",
+        "destination": "engines/brush",
+        "anchorFile": "brush_app.exe",
+        "rootFromAnchorParent": 0
+      }
+    },
+    {
+      "name": "COLMAP (CASPAR CUDA)",
+      "optional": true,
+      "localBuild": true,
+      "releaseTag": "4.1.1",
+      "actualVersion": "4.1.1, commit a0d785f, CUDA; CASPAR_ENABLED local build",
+      "license": "BSD-3-Clause",
+      "licenseFiles": ["licenses/COLMAP-LICENSE.txt"],
+      "runtimePolicy": "Bundled local CASPAR build; global BA uses CASPAR and local BA uses Ceres.",
+      "install": { "destination": "engines/colmap-caspar", "anchorFile": "colmap.exe" }
+    }
+  ],
+  "requiredFiles": [
+    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "E41DBF0563AF8B07D8CF1818187500ACDF36AAAFB00186BA12A18C6C661F7EB0" },
+    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "08AE7637A339009A23BA469AAFC282A16A98E02B2999E14EC1A6C1198FD77221" },
+    { "path": "engines/colmap/bin/colmap.exe", "sha256": "4358DF3C6CA10B1ED0E6F8CF1CBBEDBA637FA2559DB7AA59B34D84AA44515ADE" },
+    { "path": "engines/brush/brush_app.exe", "sha256": "37E46CBF808B9983DD15A5F9A25328DBE43E7E06D53C4F59FBEAEB10E3A5B34A" }
+  ],
+  "optionalFiles": [
+    { "path": "engines/colmap-cuda/bin/colmap.exe", "sha256": "31D80701163A42F5EE17450530D645847916845E1C0EF174C927D63125015C7A" },
+    { "path": "engines/colmap-caspar/bin/colmap.exe", "sha256": "F6CC587DB045247B9B4630A89A54739F5AA7703D501F27C79DC76B05D212CB0C" }
+  ]
+}
