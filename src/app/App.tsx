@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Aperture, ChevronRight, CircleAlert, Clapperboard, Cpu, Download, Eye, FileBox, Info,
   FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings as SettingsIcon, Square, Trash2,
@@ -20,6 +20,7 @@ import type {
   TrainingBackend,
   ProjectStatus,
   ProjectSummary,
+  PipelineEvent,
   Quality,
   InputSource,
   SplatcamImportReport,
@@ -118,7 +119,7 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-function ProjectRow({ project, busy, opening, onDelete, onView }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void }) {
+const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   return <article className="project-row">
     <div className="project-row-main">
@@ -148,7 +149,7 @@ function ProjectRow({ project, busy, opening, onDelete, onView }: { project: Pro
       <div><dt>三维点</dt><dd>{project.points3d?.toLocaleString() ?? "—"}</dd></div>
     </dl>}
   </article>;
-}
+});
 
 function ColmapBackendBlock() {
   const store = useAppStore();
@@ -210,6 +211,54 @@ function ColmapBackendBlock() {
     </div>
   );
 }
+
+const ProjectList = memo(function ProjectList({ completed, unfinished, busy, openingProjectId, onDelete, onView }: {
+  completed: ProjectSummary[];
+  unfinished: ProjectSummary[];
+  busy: boolean;
+  openingProjectId: string | null;
+  onDelete: (project: ProjectSummary) => void;
+  onView: (project: ProjectSummary) => void;
+}) {
+  return <>
+    {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
+    {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+  </>;
+});
+
+const LiveLog = memo(function LiveLog({ events }: { events: PipelineEvent[] }) {
+  return <div className="live-log" aria-label="任务日志">
+    {events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.message}</p></div>)}
+  </div>;
+});
+
+const LiveProcess = memo(function LiveProcess({ isRunning, events, progress, progressMessage, latestEvent, activeStageIndex, latestElapsedMs, onCancel }: {
+  isRunning: boolean;
+  events: PipelineEvent[];
+  progress: number;
+  progressMessage: string;
+  latestEvent: PipelineEvent | null;
+  activeStageIndex: number;
+  latestElapsedMs: number;
+  onCancel: () => void;
+}) {
+  return <section className="live-process">
+    <div className="live-heading"><div><span className="live-dot" /><strong>实时进程</strong></div><span className="mono">总进度 {progress.toFixed(1)}%</span></div>
+    <p className="current-message" aria-live="polite">{progressMessage || "正在准备任务"}</p>
+    <div className="process-metrics">
+      <span><small>当前阶段</small><b>{currentStageLabel(latestEvent?.stage, activeStageIndex)}</b></span>
+      <span><small>阶段进度</small><b>{latestEvent?.current != null ? `${latestEvent.current.toLocaleString()}${latestEvent.total ? ` / ${latestEvent.total.toLocaleString()}` : ""}` : "持续运行"}</b></span>
+      <span><small>总耗时</small><b>{formatDuration(latestElapsedMs)}</b></span>
+    </div>
+    <ol className="stage-timeline">
+      {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || latestEvent?.stage === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{label}</b>{index === activeStageIndex && isRunning && <small>{latestEvent?.indeterminate ? "运行中" : `${(latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}
+    </ol>
+    <div className="log-toolbar"><span>任务日志</span><small>最近 {events.length} / 500 条</small></div>
+    <LiveLog events={events} />
+    {isRunning && <button className="cancel-action" type="button" onClick={onCancel}><Square size={12} fill="currentColor" />取消任务并终止所有进程</button>}
+  </section>;
+});
 
 function CudaColmapFlavorBlock() {
   const store = useAppStore();
@@ -394,11 +443,11 @@ export function App() {
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
-  const refreshProjects = async () => {
+  const refreshProjects = useCallback(async () => {
     const overview = await getProjectOverview();
     store.setProjectsRoot(overview.projectsRoot);
     store.setProjects(overview.projects);
-  };
+  }, [store.setProjects, store.setProjectsRoot]);
   useEffect(() => {
     void Promise.all([checkEngines(), getProjectOverview(), getSettings()])
       .then(([engines, overview, settings]) => {
@@ -503,12 +552,12 @@ export function App() {
       try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
     }
   };
-  const removeProject = async (project: ProjectSummary) => {
+  const removeProject = useCallback(async (project: ProjectSummary) => {
     try {
       if (await confirmAndDeleteProject(project)) await refreshProjects();
     } catch (error) { store.setError(messageOf(error)); }
-  };
-  const viewProject = async (project: ProjectSummary) => {
+  }, [refreshProjects, store.setError]);
+  const viewProject = useCallback(async (project: ProjectSummary) => {
     if (openingProjectId) return;
     setOpeningProjectId(project.id);
     store.setError(null);
@@ -519,7 +568,8 @@ export function App() {
     } finally {
       setOpeningProjectId(null);
     }
-  };
+  }, [openingProjectId, store.setError]);
+  const cancelRun = useCallback(() => void cancelPipeline(), []);
   const currentBackendLabel = store.settings ? (store.settings.colmapBackend === "cuda" ? "CUDA" : "CPU") : "CPU";
   const latestElapsedMs = store.latestEvent
     ? store.latestEvent.elapsedMs + (isRunning ? Math.max(0, clockMs - new Date(store.latestEvent.timestamp).getTime()) : 0)
@@ -611,23 +661,16 @@ export function App() {
             {inputSource === "splatcam" ? "导入并训练" : store.phase === "analyzing" ? "正在分析视频" : "开始生成"}<ChevronRight size={16} />
           </button>}
 
-          {(isRunning || store.events.length > 0) && <section className="live-process">
-            <div className="live-heading"><div><span className="live-dot" /><strong>实时进程</strong></div><span className="mono">总进度 {store.progress.toFixed(1)}%</span></div>
-            <p className="current-message">{store.progressMessage || "正在准备任务"}</p>
-            <div className="process-metrics">
-              <span><small>当前阶段</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
-              <span><small>阶段进度</small><b>{store.latestEvent?.current != null ? `${store.latestEvent.current.toLocaleString()}${store.latestEvent.total ? ` / ${store.latestEvent.total.toLocaleString()}` : ""}` : "持续运行"}</b></span>
-              <span><small>总耗时</small><b>{formatDuration(latestElapsedMs)}</b></span>
-            </div>
-            <ol className="stage-timeline">
-              {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || store.phase === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{label}</b>{index === activeStageIndex && isRunning && <small>{store.latestEvent?.indeterminate ? "运行中" : `${(store.latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}
-            </ol>
-            <div className="log-toolbar"><span>任务日志</span><small>最近 {store.events.length} / 500 条</small></div>
-            <div className="live-log" aria-live="polite">
-              {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.message}</p></div>)}
-            </div>
-            {isRunning && <button className="cancel-action" type="button" onClick={() => void cancelPipeline()}><Square size={12} fill="currentColor" />取消任务并终止所有进程</button>}
-          </section>}
+          {(isRunning || store.events.length > 0) && <LiveProcess
+            isRunning={isRunning}
+            events={store.events}
+            progress={store.progress}
+            progressMessage={store.progressMessage}
+            latestEvent={store.latestEvent}
+            activeStageIndex={activeStageIndex}
+            latestElapsedMs={latestElapsedMs}
+            onCancel={cancelRun}
+          />}
 
           {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{store.error}</span><button type="button" onClick={() => store.setError(null)}>关闭</button></div>}
         </section>
@@ -663,10 +706,7 @@ export function App() {
           <div className="pane-header"><h2>02 历史任务</h2><button className="refresh-action" type="button" disabled={isRunning} onClick={() => void refreshProjects()}><RotateCcw size={14} />刷新</button></div>
           <div className="archive-summary"><span><b>{completed.length}</b><small>已完成</small></span><span><b>{unfinished.length}</b><small>未完成</small></span></div>
 
-          {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
-
-          {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} opening={openingProjectId === project.id} onDelete={(item) => void removeProject(item)} onView={(item) => void viewProject(item)} />)}</div>}
-          {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} opening={openingProjectId === project.id} onDelete={(item) => void removeProject(item)} onView={(item) => void viewProject(item)} />)}</div>}
+          <ProjectList completed={completed} unfinished={unfinished} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} />
         </section>
       </section>
       </div>

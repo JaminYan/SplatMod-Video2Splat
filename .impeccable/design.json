@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-25T00:00:00+08:00",
+  "title": "Design System: SplatMod-Video2Splat",
+  "extensions": {
+    "colorMeta": {
+      "primary-blue": { "role": "primary", "displayName": "工作台蓝", "canonical": "#1e5cff", "tonalRamp": ["#071744", "#0c2b7a", "#1242b8", "#1e5cff", "#5e88ff", "#9eb8ff", "#d7e2ff", "#f1f5ff"] },
+      "ink": { "role": "neutral", "displayName": "墨色", "canonical": "#172033", "tonalRamp": ["#0a0d14", "#172033", "#2e394d", "#4c586b", "#697487", "#919aa9", "#c2c8d1", "#f2f4f7"] },
+      "surface": { "role": "neutral", "displayName": "工作区灰", "canonical": "#eef1f5", "tonalRamp": ["#202735", "#414b5b", "#667084", "#8a94a5", "#aeb7c5", "#d4dae3", "#eef1f5", "#f8f9fb"] },
+      "success-green": { "role": "success", "displayName": "成功绿", "canonical": "#2d9965", "tonalRamp": ["#092b1b", "#145c39", "#237a4e", "#2d9965", "#66bd8e", "#a1d7b8", "#d3efde", "#f1faf5"] },
+      "warning-amber": { "role": "warning", "displayName": "警告琥珀", "canonical": "#c78314", "tonalRamp": ["#3c2505", "#744708", "#9c640d", "#c78314", "#e0a53f", "#efc77d", "#f9e5bc", "#fff8e9"] },
+      "error-red": { "role": "error", "displayName": "错误红", "canonical": "#b04a40", "tonalRamp": ["#3b100d", "#6d2520", "#8e3730", "#b04a40", "#cc7770", "#e3aaa5", "#f3d2cf", "#fff7f7"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "工作台标题", "purpose": "页面和主要面板标题，保持专业而克制。" },
+      "mono": { "displayName": "处理数据", "purpose": "路径、日志、版本和处理指标。" }
+    },
+    "shadows": [
+      { "name": "tool-float", "value": "0 7px 20px rgba(23, 72, 202, .2)", "purpose": "固定缩放工具的轻量浮起效果。" },
+      { "name": "neutral-float", "value": "0 7px 20px rgba(23, 32, 51, .12)", "purpose": "辅助控制条的结构性浮层。" }
+    ],
+    "motion": [
+      { "name": "state-transition", "value": "150–250ms ease-out", "purpose": "按钮、选择和阶段状态反馈。" },
+      { "name": "progress-pulse", "value": "1.6s ease-in-out infinite", "purpose": "仅提示当前流水线仍在运行；减少动态效果时停用。" }
+    ],
+    "breakpoints": [
+      { "name": "compact", "value": "1050px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "启动视频或 Splatcam 处理任务的主要动作。",
+      "html": "<button class=\"ds-btn-primary\"><span>开始处理</span></button>",
+      "css": ".ds-btn-primary { width: 100%; height: 48px; padding: 0 15px; display: flex; align-items: center; justify-content: center; color: #fff; background: #1e5cff; border: 0; border-radius: 0; font: 700 13px/1 \"Segoe UI Variable\", sans-serif; cursor: pointer; transition: background 180ms ease-out; } .ds-btn-primary:hover { background: #1748ca; } .ds-btn-primary:focus-visible { outline: 2px solid rgba(30, 92, 255, .45); outline-offset: 2px; }"
+    },
+    {
+      "name": "Ghost Action",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "资源管理器、详情和刷新等不打断工作流的次要动作。",
+      "html": "<button class=\"ds-btn-ghost\">资源管理器</button>",
+      "css": ".ds-btn-ghost { padding: 4px 0; color: #667084; background: transparent; border: 0; border-radius: 0; font: 600 11px/1.35 \"Segoe UI Variable\", sans-serif; cursor: pointer; transition: color 150ms ease-out; } .ds-btn-ghost:hover { color: #1e5cff; } .ds-btn-ghost:focus-visible { outline: 2px solid rgba(30, 92, 255, .45); outline-offset: 2px; }"
+    },
+    {
+      "name": "Path Picker",
+      "kind": "input",
+      "refersTo": "path-picker",
+      "description": "选择视频、项目根目录或 Splatcam 导出目录。",
+      "html": "<button class=\"ds-path-picker\"><span><strong>Splatcam 导出目录</strong><small>A:\\project\\capture</small></span></button>",
+      "css": ".ds-path-picker { width: 100%; min-height: 66px; padding: 12px 14px; display: grid; align-items: center; text-align: left; color: #172033; background: transparent; border: 1px solid #bdc5d1; border-radius: 0; cursor: pointer; transition: border-color 150ms ease-out, background 150ms ease-out; } .ds-path-picker:hover { border-color: #1e5cff; background: #f1f4fb; } .ds-path-picker strong, .ds-path-picker small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-path-picker small { margin-top: 5px; color: #667084; font: 500 12px/1.35 \"Cascadia Mono\", monospace; }"
+    },
+    {
+      "name": "Selected Toggle",
+      "kind": "chip",
+      "refersTo": "selected-toggle",
+      "description": "在视频重建与 Splatcam 直入、CUDA 与 CPU 后端之间切换。",
+      "html": "<button class=\"ds-toggle-selected\">Splatcam 直入</button>",
+      "css": ".ds-toggle-selected { min-height: 40px; padding: 8px 11px; color: #1e5cff; background: #edf2ff; border: 0; border-bottom: 2px solid #1e5cff; border-radius: 0; font: 650 12px/1.35 \"Segoe UI Variable\", sans-serif; cursor: pointer; } .ds-toggle-selected:focus-visible { outline: 2px solid rgba(30, 92, 255, .45); outline-offset: 2px; }"
+    },
+    {
+      "name": "Pipeline Timeline",
+      "kind": "custom",
+      "description": "显示从导入、重建到训练和发布的确定阶段状态。",
+      "html": "<ol class=\"ds-timeline\"><li class=\"done\"><span></span><b>Splatcam 导入</b></li><li class=\"active\"><span></span><b>Splat 训练</b></li><li><span></span><b>结果发布</b></li></ol>",
+      "css": ".ds-timeline { margin: 0; padding: 0; list-style: none; color: #929baa; font: 11px/1.35 \"Segoe UI Variable\", sans-serif; } .ds-timeline li { position: relative; min-height: 31px; padding-left: 25px; } .ds-timeline li:before { content: \"\"; position: absolute; top: 8px; bottom: -8px; left: 6px; width: 1px; background: #d1d7e0; } .ds-timeline li:last-child:before { display: none; } .ds-timeline li > span { position: absolute; top: 2px; left: 2px; width: 9px; height: 9px; background: #f7f8fa; border: 2px solid #aeb7c5; border-radius: 50%; } .ds-timeline li.done { color: #586376; } .ds-timeline li.done > span { background: #2d9965; border-color: #2d9965; } .ds-timeline li.active { color: #172033; } .ds-timeline li.active > span { background: #1e5cff; border-color: #1e5cff; box-shadow: 0 0 0 4px rgba(30, 92, 255, .1); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Edit Suite Instrument",
+    "overview": "这个界面应像一间可靠的影视后期剪辑工作台：工具安静地退到背景，当前素材、流水线阶段和可执行动作始终清楚。视觉采用冷静的灰阶层次与克制的蓝色指示，把复杂的 CUDA、COLMAP、CASPAR、Brush 和 gsplat 能力翻译成普通创作者能够理解的任务状态。\n\n信息密度可以专业，但不能像工程日志一样压迫用户。画面筛选、相机重建、训练和导出应形成连续的工作流；已有 Splatcam 数据进入时，应让“跳过重复重建”成为明确的效率收益，而不是隐藏在设置里的分支。",
+    "keyCharacteristics": ["专业影视后期工作台，而非娱乐化创作应用", "冷灰表面、蓝色主动作、文本化语义状态", "平直边界与细分隔线，强调结构而非装饰", "进度动画只表达运行状态、阶段切换和反馈", "高对比文字优先，工程细节按需展开"],
+    "rules": [
+      { "name": "The One Action Color Rule", "body": "每个界面只让工作台蓝承担主要动作与当前状态，不用蓝色装饰无关内容。", "section": "colors" },
+      { "name": "The Semantic Pairing Rule", "body": "绿色、琥珀色和红色必须同时配合文字或图标表达，颜色不能是唯一状态信号。", "section": "colors" },
+      { "name": "The Readable State Rule", "body": "关键阶段、失败原因和下一步动作永远使用高对比正文，不用淡灰文字或动画替代说明。", "section": "typography" },
+      { "name": "The Flat-By-Default Rule", "body": "普通面板默认无阴影；结构由背景、边界和间距承担，阴影只表示确实浮起的工具。", "section": "elevation" }
+    ],
+    "dos": ["Do 使用 #172033 作为关键文字，确保普通创作者在冷灰背景上能清楚阅读。", "Do 让工作台蓝只负责主要动作、选择和运行状态。", "Do 用阶段名称、当前消息和可执行错误解释流水线，而不是只显示“处理中”。", "Do 使用 150–250ms 的状态过渡并遵守 prefers-reduced-motion。"],
+    "donts": ["Don't 使用卡通化或游戏化界面。", "Don't 做成充满 KPI 卡片的通用 SaaS 仪表盘。", "Don't 使用过多大圆角容器、玻璃拟态和装饰性渐变。", "Don't 把工程控制台术语作为普通创作者的主要入口。", "Don't 用加载动画或模糊的“处理中”隐藏失败原因和质量风险。", "Don't 使用渐变文字、彩色侧边条、重复的卡片网格或 32px 以上卡片圆角。"]
+  }
+}
