@@ -184,6 +184,19 @@ pub async fn download_colmap_cuda(app: tauri::AppHandle) -> Result<EngineStatus>
         "CUDA COLMAP 尚未下载。请在终端运行 `npm run download:colmap-cuda`，或在设置抽屉中点击“下载 CUDA 版 COLMAP”。".into(),
     ))
 }
+
+/// Performs the read-only Splatcam preflight. It deliberately does not create a project,
+/// convert a COLMAP model, or start any video/COLMAP process.
+#[tauri::command]
+pub async fn inspect_splatcam_import(
+    path: String,
+) -> std::result::Result<crate::splatcam::SplatcamImportReport, SplatError> {
+    let source = PathBuf::from(path);
+    tokio::task::spawn_blocking(move || crate::splatcam::inspect_export(&source))
+        .await
+        .map_err(|error| SplatError::Process(format!("Splatcam 导入检查任务失败：{error}")))?
+}
+
 #[tauri::command]
 pub async fn start_pipeline(
     app: tauri::AppHandle,

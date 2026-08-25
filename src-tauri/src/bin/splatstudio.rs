@@ -41,6 +41,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Quality::Standard)]
         quality: Quality,
     },
+    /// Validate a Splatcam RGB + COLMAP text + RGB point-cloud export without modifying it.
+    SplatcamInspect { input: PathBuf },
     /// Run the end-to-end pipeline after all fixed engine CLIs are verified.
     Generate {
         input: PathBuf,
@@ -104,6 +106,16 @@ async fn execute(cli: Cli) -> Result<()> {
             )
             .await?;
             println!("extracted {count} frames to {}", output.display());
+        }
+        Commands::SplatcamInspect { input } => {
+            let source = input.clone();
+            let report =
+                tokio::task::spawn_blocking(move || ooo_splat::splatcam::inspect_export(&source))
+                    .await
+                    .map_err(|error| {
+                        SplatError::Process(format!("Splatcam 导入检查任务失败：{error}"))
+                    })??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Generate {
             input,

@@ -84,6 +84,15 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .path-picker small { color: var(--muted); font: 500 12px/1.35 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
 .path-picker.compact { min-height: 60px; }
 .field-note { margin: 8px 0 0; color: var(--faint); font-size: 11px; line-height: 1.6; }
+.source-toggle { display: grid; grid-template-columns: 1fr 1.45fr; border: 1px solid var(--line-dark); }
+.source-toggle button { min-height: 40px; padding: 8px 11px; color: var(--muted); background: transparent; border: 0; border-right: 1px solid var(--line); cursor: pointer; font-size: 12px; font-weight: 650; }
+.source-toggle button:last-child { border-right: 0; }
+.source-toggle button.selected { color: var(--blue); background: #edf2ff; box-shadow: inset 0 -2px var(--blue); }
+.splatcam-check { margin-top: 10px; }
+.splatcam-report { margin-top: 11px; padding: 10px 11px; display: grid; gap: 4px; border: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.5; }
+.splatcam-report strong { font-size: 12px; }
+.splatcam-report.passed { border-color: #8bc7a7; background: #f1faf5; color: #336c4e; }
+.splatcam-report.failed { border-color: #e1aeae; background: #fff7f7; color: #a04747; }
 .quality-list { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
 .quality-option { min-width: 0; min-height: 92px; padding: 15px 12px; display: grid; grid-template-columns: 14px minmax(0,1fr); gap: 9px; color: var(--ink); text-align: left; background: transparent; border: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
 .quality-option.selected { background: #edf2ff; box-shadow: inset 0 -2px var(--blue); }

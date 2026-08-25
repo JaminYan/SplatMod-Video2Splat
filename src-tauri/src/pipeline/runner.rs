@@ -28,7 +28,7 @@ use crate::{
     video::{
         adaptive_plan, analyze_prepared_proxy_images_with_progress, passes_proxy_geometry, prepare_proxy_tracking_pyramids_with_progress, proxy_analysis_worker_count, select_adaptive_frames,
         AdaptiveFrameProfile, FramePlan, FrameSelectionReport, FrameSelectionStrategy,
-        ProxyFrame, SelectedSourceFrame, SelectionReason, UniformRatioFrameSelection, VideoInfo,
+        ProxyFrame, SelectedSourceFrame, SelectionReason, SourceFrameTimestamp, UniformRatioFrameSelection, VideoInfo,
         select_useful_frames_parallel_with_progress,
     },
 };
@@ -453,6 +453,7 @@ impl PipelineRunner {
                 Some(self.process_observer(PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg, Some(estimated_proxy_frames), ObserverMode::Ffmpeg))).await;
             match proxy_result {
                 Ok(report) => {
+                    let proxy_candidate_samples = report.frames.clone();
                     self.events.stage(PipelineStage::ExtractingFrames, 1.0, format!("高速代理抽帧完成：{} 帧（已同步映射源 PTS，缓存上限 {} 帧 / {:.1} GiB）", report.frames.len(), report.buffered_frame_limit, report.memory_budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0));
                     self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(0.0), false,
                         format!("正在分析 {} 个代理画面的背景运动", report.frames.len()), Some(0), Some(report.frames.len() as u64), Some("帧"));
@@ -608,11 +609,11 @@ impl PipelineRunner {
                                 self.events.stage(PipelineStage::SelectingFrames, 0.96,
                                     format!("精细自适应接近覆盖预算（{} / {}），正在执行隔离 COLMAP 验证", selected.len(), minimum_selected));
                                 let validation = async {
-                                    extract_selected_frames(&self.engines.ffmpeg, input, &validation_frames,
-                                        &validation_root.join("ffmpeg"), &selected, profile.analysis_fps, self.ffmpeg_hw_accel,
+                                    extract_selected_proxy_frames(&self.engines.ffmpeg, input, &validation_frames,
+                                        &validation_root.join("ffmpeg"), &selected, &proxy_candidate_samples, profile.analysis_fps, self.ffmpeg_hw_accel,
                                         logs.map(|path| path.join("ffmpeg-adaptive-near-budget-validation.log")), &self.process_manager,
                                         Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                            Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
+                                            Some(selected.len() as u64), ObserverMode::Ffmpeg))).await?;
                                     let validation_backend = self.colmap_backend;
                                     let validation_compute = match validation_backend {
                                         ColmapBackend::Cpu => ColmapComputeMode::Cpu,
@@ -696,11 +697,11 @@ impl PipelineRunner {
                                             self.events.stage(PipelineStage::SelectingFrames, 0.97,
                                                 format!("近预算桥接 repair：正在验证 {} 张关键帧", repair_selection.len()));
                                             let repair_result = async {
-                                                extract_selected_frames(&self.engines.ffmpeg, input, &repair_frames, &repair_root.join("ffmpeg"),
-                                                    &repair_selection, profile.analysis_fps, self.ffmpeg_hw_accel,
+                                                extract_selected_proxy_frames(&self.engines.ffmpeg, input, &repair_frames, &repair_root.join("ffmpeg"),
+                                                    &repair_selection, &proxy_candidate_samples, profile.analysis_fps, self.ffmpeg_hw_accel,
                                                     Some(log_directory.join("ffmpeg-adaptive-near-budget-bridge-repair.log")), &self.process_manager,
                                                     Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                                        Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
+                                                        Some(repair_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
                                                 let compute = match self.colmap_backend {
                                                     ColmapBackend::Cpu => ColmapComputeMode::Cpu,
                                                     ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
@@ -753,11 +754,11 @@ impl PipelineRunner {
                                                 self.events.stage(PipelineStage::SelectingFrames, 0.98,
                                                     format!("桥接 repair 未通过，正在验证 {:.1} FPS 自适应密度升级（{} 张）", 2.0, dense_selection.len()));
                                                 let dense_result = async {
-                                                    extract_selected_frames(&self.engines.ffmpeg, input, &dense_frames, &dense_root.join("ffmpeg"),
-                                                        &dense_selection, profile.analysis_fps, self.ffmpeg_hw_accel,
+                                                    extract_selected_proxy_frames(&self.engines.ffmpeg, input, &dense_frames, &dense_root.join("ffmpeg"),
+                                                        &dense_selection, &proxy_candidate_samples, profile.analysis_fps, self.ffmpeg_hw_accel,
                                                         logs.map(|path| path.join("ffmpeg-adaptive-density-validation.log")), &self.process_manager,
                                                         Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Ffmpeg,
-                                                            Some(proxy_count as u64), ObserverMode::Ffmpeg))).await?;
+                                                            Some(dense_selection.len() as u64), ObserverMode::Ffmpeg))).await?;
                                                     let compute = match self.colmap_backend {
                                                         ColmapBackend::Cpu => ColmapComputeMode::Cpu,
                                                         ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
@@ -1558,11 +1559,26 @@ impl PipelineRunner {
             let bridge_log = bridge_attempt.join("colmap.log");
             let _bridge_sparse = bridge_attempt.join("incremental-ceres").join("sparse");
             tokio::fs::create_dir_all(&bridge_attempt).await?;
-            self.events.stage(PipelineStage::ValidatingReconstruction, 0.55, "自动补帧 attempt 1：正在提取完整时间序列");
-            extract_selected_frames(&self.engines.ffmpeg, &metadata.source_path, &bridge_frames,
-                &bridge_attempt.join("ffmpeg"), &combined_selection,
-                state.frames.as_ref().and_then(|frames| frames.analysis_fps).unwrap_or(quality.preset().target_sampling_fps), self.ffmpeg_hw_accel,
-                Some(paths.logs.join("ffmpeg-adaptive-bridge.log")), &self.process_manager, None).await?;
+            let analysis_fps = state.frames.as_ref().and_then(|frames| frames.analysis_fps)
+                .unwrap_or(quality.preset().target_sampling_fps);
+            match read_adaptive_proxy_source_samples(&paths.logs).await {
+                Ok(proxy_samples) => {
+                    self.events.stage(PipelineStage::ValidatingReconstruction, 0.55,
+                        format!("自动补帧 attempt 1：正在定向抽取 {} 张关键帧", combined_selection.len()));
+                    extract_selected_proxy_frames(&self.engines.ffmpeg, &metadata.source_path, &bridge_frames,
+                        &bridge_attempt.join("ffmpeg"), &combined_selection, &proxy_samples, analysis_fps, self.ffmpeg_hw_accel,
+                        Some(paths.logs.join("ffmpeg-adaptive-bridge.log")), &self.process_manager, None).await?;
+                }
+                Err(error) => {
+                    self.events.send(PipelineStage::ValidatingReconstruction, Some(PipelineEngine::System), EventKind::Log,
+                        EventLevel::Warning, Some(0.55), false,
+                        format!("自动补帧缺少可验证的代理候选映射，回退兼容抽帧：{error}"), None, None, None);
+                    self.events.stage(PipelineStage::ValidatingReconstruction, 0.55, "自动补帧 attempt 1：正在兼容抽取关键帧");
+                    extract_selected_frames(&self.engines.ffmpeg, &metadata.source_path, &bridge_frames,
+                        &bridge_attempt.join("ffmpeg"), &combined_selection, analysis_fps, self.ffmpeg_hw_accel,
+                        Some(paths.logs.join("ffmpeg-adaptive-bridge.log")), &self.process_manager, None).await?;
+                }
+            }
             self.events.stage(PipelineStage::ValidatingReconstruction, 0.65, "自动补帧 attempt 1：正在提取独立 COLMAP 特征");
             colmap::extract_features(&colmap_exe, &bridge_database, &bridge_frames,
                 ColmapFeatureOptions { compute: colmap_compute }, bridge_log.clone(), &self.process_manager, None).await?;
@@ -2450,6 +2466,22 @@ fn densify_with_proxy_anchors(
 async fn read_adaptive_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {
     let bytes = tokio::fs::read(logs.join("adaptive-bridge-plan.json")).await?;
     serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+/// The post-Mapper bridge attempt reloads the exact proxy order rather than
+/// deriving frames from average FPS, so it can use the same direct extractor
+/// and source-index verification as the original adaptive attempt.
+async fn read_adaptive_proxy_source_samples(logs: &Path) -> Result<Vec<SourceFrameTimestamp>> {
+    let proxy: AdaptiveProxyAnalysisLog = serde_json::from_slice(
+        &tokio::fs::read(logs.join("adaptive-proxy-analysis.json")).await?,
+    )?;
+    if proxy.frames.is_empty() {
+        return Err(SplatError::Process("自适应代理候选映射为空".into()));
+    }
+    Ok(proxy.frames.into_iter().map(|frame| SourceFrameTimestamp {
+        source_index: frame.source_index,
+        pts_seconds: frame.pts_seconds,
+    }).collect())
 }
 
 async fn read_near_budget_bridge_plan(logs: &Path) -> Result<AdaptiveBridgePlan> {

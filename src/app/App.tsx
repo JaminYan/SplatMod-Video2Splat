@@ -6,7 +6,7 @@ import {
 } from "lucide-react";
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings,
-  onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
+  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectVideo,
   setProjectsRoot, startPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
@@ -21,6 +21,8 @@ import type {
   ProjectStatus,
   ProjectSummary,
   Quality,
+  InputSource,
+  SplatcamImportReport,
 } from "../types/pipeline";
 
 const qualities: Array<{ value: Quality; label: string; description: string }> = [
@@ -343,6 +345,10 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [clockMs, setClockMs] = useState(() => Date.now());
+  const [inputSource, setInputSource] = useState<InputSource>("video");
+  const [splatcamPath, setSplatcamPath] = useState<string | null>(null);
+  const [splatcamReport, setSplatcamReport] = useState<SplatcamImportReport | null>(null);
+  const [checkingSplatcam, setCheckingSplatcam] = useState(false);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
@@ -405,6 +411,25 @@ export function App() {
   const chooseVideo = async () => {
     const selected = await selectVideo();
     if (selected) { store.setVideoPath(selected); await analyze(selected, store.quality); }
+  };
+  const chooseSplatcam = async () => {
+    const selected = await selectSplatcamDirectory();
+    if (!selected) return;
+    setSplatcamPath(selected);
+    setSplatcamReport(null);
+  };
+  const inspectSplatcam = async () => {
+    if (!splatcamPath) return;
+    setCheckingSplatcam(true);
+    store.setError(null);
+    try {
+      setSplatcamReport(await inspectSplatcamImport(splatcamPath));
+    } catch (error) {
+      setSplatcamReport(null);
+      store.setError(messageOf(error));
+    } finally {
+      setCheckingSplatcam(false);
+    }
   };
   const chooseRoot = async () => {
     const selected = await selectProjectsRoot(store.projectsRoot);
@@ -482,6 +507,14 @@ export function App() {
           <div className="pane-header"><h1>01 创建新任务</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? "运行中" : "待命"}</span></div>
 
           <div className="form-section">
+            <label className="field-label">数据源</label>
+            <div className="source-toggle" role="radiogroup" aria-label="数据源">
+              <button type="button" role="radio" aria-checked={inputSource === "video"} className={inputSource === "video" ? "selected" : ""} disabled={isRunning} onClick={() => setInputSource("video")}>视频重建</button>
+              <button type="button" role="radio" aria-checked={inputSource === "splatcam"} className={inputSource === "splatcam" ? "selected" : ""} disabled={isRunning} onClick={() => setInputSource("splatcam")}>Splatcam 已重建数据</button>
+            </div>
+          </div>
+
+          {inputSource === "video" ? <div className="form-section">
             <label className="field-label">输入视频</label>
             <button className="path-picker" type="button" disabled={isRunning} onClick={() => void chooseVideo()}>
               <Clapperboard size={18} /><span><strong>{store.videoPath ? basename(store.videoPath) : "选择 MP4 或 MOV 视频"}</strong><small>{store.videoPath ?? "从本机选择环绕拍摄素材"}</small></span><FolderOpen size={16} />
@@ -490,7 +523,20 @@ export function App() {
               <input type="checkbox" checked={store.autoBridgeFrames} disabled={isRunning} onChange={(event) => store.setAutoBridgeFrames(event.currentTarget.checked)} />
               自动从原视频补帧
             </label>
-          </div>
+          </div> : <div className="form-section">
+            <label className="field-label">Splatcam 导出目录</label>
+            <button className="path-picker" type="button" disabled={isRunning || checkingSplatcam} onClick={() => void chooseSplatcam()}>
+              <FolderOpen size={18} /><span><strong>{splatcamPath ? basename(splatcamPath) : "选择包含 images 与 sparse/0 的目录"}</strong><small>{splatcamPath ?? "仅接受 RGB JPEG + COLMAP 文本模型 + RGB 点云"}</small></span><ChevronRight size={16} />
+            </button>
+            <button className="secondary-action splatcam-check" type="button" disabled={!splatcamPath || isRunning || checkingSplatcam} onClick={() => void inspectSplatcam()}>{checkingSplatcam ? <LoaderCircle className="spin" size={14} /> : <FileBox size={14} />}{checkingSplatcam ? "正在导入检查" : "仅导入检查"}</button>
+            {splatcamReport && <div className={splatcamReport.geometryGate.passed ? "splatcam-report passed" : "splatcam-report failed"}>
+              <strong>{splatcamReport.geometryGate.passed ? "检查通过：可进入下一阶段标准化" : "检查未通过"}</strong>
+              <span>{splatcamReport.imageCount} 张 RGB · {splatcamReport.poseCount} 个位姿 · {splatcamReport.pointCount.toLocaleString()} 个初始化点</span>
+              <small>坐标：COLMAP world-to-camera · 正深度 {(splatcamReport.positiveDepthProjectionRatio * 100).toFixed(1)}% · 图像内 {(splatcamReport.inImageProjectionRatio * 100).toFixed(1)}%</small>
+              {!splatcamReport.geometryGate.passed && <small>{splatcamReport.geometryGate.reason}</small>}
+            </div>}
+            <p className="field-note">当前先执行只读检查；标准化模型与训练接入完成前不会启动 FFmpeg、特征提取或相机重建。</p>
+          </div>}
 
           <div className="form-section">
             <label className="field-label">项目根目录</label>
@@ -509,15 +555,15 @@ export function App() {
             </div>
           </div>
 
-          {store.video && store.plan && <div className="source-metrics">
+          {inputSource === "video" && store.video && store.plan && <div className="source-metrics">
             <span><small>时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
             <span><small>分辨率</small><b>{store.video.width} × {store.video.height}</b></span>
             <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
           </div>}
 
-          {!isRunning && <button className="primary-action" type="button" disabled={!store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
+          {!isRunning && <button className="primary-action" type="button" disabled={inputSource !== "video" || !store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
             {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}
-            {store.phase === "analyzing" ? "正在分析视频" : "开始生成"}<ChevronRight size={16} />
+            {inputSource === "splatcam" ? "Splatcam 训练接入中" : store.phase === "analyzing" ? "正在分析视频" : "开始生成"}<ChevronRight size={16} />
           </button>}
 
           {(isRunning || store.events.length > 0) && <section className="live-process">

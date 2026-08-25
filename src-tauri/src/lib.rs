@@ -6,6 +6,7 @@ pub mod presets;
 pub mod process;
 pub mod project;
 pub mod reconstruction;
+pub mod splatcam;
 pub mod video;
 use tauri::{Emitter, Manager};
 pub fn run_app() {
@@ -30,6 +31,7 @@ pub fn run_app() {
             commands::set_training_backend,
     commands::set_gsplat_splat_cap,
     commands::set_photometric_mode,
+            commands::inspect_splatcam_import,
             commands::download_colmap_cuda,
             commands::open_project_viewer,
             commands::delete_project,

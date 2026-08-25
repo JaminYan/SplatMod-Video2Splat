@@ -206,6 +206,8 @@ async fn train_gsplat(
         "maxSteps": request.total_steps,
         "maxResolution": request.max_resolution,
         "maxSplats": request.max_splats,
+        // M2: stabilise the coarse static scene before MCMC adds new splats.
+        "delayedDensificationRatio": 0.10,
         "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp => 1 },
         // M1 is opt-in until it has passed the documented three-material gate.
         "photometricMode": match request.photometric_mode { PhotometricMode::None => "none", PhotometricMode::Ppisp => "ppisp" },

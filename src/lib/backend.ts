@@ -20,6 +20,7 @@ import type {
   ProjectOverview,
   ProjectSummary,
   Quality,
+  SplatcamImportReport,
   VideoInfo,
 } from "../types/pipeline";
 
@@ -56,6 +57,16 @@ export async function setColmapBackend(backend: ColmapBackend): Promise<AppSetti
 
 export async function setFfmpegHwAccel(mode: FfmpegHwAccel): Promise<AppSettingsLike> {
   return invoke("set_ffmpeg_hw_accel", { mode }) as Promise<AppSettingsLike>;
+}
+
+export async function selectSplatcamDirectory(): Promise<string | null> {
+  if (!inTauri()) return null;
+  const selected = await open({ multiple: false, directory: true });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function inspectSplatcamImport(path: string): Promise<SplatcamImportReport> {
+  return invoke("inspect_splatcam_import", { path }) as Promise<SplatcamImportReport>;
 }
 export async function setCudaColmapFlavor(flavor: CudaColmapFlavor): Promise<AppSettingsLike> {
   return invoke("set_cuda_colmap_flavor", { flavor }) as Promise<AppSettingsLike>;

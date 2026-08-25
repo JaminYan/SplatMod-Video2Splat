@@ -15,6 +15,7 @@ export type FfmpegHwAccel = "off" | "auto" | "d3d11va" | "cuda";
 export type BrushTrainingPreset = "a" | "b" | "c";
 export type GsplatSplatCap = "auto" | "1m" | "2m" | "4m";
 export type TrainingBackend = "brush" | "gsplat";
+export type InputSource = "video" | "splatcam";
 export type PhotometricMode = "none" | "ppisp";
 export interface EngineStatus {
   kind: EngineKind;
@@ -119,4 +120,19 @@ export interface ProjectOverview {
   projectsRoot: string;
   colmapBackend: ColmapBackend;
   projects: ProjectSummary[];
+}
+export interface SplatcamImportReport {
+  sourcePath: string;
+  coordinateConvention: "colmap-world-to-camera";
+  hasDepth: boolean;
+  hasTransforms: boolean;
+  imageCount: number;
+  cameraCount: number;
+  poseCount: number;
+  pointCount: number;
+  pointsHaveObservationTracks: boolean;
+  positiveDepthProjectionRatio: number;
+  inImageProjectionRatio: number;
+  cameraTrajectoryExtent: number;
+  geometryGate: { passed: boolean; reason: string | null };
 }
