@@ -290,7 +290,7 @@ function FfmpegHwAccelBlock() {
   );
 }
 
-function BrushTrainingPresetBlock() {
+function BrushTrainingPresetBlock({ inputSource }: { inputSource: InputSource }) {
   const store = useAppStore();
   const settings = store.settings;
   if (!settings) return <p className="settings-empty">正在读取设置…</p>;
@@ -301,7 +301,10 @@ function BrushTrainingPresetBlock() {
     { value: "b", title: "B · 显存优先", hint: "适合 6–8GB 显存；降低 splat 上限以减少中断。" },
     { value: "c", title: "C · 质量优先", hint: "建议 12GB+ 显存；更多迭代与 splats，耗时更长。" },
   ];
-  return <div className="settings-block"><div className="settings-block-title">Brush 训练预设</div><p className="settings-block-hint">仅影响 Brush 训练参数；不改变自适应 SfM 关键帧规划，也不改变固定策略回退的 1 / 2 / 4 FPS 基准。</p><div className="backend-toggle" role="radiogroup" aria-label="Brush 训练预设">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setBrushTrainingPreset(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
+  const hint = inputSource === "splatcam"
+    ? "仅影响 Brush 训练参数；Splatcam 会直接使用导出的全部图片、相机与位姿。"
+    : "仅影响 Brush 训练参数；不改变自适应 SfM 关键帧规划，也不改变固定策略回退的 1 / 2 / 4 FPS 基准。";
+  return <div className="settings-block"><div className="settings-block-title">Brush 训练预设</div><p className="settings-block-hint">{hint}</p><div className="backend-toggle" role="radiogroup" aria-label="Brush 训练预设">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setBrushTrainingPreset(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
 function TrainingBackendBlock() {
@@ -342,8 +345,9 @@ function PhotometricModeBlock() {
  return <div className="settings-block"><div className="settings-block-title">光度一致性</div><p className="settings-block-hint">仅 gsplat 生效。PPISP 适合曝光变化明显的视频；请与同素材 M0 基线对照后再用于正式交付。</p><div className="backend-toggle" role="radiogroup" aria-label="光度一致性">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
-function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose: () => void; inputSource: InputSource }) {
   const store = useAppStore();
+  const isSplatcam = inputSource === "splatcam";
   return (
     <aside className={open ? "settings-drawer open" : "settings-drawer"} aria-hidden={!open}>
       <header className="settings-drawer-head">
@@ -351,13 +355,15 @@ function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void 
         <button type="button" onClick={onClose} aria-label="关闭设置">×</button>
       </header>
       <div className="settings-drawer-body">
-        <ColmapBackendBlock />
-        <CudaColmapFlavorBlock />
-        <FfmpegHwAccelBlock />
+        {isSplatcam ? <div className="settings-notice settings-context"><span><strong>Splatcam 训练模式</strong><br />已跳过视频抽帧、关键帧筛选和 COLMAP 重建；下方设置仅影响训练。</span></div> : <>
+          <ColmapBackendBlock />
+          <CudaColmapFlavorBlock />
+          <FfmpegHwAccelBlock />
+        </>}
         <TrainingBackendBlock />
-<GsplatSplatCapBlock />
-<PhotometricModeBlock />
-        <BrushTrainingPresetBlock />
+        <GsplatSplatCapBlock />
+        <PhotometricModeBlock />
+        <BrushTrainingPresetBlock inputSource={inputSource} />
         {store.settingsNotice && (
           <div className="settings-notice">
             <span>{store.settingsNotice}</span>
@@ -674,7 +680,7 @@ export function App() {
         <button className="zoom-trigger" type="button" aria-expanded={showZoomControls} onClick={() => setShowZoomControls((visible) => !visible)}>{uiScale}%</button>
       </aside>
 
-      <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} inputSource={inputSource} />
     </main>
   );
 }

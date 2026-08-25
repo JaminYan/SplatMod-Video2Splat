@@ -1,6 +1,6 @@
 # Splatcam 已重建数据导入实施文档
 
-> 文档状态：设计完成，待代码实施  
+> 文档状态：已实施，完成一次真实 gsplat 端到端验证
 > 适用版本：SplatMod-Video2Splat 0.48.x
 > 当前范围：RGB JPEG + COLMAP 文本相机/位姿 + RGB 点云 PLY  
 > 不在本期范围：LiDAR 深度、`transforms.json`、深度监督训练
@@ -18,6 +18,22 @@ Splatcam 可以直接导出已经完成相机估计和点云生成的数据。�
 3. 将 Splatcam 数据转换为现有 `training-input` 契约。
 4. 在训练前验证文件映射、相机参数、位姿、点云和坐标系。
 5. 保留原始导出和导入诊断，失败时不覆盖原始数据。
+
+## 实施与真实验证状态（2026-08-25）
+
+M0--M3 已实现：导入器严格校验 JPEG、`PINHOLE` 相机、COLMAP world-to-camera 位姿与 binary little-endian RGB 点云；随后生成隔离的文本/二进制 COLMAP 模型和标准 `training-input`，直接进入 Brush 或 gsplat 训练。Splatcam 模式不会启动 FFprobe、FFmpeg、pHash/Laplacian 筛选、COLMAP 特征提取、匹配、Mapper 或 CASPAR。
+
+已完成一次真实 gsplat 验证：
+
+- 来源：`A:\tmp\export_shop_2026-08-25_183506`，379 张 RGB、379 个位姿、902,416 个初始化点；
+- 门禁：通过，项目元数据记录为 `colmap-world-to-camera`，没有 depth 或 `transforms.json`；
+- 训练：快速档，7,000 次迭代，gsplat 自动安全上限，训练阶段约 188 秒；
+- 发布：1,457,510 个 Gaussian，最终 PLY 为 361,464,012 字节；
+- 跳过证明：`project.json` 中视频、抽帧与 COLMAP 阶段耗时均为 0，任务日志直接由“验证 Splatcam”进入“生成训练输入”和训练。
+
+同一来源也已完成 Brush A 实机验证：379 张 RGB、379 个位姿、902,416 个初始化点，7,000 次迭代，训练阶段约 172 秒，发布 1,500,000 个 Gaussian、354,001,552 字节的 PLY；视频、抽帧和 COLMAP 阶段耗时同样均为 0。
+
+每次成功解析的导入现在还会写入 `work/splatcam-import/import-report.json`，保存完整几何统计与门禁结论；上面的真实任务发生在此诊断文件补齐之前，因此不追溯生成该文件。Rust 单元测试当前为 59/59 通过。
 
 ## 2. 当前已验证的输入格式
 
@@ -307,6 +323,8 @@ splatcamGeometryGate
 - 增加仅检查/导入并训练按钮；
 - 完成失败恢复和历史任务展示。
 
+**完成状态：** 已实现。Splatcam 模式的设置抽屉会隐藏 FFmpeg 与 COLMAP 重建设置，仅保留训练后端和训练参数；训练质量显示实际迭代、分辨率与后端受限后的 Splat 上限。
+
 ## 11. 测试与验收
 
 ### 单元测试
@@ -333,7 +351,7 @@ splatcamGeometryGate
 1. 导入阶段不启动 FFprobe、FFmpeg、feature extractor、matcher 或 mapper。
 2. RGB、位姿和相机记录 100% 对应。
 3. 生成的 training-input 通过现有 Brush/gsplat 输入校验。
-4. 至少完成一次 Brush 训练并输出合法 Gaussian PLY。
+4. 至少完成一次训练后端端到端验证并输出合法 Gaussian PLY；当前 Brush A 与 gsplat 均已完成独立实机验证。
 5. 训练前后的普通 RGB 点云与最终 Gaussian PLY 清晰区分。
 6. 所有门禁、耗时和回退原因写入项目状态与日志。
 

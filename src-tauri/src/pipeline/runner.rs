@@ -2383,11 +2383,7 @@ impl PipelineRunner {
         metadata.training_backend = self.training_backend;
         metadata.brush_training_preset = self.brush_training_preset;
         metadata.gsplat_splat_cap = self.gsplat_splat_cap;
-        self.events.stage(
-            PipelineStage::ImportingSplatcam,
-            0.0,
-            "正在验证 Splatcam RGB、相机、位姿与点云",
-        );
+        self.splatcam_import_step(0, 5, "正在验证 Splatcam RGB、相机、位姿与点云");
         tokio::fs::create_dir_all(&import_root).await?;
         let report = tokio::task::spawn_blocking({
             let source = source.clone();
@@ -2407,6 +2403,14 @@ impl PipelineRunner {
                     .unwrap_or_else(|| "Splatcam 坐标系门禁失败".into()),
             ));
         }
+        self.splatcam_import_step(
+            1,
+            5,
+            format!(
+                "已校验 {} 张 RGB、{} 个位姿、{} 个初始化点；正在保留来源快照",
+                report.image_count, report.pose_count, report.point_count
+            ),
+        );
         let staged_source = paths.project.join("source").join("splatcam");
         tokio::task::spawn_blocking({
             let source = source.clone();
@@ -2431,14 +2435,7 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, metadata)
             .await?;
         project_manager.write_state(&paths.state, &state).await?;
-        self.events.stage(
-            PipelineStage::ImportingSplatcam,
-            0.35,
-            format!(
-                "已校验 {} 张 RGB、{} 个位姿、{} 个初始化点",
-                report.image_count, report.pose_count, report.point_count
-            ),
-        );
+        self.splatcam_import_step(2, 5, "来源快照已保留；正在标准化 COLMAP 文本模型");
         let source_for_model = staged_source.clone();
         let text_destination = text_model.clone();
         tokio::task::spawn_blocking(move || {
@@ -2446,6 +2443,7 @@ impl PipelineRunner {
         })
         .await
         .map_err(|error| SplatError::Process(format!("Splatcam 文本模型标准化失败：{error}")))??;
+        self.splatcam_import_step(3, 5, "文本模型已标准化；正在转换 COLMAP 二进制模型");
         tokio::fs::create_dir(&binary_model).await?;
         colmap::convert_text_model_to_binary(
             &self.engines.colmap,
@@ -2469,11 +2467,7 @@ impl PipelineRunner {
         })
         .await
         .map_err(|error| SplatError::Process(format!("Splatcam 二进制模型验证失败：{error}")))??;
-        self.events.stage(
-            PipelineStage::ImportingSplatcam,
-            0.7,
-            "已导入相机与点云，正在生成训练输入",
-        );
+        self.splatcam_import_step(4, 5, "二进制模型已校验；正在生成标准训练输入");
         let input_images = staged_source.join("images");
         training::prepare_standard_colmap_dataset(
             &paths.training_input,
@@ -2481,6 +2475,7 @@ impl PipelineRunner {
             &binary_model,
         )
         .await?;
+        self.splatcam_import_step(5, 5, "训练输入已就绪，正在进入训练");
         metadata.timings.training_input_ms = total_started.elapsed().as_millis() as u64;
         state.training_input_complete = true;
         state.stage = PipelineStage::TrainingSplats;
@@ -2613,6 +2608,20 @@ impl PipelineRunner {
             logs_directory: paths.logs.clone(),
             colmap_backend: ColmapBackend::Cpu,
         })
+    }
+    fn splatcam_import_step(&self, current: u64, total: u64, message: impl Into<String>) {
+        self.events.send(
+            PipelineStage::ImportingSplatcam,
+            Some(PipelineEngine::System),
+            EventKind::Progress,
+            EventLevel::Info,
+            Some(current as f32 / total as f32),
+            false,
+            message,
+            Some(current),
+            Some(total),
+            Some("步骤"),
+        );
     }
     fn process_observer(
         &self,
