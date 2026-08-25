@@ -21,8 +21,8 @@ use crate::{
     presets::Quality,
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
-        FrameState, PipelineStateFile, ProjectManager, ProjectMetadata, ProjectOutput,
-        ProjectPaths, ProjectStatus,
+        atomic_write_json, FrameState, PipelineStateFile, ProjectManager, ProjectMetadata,
+        ProjectOutput, ProjectPaths, ProjectStatus,
     },
     reconstruction::{
         ply::inspect_gaussian_ply,
@@ -1998,7 +1998,16 @@ impl PipelineRunner {
                         self.ffmpeg_hw_accel,
                         Some(paths.logs.join("ffmpeg-adaptive-bridge.log")),
                         &self.process_manager,
-                        None,
+                        state.video.as_ref().map(|video| {
+                            self.process_observer(
+                                PipelineStage::ValidatingReconstruction,
+                                PipelineEngine::Ffmpeg,
+                                Some(combined_selection.len() as u64),
+                                ObserverMode::FfmpegSelected {
+                                    source_duration_seconds: video.duration,
+                                },
+                            )
+                        }),
                     )
                     .await?;
                 }
@@ -2386,6 +2395,10 @@ impl PipelineRunner {
         })
         .await
         .map_err(|error| SplatError::Process(format!("Splatcam 导入检查任务失败：{error}")))??;
+        // Keep the full geometry metrics beside the normalized model. `project.json` deliberately
+        // stores only the durable summary used by history, while this report is the diagnostic
+        // artifact needed to audit an accepted or rejected source export.
+        atomic_write_json(&import_root.join("import-report.json"), &report).await?;
         if !report.geometry_gate.passed {
             return Err(SplatError::Process(
                 report

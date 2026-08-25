@@ -1,7 +1,7 @@
 # Splatcam 已重建数据导入实施文档
 
 > 文档状态：设计完成，待代码实施  
-> 适用版本：SplatMod-Video2Splat 0.47.x  
+> 适用版本：SplatMod-Video2Splat 0.48.x
 > 当前范围：RGB JPEG + COLMAP 文本相机/位姿 + RGB 点云 PLY  
 > 不在本期范围：LiDAR 深度、`transforms.json`、深度监督训练
 

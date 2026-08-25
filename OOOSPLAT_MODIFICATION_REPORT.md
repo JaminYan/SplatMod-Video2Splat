@@ -1,6 +1,6 @@
-# OOOSplat 0.47 相对原版项目的修改说明
+# OOOSplat 0.48 相对原版项目的修改说明
 
-本文用于说明当前本地升级版与上游 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的主要差异。上游公开版本说明为 0.1.0，核心链路是“视频 → FFmpeg 抽帧 → COLMAP → Brush → final.ply”，并且不包含内置 3D Viewer；当前版本为本地升级版 0.47。
+本文用于说明当前本地升级版与上游 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的主要差异。上游公开版本说明为 0.1.0，核心链路是“视频 → FFmpeg 抽帧 → COLMAP → Brush → final.ply”，并且不包含内置 3D Viewer；当前版本为本地升级版 0.48。
 
 > 文档更新时间：2026-08-24。本文区分“已实施”“已通过局部验证”和“仍待真实素材验收”，不把计划、静态检查或单次诊断运行写成完整发布结论。
 
@@ -32,7 +32,7 @@
 
 ## 2. 主要改动总览
 
-| 领域 | 原版 | 当前 0.47 |
+| 领域 | 原版 | 当前 0.48 |
 |---|---|---|
 | 抽帧 | 快速/均衡/精细按源 FPS 比例抽取 | 固定为快速 1 FPS、均衡 2 FPS、精细 4 FPS 候选帧 |
 | 帧筛选 | 均匀抽帧后直接进入 COLMAP | Rayon 并行计算 pHash 与 Laplacian，连续近重复合并并保留更清晰帧 |
