@@ -2,6 +2,7 @@ use crate::pipeline::PipelineStage;
 
 pub fn stage_progress_range(stage: PipelineStage) -> (f32, f32) {
     match stage {
+        PipelineStage::ImportingSplatcam => (0.00, 0.12),
         PipelineStage::ProbingVideo => (0.00, 0.05),
         PipelineStage::PlanningFrames => (0.05, 0.10),
         PipelineStage::ExtractingFrames => (0.10, 0.25),

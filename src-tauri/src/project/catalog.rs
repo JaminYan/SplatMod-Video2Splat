@@ -1,6 +1,7 @@
 use crate::{
     engines::{
-    ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode, TrainingBackend, PhotometricMode,
+        ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode,
+        PhotometricMode, TrainingBackend,
     },
     error::{Result, SplatError},
     presets::{BrushTrainingPreset, GsplatSplatCap},
@@ -92,6 +93,7 @@ pub struct ProjectSummary {
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
     pub quality: crate::presets::Quality,
+    pub input_source: crate::pipeline::InputSource,
     pub training_backend: TrainingBackend,
     pub brush_training_preset: BrushTrainingPreset,
     pub gsplat_splat_cap: GsplatSplatCap,
@@ -421,6 +423,7 @@ async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
         completed_at,
         duration_ms: metadata.duration_ms,
         quality: metadata.quality,
+        input_source: metadata.input_source,
         training_backend: metadata.training_backend,
         brush_training_preset: metadata.brush_training_preset,
         gsplat_splat_cap: metadata.gsplat_splat_cap,

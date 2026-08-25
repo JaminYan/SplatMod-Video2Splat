@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use ooo_splat::{
-    engines::{ffmpeg::extract_uniform_frames, ffprobe::probe_video, FfmpegHwAccel},
+    engines::{
+        colmap::convert_text_model_to_binary, ffmpeg::extract_uniform_frames, ffprobe::probe_video,
+        FfmpegHwAccel,
+    },
     error::{Result, SplatError},
     pipeline::runner::{default_engine_paths, PipelineRunner},
     presets::Quality,
@@ -43,6 +46,8 @@ enum Commands {
     },
     /// Validate a Splatcam RGB + COLMAP text + RGB point-cloud export without modifying it.
     SplatcamInspect { input: PathBuf },
+    /// Normalize Splatcam into COLMAP text and binary models without running SfM.
+    SplatcamNormalize { input: PathBuf, output: PathBuf },
     /// Run the end-to-end pipeline after all fixed engine CLIs are verified.
     Generate {
         input: PathBuf,
@@ -116,6 +121,42 @@ async fn execute(cli: Cli) -> Result<()> {
                         SplatError::Process(format!("Splatcam 导入检查任务失败：{error}"))
                     })??;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Commands::SplatcamNormalize { input, output } => {
+            if output.exists() {
+                return Err(SplatError::Process(format!(
+                    "输出目录已存在，拒绝覆盖：{}",
+                    output.display()
+                )));
+            }
+            std::fs::create_dir_all(&output)?;
+            let text_model = output.join("normalized-model");
+            let source = input.clone();
+            let text_destination = text_model.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                ooo_splat::splatcam::prepare_normalized_text_model(&source, &text_destination)
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("Splatcam 标准化任务失败：{error}")))??;
+            let binary_model = output.join("binary-model");
+            std::fs::create_dir(&binary_model)?;
+            convert_text_model_to_binary(
+                &engines.colmap,
+                &text_model,
+                &binary_model,
+                output.join("model-converter.log"),
+                &ProcessManager::new(),
+                None,
+            )
+            .await?;
+            ooo_splat::splatcam::verify_binary_model_counts(
+                &binary_model,
+                report.camera_count,
+                report.pose_count,
+                report.point_count,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            println!("normalized model: {}", binary_model.display());
         }
         Commands::Generate {
             input,

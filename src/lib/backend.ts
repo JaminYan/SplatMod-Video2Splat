@@ -122,6 +122,14 @@ export async function startPipeline(
   return invoke("start_pipeline", { path, quality, projectsRoot, autoBridgeFrames });
 }
 
+export async function startSplatcamPipeline(
+  path: string,
+  quality: Quality,
+  projectsRoot: string,
+): Promise<PipelineResult> {
+  return invoke("start_splatcam_pipeline", { path, quality, projectsRoot });
+}
+
 export async function cancelPipeline(): Promise<void> {
   return invoke("cancel_pipeline");
 }

@@ -121,6 +121,8 @@ impl ProjectManager {
             output: None,
             failure_message: None,
             app_id: crate::pipeline::PROJECT_APP_ID.to_string(),
+            input_source: crate::pipeline::InputSource::Video,
+            splatcam_import: None,
             training_backend: crate::engines::TrainingBackend::Brush,
             brush_training_preset: crate::presets::BrushTrainingPreset::A,
             gsplat_splat_cap: crate::presets::GsplatSplatCap::Auto,

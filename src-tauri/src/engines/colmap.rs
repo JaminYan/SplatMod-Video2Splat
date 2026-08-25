@@ -120,6 +120,36 @@ pub async fn extract_features(
     .await
 }
 
+/// Converts a validated COLMAP text model into the binary layout consumed by Brush and gsplat.
+/// This deliberately has no feature/matching/mapper flags, so it is safe for already-reconstructed
+/// Splatcam exports.
+pub async fn convert_text_model_to_binary(
+    executable: &Path,
+    input: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        vec![
+            "model_converter".into(),
+            "--input_path".into(),
+            input.as_os_str().to_os_string(),
+            "--output_path".into(),
+            output.as_os_str().to_os_string(),
+            "--output_type".into(),
+            "BIN".into(),
+        ],
+        input,
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 /// Only device/driver/runtime failures are eligible for a CPU retry. Dataset
 /// quality failures (for example insufficient matches) must remain visible and
 /// never be disguised as a successful CPU fallback.
@@ -245,15 +275,22 @@ pub async fn undistort_images(
     run_colmap(
         executable,
         vec![
-            "image_undistorter".into(), "--image_path".into(), images.into(),
-            "--input_path".into(), model.into(), "--output_path".into(), output.into(),
-            "--output_type".into(), "COLMAP".into(),
+            "image_undistorter".into(),
+            "--image_path".into(),
+            images.into(),
+            "--input_path".into(),
+            model.into(),
+            "--output_path".into(),
+            output.into(),
+            "--output_type".into(),
+            "COLMAP".into(),
         ],
         images,
         log,
         manager,
         None,
-    ).await
+    )
+    .await
 }
 
 #[cfg(test)]

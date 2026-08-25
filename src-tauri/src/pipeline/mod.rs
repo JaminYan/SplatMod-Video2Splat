@@ -21,6 +21,7 @@ pub use runner::*;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PipelineStage {
+    ImportingSplatcam,
     ProbingVideo,
     PlanningFrames,
     ExtractingFrames,
@@ -115,6 +116,10 @@ pub struct ProjectMetadata {
     pub failure_message: Option<String>,
     pub app_id: String,
     #[serde(default)]
+    pub input_source: InputSource,
+    #[serde(default)]
+    pub splatcam_import: Option<SplatcamImportState>,
+    #[serde(default)]
     pub training_backend: TrainingBackend,
     #[serde(default)]
     pub colmap_execution: ColmapExecution,
@@ -128,7 +133,30 @@ pub struct ProjectMetadata {
     pub needs_supplement: Option<SupplementRequirement>,
 }
 
-fn default_auto_bridge_frames() -> bool { true }
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InputSource {
+    #[default]
+    Video,
+    Splatcam,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplatcamImportState {
+    pub source_path: PathBuf,
+    pub image_count: u64,
+    pub pose_count: u64,
+    pub point_count: u64,
+    pub coordinate_convention: String,
+    pub has_depth: bool,
+    pub has_transforms: bool,
+    pub geometry_gate_passed: bool,
+}
+
+fn default_auto_bridge_frames() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,6 +235,10 @@ pub struct PipelineStateFile {
     pub schema_version: u32,
     pub stage: PipelineStage,
     pub quality: Quality,
+    #[serde(default)]
+    pub input_source: InputSource,
+    #[serde(default)]
+    pub splatcam_import: Option<SplatcamImportState>,
     pub video: Option<VideoInfo>,
     pub frames: Option<FrameState>,
     pub features_complete: bool,
@@ -231,6 +263,8 @@ impl PipelineStateFile {
             schema_version: 1,
             stage: PipelineStage::ProbingVideo,
             quality,
+            input_source: InputSource::Video,
+            splatcam_import: None,
             video: None,
             frames: None,
             features_complete: false,
@@ -276,8 +310,31 @@ mod tests {
             diagnostics_path: PathBuf::from("logs/adaptive-registered-frames.json"),
         });
 
-        let restored: PipelineStateFile = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let restored: PipelineStateFile =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(restored.stage, PipelineStage::NeedsSupplement);
         assert_eq!(restored.needs_supplement.unwrap().weak_interval_count, 2);
+    }
+
+    #[test]
+    fn splatcam_source_state_round_trips_without_video_fields() {
+        let mut state = PipelineStateFile::created(Quality::Standard);
+        state.input_source = InputSource::Splatcam;
+        state.stage = PipelineStage::ImportingSplatcam;
+        state.splatcam_import = Some(SplatcamImportState {
+            source_path: PathBuf::from("export"),
+            image_count: 68,
+            pose_count: 68,
+            point_count: 189_385,
+            coordinate_convention: "colmap-world-to-camera".into(),
+            has_depth: false,
+            has_transforms: false,
+            geometry_gate_passed: true,
+        });
+        let restored: PipelineStateFile =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.input_source, InputSource::Splatcam);
+        assert_eq!(restored.splatcam_import.unwrap().point_count, 189_385);
+        assert!(restored.video.is_none() && restored.frames.is_none());
     }
 }

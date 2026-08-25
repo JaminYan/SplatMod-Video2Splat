@@ -261,6 +261,45 @@ pub async fn start_pipeline(
     result
 }
 
+/// Starts training from an already reconstructed Splatcam export. The runner owns the
+/// source boundary and never falls back to the video/SfM pipeline.
+#[tauri::command]
+pub async fn start_splatcam_pipeline(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    path: String,
+    quality: Quality,
+    projects_root: String,
+) -> std::result::Result<PipelineResult, SplatError> {
+    let settings = catalog::load_settings().await?;
+    let emitter = app.clone();
+    let runner = Arc::new(PipelineRunner::new(
+        paths_for_app(&app),
+        settings.colmap_backend,
+        settings.cuda_colmap_flavor,
+        settings.mapper_ba_mode,
+        settings.ffmpeg_hw_accel,
+        settings.brush_training_preset,
+        settings.gsplat_splat_cap,
+        settings.photometric_mode,
+        settings.training_backend,
+        false,
+        move |event| { let _ = emitter.emit("pipeline-event", event); },
+    ));
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() { return Err(SplatError::Process("已有任务正在运行".into())); }
+        *active = Some(runner.clone());
+    }
+    let result = runner.generate_splatcam(PathBuf::from(path).as_path(), quality, PathBuf::from(projects_root).as_path()).await;
+    if let Err(error) = &result {
+        let stage = if matches!(error, SplatError::Cancelled) { crate::pipeline::PipelineStage::Cancelled } else { crate::pipeline::PipelineStage::Failed };
+        let _ = app.emit("pipeline-event", crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()));
+    }
+    *state.active.lock().await = None;
+    result
+}
+
 #[tauri::command]
 pub async fn cancel_pipeline(state: State<'_, PipelineController>) -> Result<()> {
     let runner = state.active.lock().await.clone();

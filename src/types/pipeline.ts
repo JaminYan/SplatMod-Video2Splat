@@ -108,6 +108,7 @@ export interface ProjectSummary {
   completedAt: string | null;
   durationMs: number | null;
   quality: Quality;
+  inputSource: InputSource;
   trainingBackend: TrainingBackend;
   brushTrainingPreset: BrushTrainingPreset;
   gsplatSplatCap: GsplatSplatCap;

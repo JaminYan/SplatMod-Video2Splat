@@ -249,6 +249,8 @@ struct FrameSelectionPlan {
 
 Mapper 后的自动补帧 attempt 也会从持久化 `adaptive-proxy-analysis.json` 恢复候选顺序与 VFR PTS 映射，采用相同的平衡定向抽帧；该文件缺失或损坏时记录原因，并安全回退兼容抽帧。
 
+每个成功的自适应原图定向抽帧还必须写入 `logs/adaptive-original-extraction-benchmark.json`：记录代理采样点数、实际编码 JPEG 数、跳过的候选 JPEG 数、抽帧耗时与输出吞吐。主界面在该阶段结束时输出相同的摘要；扫描采样点仍需顺序解码，但该基准不得把它误写成已编码 JPEG 数。
+
 本里程碑采用“两遍分析 + 质量闭环”：
 
 ```text

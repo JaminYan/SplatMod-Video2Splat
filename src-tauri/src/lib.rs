@@ -19,6 +19,7 @@ pub fn run_app() {
             commands::get_settings,
             commands::probe_and_plan,
             commands::start_pipeline,
+            commands::start_splatcam_pipeline,
             commands::cancel_pipeline,
             commands::export_ply,
             commands::get_project_overview,

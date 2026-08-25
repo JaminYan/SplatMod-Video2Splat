@@ -7,7 +7,7 @@ import {
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings,
   inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectVideo,
-  setProjectsRoot, startPipeline,
+  setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
 import type {
@@ -31,7 +31,40 @@ const qualities: Array<{ value: Quality; label: string; description: string }> =
   { value: "high", label: "精细", description: "更充分地利用视频画面细节" },
 ];
 
+const splatcamTrainingProfiles: Record<Quality, { iterations: number; resolution: number }> = {
+  fast: { iterations: 7_000, resolution: 512 },
+  balanced: { iterations: 15_000, resolution: 1024 },
+  high: { iterations: 30_000, resolution: 1920 },
+};
+
+const splatcamBrushCap = (quality: Quality, preset: BrushTrainingPreset) => {
+  const caps: Record<BrushTrainingPreset, Record<Quality, number>> = {
+    a: { fast: 1_500_000, balanced: 3_000_000, high: 5_000_000 },
+    b: { fast: 1_000_000, balanced: 2_000_000, high: 3_000_000 },
+    c: { fast: 2_000_000, balanced: 5_000_000, high: 8_000_000 },
+  };
+  return caps[preset][quality];
+};
+
+const splatcamTrainingDetail = (
+  quality: Quality,
+  trainingBackend: TrainingBackend | undefined,
+  brushPreset: BrushTrainingPreset | undefined,
+  gsplatCap: GsplatSplatCap | undefined,
+) => {
+  const profile = splatcamTrainingProfiles[quality];
+  if (trainingBackend === "brush" && brushPreset) {
+    const iterations = brushPreset === "c" ? Math.floor(profile.iterations * 1.5) : profile.iterations;
+    const resolution = brushPreset === "b" ? Math.min(profile.resolution, 1536) : profile.resolution;
+    return `${iterations.toLocaleString()} 次迭代 · ${resolution}px · Brush ${brushPreset.toUpperCase()} 上限 ${(splatcamBrushCap(quality, brushPreset) / 10_000).toLocaleString()} 万 splat`;
+  }
+  const cap = gsplatCap === "1m" ? 1_000_000 : gsplatCap === "2m" ? 2_000_000 : 4_000_000;
+  const qualityCap = quality === "fast" ? 1_500_000 : quality === "balanced" ? 3_000_000 : 5_000_000;
+  return `${profile.iterations.toLocaleString()} 次迭代 · ${profile.resolution}px · gsplat 上限 ${Math.min(cap, qualityCap) / 10_000} 万 splat`;
+};
+
 const stages = [
+  ["importingSplatcam", "Splatcam 导入"],
   ["probingVideo", "视频分析"], ["extractingFrames", "画面提取"], ["selectingFrames", "画面筛选"],
   ["extractingFeatures", "特征提取"], ["matching", "顺序匹配"],
   ["reconstructing", "相机重建"], ["validatingReconstruction", "重建校验"], ["trainingSplats", "Splat 训练"],
@@ -58,8 +91,9 @@ const trainingLabel = (project: ProjectSummary) => {
 };
 const statusLabel: Record<ProjectStatus, string> = { running: "处理中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", needsSupplement: "等待补充素材" };
 const stagePosition = (stage?: string) => {
-  if (!stage || ["created", "probingVideo", "planningFrames"].includes(stage)) return 0;
-  if (["completed", "failed", "cancelled", "needsSupplement"].includes(stage)) return 8;
+  if (!stage || stage === "created") return 0;
+  if (["probingVideo", "planningFrames"].includes(stage)) return 1;
+  if (["completed", "failed", "cancelled", "needsSupplement"].includes(stage)) return 9;
   const index = stages.findIndex(([key]) => key === stage);
   return index < 0 ? 0 : index;
 };
@@ -108,6 +142,7 @@ function ProjectRow({ project, busy, opening, onDelete, onView }: { project: Pro
       <div><dt>生成日期</dt><dd>{formatDate(project.completedAt ?? project.createdAt)}</dd></div>
       <div><dt>耗时</dt><dd>{formatDuration(project.durationMs)}</dd></div>
       <div><dt>训练</dt><dd>{trainingLabel(project)}</dd></div>
+      <div><dt>数据源</dt><dd>{project.inputSource === "splatcam" ? "Splatcam 已重建数据" : "视频重建"}</dd></div>
       <div><dt>档位</dt><dd>{qualityLabel(project.quality)}</dd></div>
       <div><dt>SfM 注册</dt><dd>{project.registeredRatio == null ? "—" : `${(project.registeredRatio * 100).toFixed(1)}%`}</dd></div>
       <div><dt>三维点</dt><dd>{project.points3d?.toLocaleString() ?? "—"}</dd></div>
@@ -442,13 +477,16 @@ export function App() {
   };
   const chooseQuality = async (quality: Quality) => {
     store.setQuality(quality);
-    if (store.videoPath) await analyze(store.videoPath, quality);
+    if (inputSource === "video" && store.videoPath) await analyze(store.videoPath, quality);
   };
   const generate = async () => {
-    if (!store.videoPath || !store.plan || !store.projectsRoot) return;
+    const path = inputSource === "splatcam" ? splatcamPath : store.videoPath;
+    if (!path || !store.projectsRoot || (inputSource === "video" && !store.plan)) return;
     store.beginRun();
     try {
-      const result = await startPipeline(store.videoPath, store.quality, store.projectsRoot, store.autoBridgeFrames);
+      const result = inputSource === "splatcam"
+        ? await startSplatcamPipeline(path, store.quality, store.projectsRoot)
+        : await startPipeline(path, store.quality, store.projectsRoot, store.autoBridgeFrames);
       store.setResult(result);
       store.setPhase("completed");
     } catch (error) {
@@ -546,12 +584,13 @@ export function App() {
             <p className="field-note">每次生成会在此处创建独立项目文件夹，final.ply 直接保存在项目根部。</p>
           </div>
 
-          <div className="form-section">
-            <label className="field-label">生成质量</label>
-            <div className="quality-list" role="radiogroup">
-              {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
-                <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{quality.description}</small></span>
-              </button>)}
+        <div className="form-section">
+          <label className="field-label">{inputSource === "splatcam" ? "训练质量" : "生成质量"}</label>
+          {inputSource === "splatcam" && <p className="field-hint">直接使用导出的图片与相机位姿；不会进行视频分析、抽帧或关键帧筛选。</p>}
+          <div className="quality-list" role="radiogroup">
+            {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
+              <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{inputSource === "splatcam" ? splatcamTrainingDetail(quality.value, store.settings?.settings.trainingBackend, store.settings?.settings.brushTrainingPreset, store.settings?.settings.gsplatSplatCap) : quality.description}</small></span>
+            </button>)}
             </div>
           </div>
 
@@ -561,9 +600,9 @@ export function App() {
             <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
           </div>}
 
-          {!isRunning && <button className="primary-action" type="button" disabled={inputSource !== "video" || !store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
+          {!isRunning && <button className="primary-action" type="button" disabled={inputSource === "splatcam" ? !splatcamPath || !splatcamReport?.geometryGate.passed || !store.projectsRoot : !store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
             {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}
-            {inputSource === "splatcam" ? "Splatcam 训练接入中" : store.phase === "analyzing" ? "正在分析视频" : "开始生成"}<ChevronRight size={16} />
+            {inputSource === "splatcam" ? "导入并训练" : store.phase === "analyzing" ? "正在分析视频" : "开始生成"}<ChevronRight size={16} />
           </button>}
 
           {(isRunning || store.events.length > 0) && <section className="live-process">
