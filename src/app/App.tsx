@@ -5,7 +5,7 @@ import {
   Zap, ZapOff,
 } from "lucide-react";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings,
+  cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings, getSupplementDiagnostics,
   inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectVideo,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
@@ -17,9 +17,11 @@ import type {
   FfmpegHwAccel,
   BrushTrainingPreset,
   GsplatSplatCap,
+  GsplatDensificationStrategy,
   TrainingBackend,
   ProjectStatus,
   ProjectSummary,
+  SupplementDiagnostics,
   PipelineEvent,
   Quality,
   InputSource,
@@ -88,7 +90,9 @@ const qualityLabel = (quality: Quality) => qualities.find((item) => item.value =
 const trainingLabel = (project: ProjectSummary) => {
   if (project.trainingBackend === "brush") return `Brush ${project.brushTrainingPreset.toUpperCase()}`;
   const cap: Record<GsplatSplatCap, string> = { auto: "自动安全", "1m": "100 万", "2m": "200 万", "4m": "400 万" };
-  return `gsplat Splat${cap[project.gsplatSplatCap]}`;
+  const strategy = project.gsplatDensificationStrategy === "absgrad" ? "AbsGS" : "MCMC";
+  const module = project.photometricMode === "wdr" ? " · WD-R" : project.photometricMode === "ppisp" ? " · PPISP" : "";
+  return `gsplat ${strategy} · Splat${cap[project.gsplatSplatCap]}${module}`;
 };
 const statusLabel: Record<ProjectStatus, string> = { running: "处理中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", needsSupplement: "等待补充素材" };
 const stagePosition = (stage?: string) => {
@@ -121,6 +125,27 @@ function engineReady(engine: EngineStatus) {
 
 const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [supplementOpen, setSupplementOpen] = useState(false);
+  const [supplementDiagnostics, setSupplementDiagnostics] = useState<SupplementDiagnostics | null>(null);
+  const [supplementError, setSupplementError] = useState<string | null>(null);
+  const [loadingSupplement, setLoadingSupplement] = useState(false);
+  const toggleSupplement = async () => {
+    if (supplementOpen) {
+      setSupplementOpen(false);
+      return;
+    }
+    setSupplementError(null);
+    setSupplementOpen(true);
+    if (supplementDiagnostics || loadingSupplement) return;
+    setLoadingSupplement(true);
+    try {
+      setSupplementDiagnostics(await getSupplementDiagnostics(project.id));
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setLoadingSupplement(false);
+    }
+  };
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -134,6 +159,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
     <div className="project-actions">
       <button className="viewer-action" type="button" disabled={busy || opening || !project.finalPly} onClick={() => onView(project)}>{opening ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{opening ? "正在打开" : "查看 3D"}</button>
       <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />资源管理器</button>
+      {project.status === "needsSupplement" && <button className="supplement-action" type="button" disabled={busy || loadingSupplement} onClick={() => void toggleSupplement()}><CircleAlert size={14} />{loadingSupplement ? "正在读取弱区" : supplementOpen ? "收起弱区" : "查看弱区"}</button>}
       <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
       <button type="button" onClick={() => setDetailsOpen((open) => !open)}><Info size={14} />{detailsOpen ? "收起详情" : "详情"}</button>
     </div>
@@ -148,6 +174,22 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       <div><dt>SfM 注册</dt><dd>{project.registeredRatio == null ? "—" : `${(project.registeredRatio * 100).toFixed(1)}%`}</dd></div>
       <div><dt>三维点</dt><dd>{project.points3d?.toLocaleString() ?? "—"}</dd></div>
     </dl>}
+    {supplementOpen && <section className="supplement-panel" aria-label="弱区补拍指引">
+      {supplementError && <p className="supplement-error">无法读取弱区诊断：{supplementError}</p>}
+      {loadingSupplement && <p className="supplement-loading">正在读取已持久化的弱区时间轴…</p>}
+      {supplementDiagnostics && <>
+        <div className="supplement-summary"><strong>需要补充拍摄</strong><span>{supplementDiagnostics.registeredFrames} / {supplementDiagnostics.selectedFrames} 张关键帧已注册</span></div>
+        <p className="supplement-hint">请沿原拍摄轨迹，在以下时间范围补拍相邻视角；让主体在画面中移动约 15–25% 宽度。单目素材没有可靠绝对尺度，因此不显示厘米或米。</p>
+        <ol className="weak-interval-list">
+          {supplementDiagnostics.weakIntervals.map((interval, index) => <li key={`${interval.startPtsSeconds}-${interval.endPtsSeconds}-${index}`}>
+            <div><strong>弱区 {index + 1} · {formatVideoDuration(interval.startPtsSeconds)}–{formatVideoDuration(interval.endPtsSeconds)}</strong><span>{interval.unregisteredFrames} 张未注册关键帧</span></div>
+            <p>问题：{interval.reason === "unregisteredSelectedFrames" ? "视角重叠或视差不足" : interval.reason}</p>
+            <small>锚点：{interval.beforeAnchor ? `${formatVideoDuration(interval.beforeAnchor.ptsSeconds)} · ${interval.beforeAnchor.outputFile}` : "缺少前锚点"} → {interval.afterAnchor ? `${formatVideoDuration(interval.afterAnchor.ptsSeconds)} · ${interval.afterAnchor.outputFile}` : "缺少后锚点"}</small>
+          </li>)}
+        </ol>
+        <p className="supplement-next">下一阶段将从这里上传补充视频或照片，并先做重叠、清晰度与视差验证；当前可通过“资源管理器”核对锚点原图和完整日志。</p>
+      </>}
+    </section>}
   </article>;
 });
 
@@ -382,16 +424,29 @@ function GsplatSplatCapBlock() {
   return <div className="settings-block"><div className="settings-block-title">gsplat splat 上限</div><p className="settings-block-hint">MCMC 会在验证损失停滞后冻结增殖，并过滤透明无效 splat；上限不是目标数量。</p><div className="backend-toggle" role="radiogroup" aria-label="gsplat splat 上限">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setGsplatSplatCap(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
+function GsplatDensificationStrategyBlock() {
+  const store = useAppStore();
+  const settings = store.settings;
+  if (!settings || settings.settings.trainingBackend !== "gsplat") return null;
+  const current: GsplatDensificationStrategy = settings.settings.gsplatDensificationStrategy;
+  const options: Array<{ value: GsplatDensificationStrategy; title: string; hint: string }> = [
+    { value: "mcmc", title: "MCMC（默认，已验证）", hint: "稳定的采样与增殖路径；适合正式任务。" },
+    { value: "absgrad", title: "AbsGS（实验 A/B）", hint: "按绝对屏幕梯度增殖；须和 MCMC 固定同素材、质量档、上限及 seed 对照。" },
+  ];
+  return <div className="settings-block"><div className="settings-block-title">gsplat 增殖策略</div><p className="settings-block-hint">仅 gsplat 生效。AbsGS 不会改变默认策略；首轮对照请关闭 PPISP，以保证只比较增殖策略。</p><div className="backend-toggle" role="radiogroup" aria-label="gsplat 增殖策略">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setGsplatDensificationStrategy(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
+}
+
 function PhotometricModeBlock() {
  const store = useAppStore();
  const settings = store.settings;
  if (!settings || settings.settings.trainingBackend !== "gsplat") return null;
  const current = settings.settings.photometricMode;
  const options = [
-  { value: "none" as const, title: "关闭（M0 基线）", hint: "使用标准 L1 + DSSIM，不增加 PPISP 运行时成本。" },
+  { value: "none" as const, title: "关闭（M0 基线）", hint: "使用标准 L1 + DSSIM，不增加附加模型成本。" },
   { value: "ppisp" as const, title: "PPISP（实验）", hint: "补偿曝光、白平衡、暗角与色调变化；单帧训练，PLY 不含 controller。" },
+  { value: "wdr" as const, title: "WD-R（实验）", hint: "VGG-16 Wasserstein 感知损失；3k/20% warm-up 后启用，单帧训练且明显更慢。" },
  ];
- return <div className="settings-block"><div className="settings-block-title">光度一致性</div><p className="settings-block-hint">仅 gsplat 生效。PPISP 适合曝光变化明显的视频；请与同素材 M0 基线对照后再用于正式交付。</p><div className="backend-toggle" role="radiogroup" aria-label="光度一致性">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
+ return <div className="settings-block"><div className="settings-block-title">附加训练模块</div><p className="settings-block-hint">仅 gsplat 生效，PPISP 与 WD-R 互斥。WD-R 是感知实验，必须以固定素材、cap、seed 的 M0/MCMC 对照验收。</p><div className="backend-toggle" role="radiogroup" aria-label="附加训练模块">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
 function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose: () => void; inputSource: InputSource }) {
@@ -411,6 +466,7 @@ function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose
         </>}
         <TrainingBackendBlock />
         <GsplatSplatCapBlock />
+        <GsplatDensificationStrategyBlock />
         <PhotometricModeBlock />
         <BrushTrainingPresetBlock inputSource={inputSource} />
         {store.settingsNotice && (

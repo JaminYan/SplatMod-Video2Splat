@@ -126,6 +126,8 @@ impl ProjectManager {
             training_backend: crate::engines::TrainingBackend::Brush,
             brush_training_preset: crate::presets::BrushTrainingPreset::A,
             gsplat_splat_cap: crate::presets::GsplatSplatCap::Auto,
+            gsplat_densification_strategy: crate::engines::GsplatDensificationStrategy::Mcmc,
+            photometric_mode: crate::engines::PhotometricMode::None,
             timings: crate::pipeline::PipelineTimings::default(),
             colmap_execution: crate::pipeline::ColmapExecution::default(),
             needs_supplement: None,

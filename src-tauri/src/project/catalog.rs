@@ -1,7 +1,7 @@
 use crate::{
     engines::{
         ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode,
-        PhotometricMode, TrainingBackend,
+        GsplatDensificationStrategy, PhotometricMode, TrainingBackend,
     },
     error::{Result, SplatError},
     presets::{BrushTrainingPreset, GsplatSplatCap},
@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-const CURRENT_SETTINGS_SCHEMA: u32 = 8;
+const CURRENT_SETTINGS_SCHEMA: u32 = 9;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -38,6 +38,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub gsplat_splat_cap: GsplatSplatCap,
     #[serde(default)]
+    pub gsplat_densification_strategy: GsplatDensificationStrategy,
+    #[serde(default)]
     pub photometric_mode: PhotometricMode,
 }
 impl Default for AppSettings {
@@ -52,6 +54,7 @@ impl Default for AppSettings {
             brush_training_preset: BrushTrainingPreset::A,
             training_backend: TrainingBackend::Brush,
             gsplat_splat_cap: GsplatSplatCap::Auto,
+            gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
             photometric_mode: PhotometricMode::None,
         }
     }
@@ -97,6 +100,8 @@ pub struct ProjectSummary {
     pub training_backend: TrainingBackend,
     pub brush_training_preset: BrushTrainingPreset,
     pub gsplat_splat_cap: GsplatSplatCap,
+    pub gsplat_densification_strategy: GsplatDensificationStrategy,
+    pub photometric_mode: PhotometricMode,
     pub source_name: String,
     pub registered_ratio: Option<f64>,
     pub points_3d: Option<u64>,
@@ -170,6 +175,7 @@ pub async fn load_settings() -> Result<AppSettings> {
                         brush_training_preset: BrushTrainingPreset::A,
                         training_backend: TrainingBackend::Brush,
                         gsplat_splat_cap: GsplatSplatCap::Auto,
+                        gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
                         photometric_mode: PhotometricMode::None,
                     });
                 }
@@ -186,6 +192,7 @@ pub async fn load_settings() -> Result<AppSettings> {
         brush_training_preset: BrushTrainingPreset::A,
         training_backend: TrainingBackend::Brush,
         gsplat_splat_cap: GsplatSplatCap::Auto,
+        gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
         photometric_mode: PhotometricMode::None,
     })
 }
@@ -235,6 +242,14 @@ pub async fn save_training_backend(backend: TrainingBackend) -> Result<AppSettin
 pub async fn save_gsplat_splat_cap(cap: GsplatSplatCap) -> Result<AppSettings> {
     let mut settings = load_settings().await?;
     settings.gsplat_splat_cap = cap;
+    persist(&settings).await?;
+    Ok(settings)
+}
+pub async fn save_gsplat_densification_strategy(
+    strategy: GsplatDensificationStrategy,
+) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.gsplat_densification_strategy = strategy;
     persist(&settings).await?;
     Ok(settings)
 }
@@ -427,6 +442,8 @@ async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
         training_backend: metadata.training_backend,
         brush_training_preset: metadata.brush_training_preset,
         gsplat_splat_cap: metadata.gsplat_splat_cap,
+        gsplat_densification_strategy: metadata.gsplat_densification_strategy,
+        photometric_mode: metadata.photometric_mode,
         source_name,
         registered_ratio: output.map(|v| v.registered_ratio),
         points_3d: output.map(|v| v.points_3d),

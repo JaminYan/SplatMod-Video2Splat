@@ -1,7 +1,8 @@
 use crate::{
     engines::{
         self, brush, ffprobe::probe_video, ColmapBackend, CudaColmapFlavor, EngineKind,
-        EnginePaths, EngineStatus, FfmpegHwAccel, MapperBaMode, TrainingBackend,
+        EnginePaths, EngineStatus, FfmpegHwAccel, GsplatDensificationStrategy, MapperBaMode,
+        TrainingBackend,
     },
     error::{Result, SplatError},
     pipeline::runner::{PipelineResult, PipelineRunner},
@@ -98,6 +99,27 @@ pub async fn get_project_overview(
         }
     }
     Ok(overview)
+}
+
+/// Loads a persisted weak-interval report for display only. Supplemental-media
+/// ingestion is deliberately a separate command so opening a project can never
+/// restart a completed pipeline attempt.
+#[tauri::command]
+pub async fn get_supplement_diagnostics(
+    project_id: String,
+) -> std::result::Result<crate::pipeline::runner::SupplementDiagnostics, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
 }
 #[tauri::command]
 pub async fn set_projects_root(
@@ -225,6 +247,7 @@ pub async fn start_pipeline(
         settings.ffmpeg_hw_accel,
         settings.brush_training_preset,
         settings.gsplat_splat_cap,
+        settings.gsplat_densification_strategy,
         settings.photometric_mode,
         settings.training_backend,
         auto_bridge_frames,
@@ -281,6 +304,7 @@ pub async fn start_splatcam_pipeline(
         settings.ffmpeg_hw_accel,
         settings.brush_training_preset,
         settings.gsplat_splat_cap,
+        settings.gsplat_densification_strategy,
         settings.photometric_mode,
         settings.training_backend,
         false,
@@ -352,6 +376,12 @@ pub async fn set_brush_training_preset(preset: BrushTrainingPreset) -> Result<Ap
 #[tauri::command]
 pub async fn set_gsplat_splat_cap(cap: GsplatSplatCap) -> Result<AppSettings> {
     catalog::save_gsplat_splat_cap(cap).await
+}
+#[tauri::command]
+pub async fn set_gsplat_densification_strategy(
+    strategy: GsplatDensificationStrategy,
+) -> Result<AppSettings> {
+    catalog::save_gsplat_densification_strategy(strategy).await
 }
 #[tauri::command]
 pub async fn set_photometric_mode(mode: crate::engines::training::PhotometricMode) -> Result<AppSettings> {

@@ -14,9 +14,12 @@ export type MapperBaMode = "auto" | "ceres" | "caspar";
 export type FfmpegHwAccel = "off" | "auto" | "d3d11va" | "cuda";
 export type BrushTrainingPreset = "a" | "b" | "c";
 export type GsplatSplatCap = "auto" | "1m" | "2m" | "4m";
+/** Experimental gsplat densification policy; MCMC remains the stable default. */
+export type GsplatDensificationStrategy = "mcmc" | "absgrad";
 export type TrainingBackend = "brush" | "gsplat";
 export type InputSource = "video" | "splatcam";
-export type PhotometricMode = "none" | "ppisp";
+/** Mutually exclusive gsplat experimental module. WD-R keeps photometric mode off. */
+export type PhotometricMode = "none" | "ppisp" | "wdr";
 export interface EngineStatus {
   kind: EngineKind;
   path: string;
@@ -39,6 +42,7 @@ export interface AppSettingsLike {
   brushTrainingPreset: BrushTrainingPreset;
   trainingBackend: TrainingBackend;
   gsplatSplatCap: GsplatSplatCap;
+  gsplatDensificationStrategy: GsplatDensificationStrategy;
   photometricMode: PhotometricMode;
 }
 export interface EffectiveSettings {
@@ -112,6 +116,8 @@ export interface ProjectSummary {
   trainingBackend: TrainingBackend;
   brushTrainingPreset: BrushTrainingPreset;
   gsplatSplatCap: GsplatSplatCap;
+  gsplatDensificationStrategy: GsplatDensificationStrategy;
+  photometricMode: PhotometricMode;
   sourceName: string;
   registeredRatio: number | null;
   points3d: number | null;
@@ -121,6 +127,25 @@ export interface ProjectOverview {
   projectsRoot: string;
   colmapBackend: ColmapBackend;
   projects: ProjectSummary[];
+}
+export interface SupplementAnchor {
+  outputFile: string;
+  ptsSeconds: number;
+}
+export interface SupplementWeakInterval {
+  reason: string;
+  startPtsSeconds: number;
+  endPtsSeconds: number;
+  unregisteredFrames: number;
+  firstOutputFile: string;
+  lastOutputFile: string;
+  beforeAnchor: SupplementAnchor | null;
+  afterAnchor: SupplementAnchor | null;
+}
+export interface SupplementDiagnostics {
+  selectedFrames: number;
+  registeredFrames: number;
+  weakIntervals: SupplementWeakInterval[];
 }
 export interface SplatcamImportReport {
   sourcePath: string;

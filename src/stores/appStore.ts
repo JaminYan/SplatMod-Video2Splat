@@ -7,6 +7,7 @@ import {
   setFfmpegHwAccel as setFfmpegHwAccelInvoke,
   setBrushTrainingPreset as setBrushTrainingPresetInvoke,
   setGsplatSplatCap as setGsplatSplatCapInvoke,
+  setGsplatDensificationStrategy as setGsplatDensificationStrategyInvoke,
   setTrainingBackend as setTrainingBackendInvoke,
   setPhotometricMode as setPhotometricModeInvoke,
 } from "../lib/backend";
@@ -19,6 +20,7 @@ import type {
   FfmpegHwAccel,
   BrushTrainingPreset,
   GsplatSplatCap,
+  GsplatDensificationStrategy,
   TrainingBackend,
   PhotometricMode,
   FramePlan,
@@ -63,6 +65,7 @@ interface AppState {
   setFfmpegHwAccel: (mode: FfmpegHwAccel) => Promise<void>;
   setBrushTrainingPreset: (preset: BrushTrainingPreset) => Promise<void>;
   setGsplatSplatCap: (cap: GsplatSplatCap) => Promise<void>;
+  setGsplatDensificationStrategy: (strategy: GsplatDensificationStrategy) => Promise<void>;
   setTrainingBackend: (backend: TrainingBackend) => Promise<void>;
   setPhotometricMode: (mode: PhotometricMode) => Promise<void>;
   downloadCudaColmap: () => Promise<void>;
@@ -176,11 +179,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     const next = await setGsplatSplatCapInvoke(cap);
     set({ settings: { ...settings, settings: next }, settingsNotice: `gsplat splat 上限已切换为 ${cap === "auto" ? "自动安全" : cap.toUpperCase()}。` });
   },
+  setGsplatDensificationStrategy: async (strategy) => {
+    const { settings } = get();
+    if (!settings || settings.settings.gsplatDensificationStrategy === strategy) return;
+    const next = await setGsplatDensificationStrategyInvoke(strategy);
+    set({
+      settings: { ...settings, settings: next },
+      settingsNotice: strategy === "absgrad"
+        ? "AbsGS 实验策略已开启；请固定素材、随机种子、质量档与 splat 上限进行对照。"
+        : "gsplat 已恢复为已验证的 MCMC 默认策略。",
+    });
+  },
   setPhotometricMode: async (mode) => {
     const { settings } = get();
     if (!settings || settings.settings.photometricMode === mode) return;
     const next = await setPhotometricModeInvoke(mode);
-    set({ settings: { ...settings, settings: next }, settingsNotice: mode === "ppisp" ? "PPISP 实验模式已开启；训练将使用单帧批次。" : "光度一致性已关闭，使用 M0 基线。" });
+    set({ settings: { ...settings, settings: next }, settingsNotice: mode === "ppisp" ? "PPISP 实验模式已开启；训练将使用单帧批次。" : mode === "wdr" ? "WD-R 实验已开启；训练使用单帧批次与 VGG-16 感知损失，耗时会明显增加。" : "附加训练模块已关闭，使用 M0 基线。" });
   },
   setTrainingBackend: async (backend) => {
     const { settings } = get();

@@ -226,6 +226,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-status.running { background: var(--blue); }
 .project-status.failed { background: var(--red); }
 .project-status.cancelled, .project-status.interrupted { background: var(--amber); }
+.project-status.needsSupplement { background: var(--amber); box-shadow: 0 0 0 3px var(--warning-ring); }
 .status-copy { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 10px; }
 .project-path { margin: 8px 0 0 14px; overflow: hidden; color: var(--muted); font: 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; text-overflow: ellipsis; white-space: nowrap; }
 .project-failure { margin: 8px 0 0 14px; color: var(--red); font-size: 11px; line-height: 1.5; }
@@ -239,6 +240,21 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-actions button { padding: 4px 0; display: flex; align-items: center; gap: 5px; color: var(--text-action); background: transparent; border: 0; cursor: pointer; font-size: 10px; }
 .project-actions button:hover:not(:disabled) { color: var(--blue); }
 .project-actions .danger-link:hover:not(:disabled) { color: var(--red); }
+.project-actions .supplement-action { color: var(--text-success); }
+.project-actions .supplement-action:hover:not(:disabled) { color: var(--green); }
+.supplement-panel { margin: 14px 0 4px 14px; padding: 13px 0; border-top: 1px solid var(--line-dark); border-bottom: 1px solid var(--line-dark); }
+.supplement-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--text-success); }
+.supplement-summary strong { font-size: 13px; }
+.supplement-summary span { color: var(--text-body); font: 600 11px/1.4 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.supplement-hint, .supplement-next, .supplement-error, .supplement-loading { max-width: 68ch; margin: 9px 0 0; color: var(--text-body); font-size: 11px; line-height: 1.65; }
+.supplement-error { color: var(--text-error); }
+.weak-interval-list { margin: 12px 0 0; padding: 0; list-style: none; }
+.weak-interval-list li { padding: 10px 0; border-top: 1px solid var(--line); }
+.weak-interval-list li > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.weak-interval-list strong { color: var(--ink); font-size: 12px; }
+.weak-interval-list span, .weak-interval-list small { color: var(--muted); font: 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.weak-interval-list p { margin: 5px 0 3px; color: var(--text-body); font-size: 11px; }
+.supplement-next { color: var(--muted); }
 .zoom-dock {
   position: fixed;
   right: 18px;

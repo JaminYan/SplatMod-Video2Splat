@@ -12,6 +12,7 @@ import type {
   FfmpegHwAccel,
   BrushTrainingPreset,
   GsplatSplatCap,
+  GsplatDensificationStrategy,
   TrainingBackend,
   PhotometricMode,
   FramePlan,
@@ -19,6 +20,7 @@ import type {
   PipelineResult,
   ProjectOverview,
   ProjectSummary,
+  SupplementDiagnostics,
   Quality,
   SplatcamImportReport,
   VideoInfo,
@@ -83,6 +85,9 @@ export async function setTrainingBackend(backend: TrainingBackend): Promise<AppS
 export async function setGsplatSplatCap(cap: GsplatSplatCap): Promise<AppSettingsLike> {
   return invoke("set_gsplat_splat_cap", { cap }) as Promise<AppSettingsLike>;
 }
+export async function setGsplatDensificationStrategy(strategy: GsplatDensificationStrategy): Promise<AppSettingsLike> {
+  return invoke("set_gsplat_densification_strategy", { strategy }) as Promise<AppSettingsLike>;
+}
 export async function setPhotometricMode(mode: PhotometricMode): Promise<AppSettingsLike> {
   return invoke("set_photometric_mode", { mode }) as Promise<AppSettingsLike>;
 }
@@ -105,6 +110,11 @@ export async function probeAndPlan(
 
 export async function getProjectOverview(): Promise<ProjectOverview> {
   return invoke("get_project_overview");
+}
+
+/** Reads the persisted weak-interval report only; it never resumes a pipeline. */
+export async function getSupplementDiagnostics(projectId: string): Promise<SupplementDiagnostics> {
+  return invoke("get_supplement_diagnostics", { projectId });
 }
 
 export async function setProjectsRoot(

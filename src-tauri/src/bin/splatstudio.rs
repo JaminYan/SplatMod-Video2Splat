@@ -171,6 +171,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 FfmpegHwAccel::Off,
                 ooo_splat::presets::BrushTrainingPreset::A,
                 ooo_splat::presets::GsplatSplatCap::Auto,
+                ooo_splat::engines::GsplatDensificationStrategy::Mcmc,
                 ooo_splat::engines::PhotometricMode::None,
                 ooo_splat::engines::TrainingBackend::Brush,
                 true,

@@ -102,6 +102,49 @@ pub struct PipelineResult {
     pub colmap_backend: ColmapBackend,
 }
 
+/// Read-only view model for a project that stopped before training because
+/// selected frames contain a weak registration interval. It intentionally
+/// contains only persisted diagnostics: requesting it cannot resume FFmpeg,
+/// COLMAP, or training.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementDiagnostics {
+    pub selected_frames: u64,
+    pub registered_frames: u64,
+    pub weak_intervals: Vec<SupplementWeakInterval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementWeakInterval {
+    pub reason: String,
+    pub start_pts_seconds: f64,
+    pub end_pts_seconds: f64,
+    pub unregistered_frames: u64,
+    pub first_output_file: String,
+    pub last_output_file: String,
+    pub before_anchor: Option<SupplementAnchor>,
+    pub after_anchor: Option<SupplementAnchor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementAnchor {
+    pub output_file: String,
+    pub pts_seconds: f64,
+}
+
+pub async fn read_supplement_diagnostics(project: &Path) -> Result<SupplementDiagnostics> {
+    let diagnostics_path = project.join("logs").join("adaptive-registered-frames.json");
+    let diagnostics = serde_json::from_slice::<SupplementDiagnostics>(
+        &tokio::fs::read(&diagnostics_path).await?,
+    )?;
+    if diagnostics.weak_intervals.is_empty() {
+        return Err(SplatError::Process("项目没有可展示的弱区诊断".into()));
+    }
+    Ok(diagnostics)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AdaptiveSelectedFramesLog {
@@ -330,6 +373,7 @@ pub struct PipelineRunner {
     ffmpeg_hw_accel: FfmpegHwAccel,
     brush_training_preset: crate::presets::BrushTrainingPreset,
     gsplat_splat_cap: crate::presets::GsplatSplatCap,
+    gsplat_densification_strategy: crate::engines::training::GsplatDensificationStrategy,
     photometric_mode: crate::engines::training::PhotometricMode,
     training_backend: TrainingBackend,
     auto_bridge_frames: bool,
@@ -345,6 +389,7 @@ impl PipelineRunner {
         ffmpeg_hw_accel: FfmpegHwAccel,
         brush_training_preset: crate::presets::BrushTrainingPreset,
         gsplat_splat_cap: crate::presets::GsplatSplatCap,
+        gsplat_densification_strategy: crate::engines::training::GsplatDensificationStrategy,
         photometric_mode: crate::engines::training::PhotometricMode,
         training_backend: TrainingBackend,
         auto_bridge_frames: bool,
@@ -358,6 +403,7 @@ impl PipelineRunner {
             ffmpeg_hw_accel,
             brush_training_preset,
             gsplat_splat_cap,
+            gsplat_densification_strategy,
             photometric_mode,
             training_backend,
             auto_bridge_frames,
@@ -1489,6 +1535,8 @@ impl PipelineRunner {
         metadata.training_backend = self.training_backend;
         metadata.brush_training_preset = self.brush_training_preset;
         metadata.gsplat_splat_cap = self.gsplat_splat_cap;
+        metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
+        metadata.photometric_mode = self.photometric_mode;
         let total_started = Instant::now();
         let prepared = self
             .prepare_frames(
@@ -2271,6 +2319,7 @@ impl PipelineRunner {
                 },
                 seed: 42,
                 photometric_mode: self.photometric_mode,
+                densification_strategy: self.gsplat_densification_strategy,
                 log_path: paths.logs.join(match self.training_backend {
                     TrainingBackend::Brush => "brush.log",
                     TrainingBackend::Gsplat => "gsplat.log",
@@ -2381,8 +2430,10 @@ impl PipelineRunner {
         state.input_source = InputSource::Splatcam;
         state.training_backend = self.training_backend;
         metadata.training_backend = self.training_backend;
+        metadata.photometric_mode = self.photometric_mode;
         metadata.brush_training_preset = self.brush_training_preset;
         metadata.gsplat_splat_cap = self.gsplat_splat_cap;
+        metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
         self.splatcam_import_step(0, 5, "正在验证 Splatcam RGB、相机、位姿与点云");
         tokio::fs::create_dir_all(&import_root).await?;
         let report = tokio::task::spawn_blocking({
@@ -2523,6 +2574,7 @@ impl PipelineRunner {
                 },
                 seed: 42,
                 photometric_mode: self.photometric_mode,
+                densification_strategy: self.gsplat_densification_strategy,
                 log_path: paths.logs.join(match self.training_backend {
                     TrainingBackend::Brush => "brush.log",
                     TrainingBackend::Gsplat => "gsplat.log",
@@ -3064,6 +3116,30 @@ mod progress_tests {
         assert_eq!(sample.2, 11);
         assert_eq!(sample.3, Some(21));
         assert_eq!(sample.4.as_deref(), Some("秒"));
+    }
+
+    #[test]
+    fn supplement_diagnostics_deserialize_persisted_weak_intervals() {
+        let diagnostics: SupplementDiagnostics = serde_json::from_str(
+            r#"{
+                "selectedFrames": 12,
+                "registeredFrames": 9,
+                "weakIntervals": [{
+                    "reason": "unregisteredSelectedFrames",
+                    "startPtsSeconds": 4.0,
+                    "endPtsSeconds": 5.5,
+                    "unregisteredFrames": 2,
+                    "firstOutputFile": "frame_000005.jpg",
+                    "lastOutputFile": "frame_000006.jpg",
+                    "beforeAnchor": { "outputFile": "frame_000004.jpg", "ptsSeconds": 3.5 },
+                    "afterAnchor": null
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.selected_frames, 12);
+        assert_eq!(diagnostics.weak_intervals[0].before_anchor.as_ref().unwrap().pts_seconds, 3.5);
+        assert!(diagnostics.weak_intervals[0].after_anchor.is_none());
     }
 
     #[test]

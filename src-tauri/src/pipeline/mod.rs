@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engines::{ColmapBackend, MapperBaMode, TrainingBackend},
+    engines::{ColmapBackend, GsplatDensificationStrategy, MapperBaMode, TrainingBackend},
     presets::{BrushTrainingPreset, GsplatSplatCap, Quality},
     video::VideoInfo,
 };
@@ -127,6 +127,12 @@ pub struct ProjectMetadata {
     pub brush_training_preset: BrushTrainingPreset,
     #[serde(default)]
     pub gsplat_splat_cap: GsplatSplatCap,
+    /// The gsplat densification implementation used for this exact project.
+    /// Older projects predate the selector and therefore deserialize as MCMC.
+    #[serde(default)]
+    pub gsplat_densification_strategy: GsplatDensificationStrategy,
+    #[serde(default)]
+    pub photometric_mode: crate::engines::PhotometricMode,
     #[serde(default)]
     pub timings: PipelineTimings,
     #[serde(default)]

@@ -1,14 +1,15 @@
 # OOOSplat Gaussian 模型质量提升实施文档
 
-> 文档版本：1.0  
+> 文档版本：1.1
 > 编写日期：2026-08-24  
+> 最近更新：2026-08-26
 > 适用项目：`A:\project\splat`  
 > 文档性质：后续开发、实验、验收和回退依据  
-> 当前状态：仅完成代码审计与技术研究，本文所列质量算法尚未实施  
+> 当前状态（2026-08-26）：M0 基线、M1 PPISP 和 M2 延迟增殖已实现；M3 的 MCMC/AbsGS 显式选择与可复现记录已实现。AbsGS 尚未完成三类真实素材的同输入 A/B 验收，因此仍为实验选项，Brush 继续是产品默认后端。M3.5 多视角浮点抑制已完成研究与实施设计，尚未进入代码开发。
 
 ## 1. 技术结论
 
-OOOSplat 下一阶段的质量提升不应从替换 COLMAP 或直接叠加最新论文开始，而应先把实验 gsplat 后端从“能够生成标准 PLY 的最小训练器”补齐为“可与 Brush 公平比较的完整 3D Gaussian Splatting 质量基线”。当前 gsplat adapter 在相机投影、Gaussian 初始化、视角相关颜色、损失函数和验证集设计上都存在基础缺口；这些缺口足以掩盖 MCMC、AbsGS、PPISP 或感知损失带来的真实收益。
+OOOSplat 的 M0 基础补齐、PPISP、延迟增殖以及 MCMC/AbsGS 显式选择已经进入实现；本文前半部分仍保留这些设计，作为代码审计、回归和重建基线的依据。当前下一阶段不应替换 COLMAP、继续扩大 splat cap 或直接叠加感知损失，而应先完成 MCMC/AbsGS 三类真实素材验收，并解决现有 opacity-only 导出过滤无法识别多视角不一致浮点的问题。
 
 推荐的主线顺序为：
 
@@ -16,10 +17,11 @@ OOOSplat 下一阶段的质量提升不应从替换 COLMAP 或直接叠加最新
 2. 接入 PPISP 光度补偿；
 3. 接入轻量动态区域降权和延迟增殖；
 4. 对 MCMC 与 AbsGS 进行同输入 A/B；
-5. 实验 WD-R 感知损失；
-6. 实验 ResGS 式粗到细训练与 residual split；
-7. 仅在检测到对应问题时启用 3DGUT、BAD-Gaussians 或深度正则；
-8. 最后再改善查看器的抗锯齿和运动一致性。
+5. 增加多视角一致性增殖门控、导出前多条件浮点清理和自动质量回退；
+6. 实验 WD-R 感知损失；
+7. 实验 ResGS 式粗到细训练与 residual split；
+8. 仅在检测到对应问题时启用 3DGUT、BAD-Gaussians 或深度正则；
+9. 最后再改善查看器的抗锯齿和运动一致性。
 
 这条路线的核心约束是：
 
@@ -28,6 +30,7 @@ OOOSplat 下一阶段的质量提升不应从替换 COLMAP 或直接叠加最新
 - 默认产物仍是普通第三方查看器可读取的标准 Gaussian PLY；
 - 训练时附加模块不能被误认为已经写入 PLY；
 - 不用更大的 splat cap、更多训练步数或更大的文件代替质量证明；
+- 不用单一 opacity 阈值代替多视角证据，避免把细杆、叶片和边缘细节与浮点一起删除；
 - GLOMAP 自动质量回退和预置 ONNX/LightGlue 恢复模式继续保留为备选，不在本质量主线中实施。
 
 ## 2. 质量目标与范围
@@ -399,6 +402,157 @@ AbsGS 或新 MCMC 参数必须同时满足：
 - RTX 5090D 不出现上游 MCMC 非法内存访问；
 - 导出 PLY 属性与普通查看器兼容。
 
+### 8.4 当前实现与未完成验收（2026-08-25）
+
+已实现以下最小可回退闭环：
+
+- `GsplatDensificationStrategy` 持久化为 `mcmc`（默认）或 `absgrad`；旧设置和旧项目通过 serde 默认值安全读取为 MCMC；
+- 设置页仅在选择 gsplat 后端时显示“gsplat 增殖策略”，避免影响 Brush 预设与默认路径；
+- 任务创建时将 strategy 写入 `project.json`、历史详情和 adapter `request.json`，从而与质量档、splat cap、seed=42 一起可追溯；
+- adapter 的 AbsGS 路径采用本地 gsplat `DefaultStrategy(absgrad=True)`，并向 rasterizer 请求绝对屏幕空间梯度；MCMC 保持既有 `MCMCStrategy` 路径；
+- 延迟增殖、验证集冻结和标准 PLY 导出继续对两条策略生效；AbsGS 的首轮比较应关闭 PPISP，防止把光度控制器影响混入策略结论。
+
+首个真实配对素材（均衡、15,000 steps、1024px、2M cap、seed=42、PPISP 关闭）中，MCMC 得到 PSNR 15.0476 / SSIM 0.6388、1,728,358 splats；AbsGS（`absgradGrowGrad2d=0.0008`）得到 PSNR 14.9612 / SSIM 0.6246、1,447,324 splats。AbsGS 虽少 16.3% splats、训练快 8.9%，但 SSIM 下降 0.01425，未通过门槛。随后在 chair 素材试验 `0.0004`，AbsGS 的 splat 增加 34.9%，但 PSNR 下降 0.4731 dB、SSIM 下降 0.03419，仍未通过门槛。为排除提前冻结，chair 又以 `0.0008` 完整增殖至第 12,000 步；splat 从 546,157 增至 654,522，但相对冻结版 PSNR 再下降 0.4706 dB，故该调度实验已回退。检查本地 gsplat `DefaultStrategy` 后确认它会按 `n_cameras` 缩放梯度并按可见相机数平均，当前 batch=4 不是梯度统计错误。桌面请求继续显式记录 `absgradGrowGrad2d=0.0008`；这仅影响 AbsGS 实验，不改变 MCMC 或 Brush 默认。
+
+已完成静态验证：Python adapter 语法编译、Rust 单元测试和桌面/命令行 Rust 编译、前端生产构建。尚未完成的真实验收是固定同一素材、同一质量档、同一 cap 和 seed 的 MCMC 与 AbsGS 成对运行；必须记录 PSNR、SSIM、最终 splat 数、峰值显存、训练时间和标准 PLY 检查结果，再决定是否扩大实验范围或调整默认。
+
+## 8A. 里程碑 M3.5：多视角浮点抑制与安全裁剪
+
+### 8A.1 结论与实施定位
+
+当前模型浮点的主要工程缺口不是训练步数不足，而是只被少数视角支持、尺度异常、空间孤立或拟合了动态/反光/模糊残差的 Gaussian 仍能增殖并进入最终 PLY。现有 gsplat adapter 导出时主要依据 `sigmoid(opacity) > 0.005` 保留点；MCMC 会重定位低 opacity Gaussian，但没有完整的多视角支持、渲染贡献、尺度和孤立度联合门禁。AbsGS/DefaultStrategy 虽增加超大世界尺度裁剪，仍不能识别“高于 opacity 阈值但只解释单个视角”的浮点。
+
+因此 M3.5 的默认路线确定为：
+
+```text
+同输入基线诊断
+  -> 多视角一致性增殖门控
+  -> 导出前多条件安全裁剪
+  -> 禁止增殖的短程恢复训练
+  -> 留出视角与关键 crop 复验
+  -> 不达门槛自动回退裁剪前 checkpoint/PLY
+```
+
+该阶段借鉴 FastGS 的多视角一致性增殖/裁剪、Taming 3DGS 的跨视角贡献度和 TIDI-GS 的空间关系与细节保护，但不要求改变标准 3DGS PLY，也不把尚无成熟本地集成的整套论文代码直接作为产品依赖。
+
+### 8A.2 先区分五类问题
+
+训练或裁剪前必须先生成固定轨迹视频并分类，避免把查看器问题误当模型浮点：
+
+| 现象 | 优先诊断 | 默认处理 |
+| --- | --- | --- |
+| 只在单个输入视角附近出现半透明团块 | 单视角残差、近相机 screen-space artifact | 多视角支持与深度冲突门禁 |
+| 多个视角都能看到漂浮薄片/云团 | 位姿误差、低视差、异常尺度 | 先检查 COLMAP，再做尺度/贡献联合裁剪 |
+| 集中在人、车辆、树叶、阴影周围 | 动态或瞬态内容 | 动态软 mask，禁止其驱动增殖 |
+| 集中在玻璃、金属、镜面或积水周围 | 反射/透射外观歧义 | 独立反射恢复路线，不提高全局裁剪强度 |
+| 静止时正常，仅运动或转动时 popping | 排序、抗锯齿或查看器问题 | StopThePop/Mip 路线，不删除模型点 |
+
+若 COLMAP 注册率、轨迹连通性、重投影误差或相机簇检查失败，M3.5 不得通过强裁剪掩盖重建错误，应回到 SfM/输入质量阶段。
+
+### 8A.3 第一轮无代码 A/B 与资源边界
+
+在开发新裁剪器前，先固定抽帧 manifest、COLMAP sparse model、训练/验证划分、seed、步数、分辨率和查看轨迹，仅改变一个变量：
+
+1. gsplat 比较 MCMC 与 AbsGS，首轮关闭 PPISP；
+2. 均衡路线优先测试 1.5M–2M cap，精细路线优先测试 2.5M–3M cap；
+3. 暂不把 5M–8M 作为浮点问题素材的默认解法，因为更大 cap 可能继续拟合单视角噪声；
+4. Brush 先只降低 `max_splats`；若仍明显过度增长，再分别测试把 `growth-select-fraction` 从 0.10 降至约 0.05，或把增长停止点从 15,000 提前至约 12,000；
+5. 上述数值只是场景归一化前的实验起点，不得同时修改 cap、增长比例和停止点后宣称单项收益。
+
+若只降低 cap 就产生明显孔洞，说明问题不是单纯冗余点过多，不应继续压缩 cap，应进入多视角门控。
+
+### 8A.4 多视角增殖门控
+
+对每个候选 split/clone/relocation Gaussian，除原 strategy 梯度条件外，按分层采样的训练视角累计：
+
+- `viewSupportCount`：真正投影到有效像素且贡献超过噪声底的视角数；
+- `accumulatedContribution`：跨视角累积的 `alpha * transmittance` 或等价可见性贡献；
+- `mean/maxProjectedRadius`：平均与最大屏幕投影半径；
+- `depthConsistency`：与主表面深度或多视图重投影深度的一致程度；
+- `cameraProximity`：是否异常靠近单个相机；
+- `staticConfidence`：现有动态/瞬态软 mask 给出的静态可信度。
+
+首版门禁采用可解释的联合条件：
+
+```text
+allowDensification =
+    originalStrategyPass
+    AND sufficientViewSupport
+    AND contributionAboveNoiseFloor
+    AND depthConflictBelowLimit
+    AND staticConfidenceAboveLimit
+```
+
+`sufficientViewSupport` 不能固定写死为三个视角。建议默认至少 2–3 个有效视角，并按总训练视角数、可见视角数和场景覆盖自动降低，防止短视频或边缘区域永远不能增殖。高贡献但低支持的候选应进入“保护/观察”队列，而不是立即删除。
+
+### 8A.5 导出前多条件安全裁剪
+
+必须把训练期 `trainingMinOpacity` 与导出期 `exportPruningPolicy` 分开。`trainingMinOpacity=0.005` 可继续作为首轮基线，但不能简单全局提高到 0.02。导出前按场景半径和统计分位归一化后执行：
+
+```text
+prune =
+    opacity <= trainingMinOpacity
+    OR (lowViewSupport AND lowContribution)
+    OR (spatiallyIsolated AND lowContribution)
+    OR (oversizedInWorldSpace AND lowContribution)
+    OR (singleCameraNearField AND depthInconsistent)
+```
+
+其中：
+
+- `spatiallyIsolated` 使用 kNN 距离/邻居数并按 scene radius 归一化；
+- `oversizedInWorldSpace` 参考 DefaultStrategy 的场景尺度规则，但必须与低贡献联合，避免误删真实大平面；
+- `singleCameraNearField` 只处理靠近单一相机、缺乏其他视角支持的半透明 Gaussian；
+- 高累积贡献、高边缘响应、细杆/叶片/文字 crop 内的 Gaussian 进入细节保护集合；
+- 第一版只做保守联合裁剪，不使用“满足任一弱信号即删除”的激进规则；
+- 输出裁剪原因计数和被删 Gaussian ID/索引映射，保证可审计。
+
+建议首轮把低支持、低贡献和孤立度阈值定义为场景内分位数，并通过三类素材标定；在没有真实 A/B 之前，不把某个绝对距离、绝对尺度或固定删除比例设为产品常量。
+
+### 8A.6 裁剪后恢复训练
+
+安全裁剪后进行 1,000–3,000 步短程恢复：
+
+- 禁止 split、clone、relocation 和新增 Gaussian；
+- 关闭或显著降低 MCMC mean noise；
+- 仅优化已有 Gaussian 的位置、尺度、旋转、opacity 和 SH；
+- 学习率沿用原训练末期水平或更低；
+- 恢复训练前后都导出标准 PLY、checkpoint 和验证渲染。
+
+恢复阶段的目的只是修复裁剪造成的小范围光度/边界变化，不能重新生成一批未经多视角门禁的点。
+
+### 8A.7 自动质量回退
+
+每次裁剪必须先保留 `pre-prune` checkpoint/PLY，生成 `post-prune` 候选后在完全相同的留出视角、关键 crop 和固定轨迹上比较。首轮自动回退门槛采用比一般新算法更严格的保护值：
+
+- PSNR 下降超过 0.15–0.20 dB；
+- SSIM 下降超过 0.002；
+- LPIPS 增加超过 0.005；
+- 关键 crop 出现孔洞、细线消失或结构断裂；
+- 最差验证区段明显退化；
+- 删除比例超过实验配置的安全上限，首轮建议警戒值 20%；
+- 普通第三方 PLY 查看器中的运动质量反而变差。
+
+触发后按以下顺序处理：
+
+1. 回退到 `pre-prune` 产物；
+2. 将裁剪强度降一级，只放宽低贡献/孤立度分位；
+3. 最多自动重试一次；
+4. 仍失败则保留原模型，将原因写入历史，不静默返回退化模型。
+
+### 8A.8 诊断产物与完成条件
+
+每次实验至少持久化：
+
+- `floater-diagnostics.json`：阈值、分位数、各类候选/删除数、视角支持和贡献分布；
+- `prune-manifest.json`：裁剪前后 splat 数、删除原因、checkpoint/PLY 哈希；
+- `pre-prune.ply`、`post-prune.ply` 和恢复后的候选 PLY；
+- 固定轨迹与关键 crop 的裁剪前后渲染；
+- 自动回退是否触发、触发指标、最终 effective configuration；
+- 训练、统计、裁剪和恢复各阶段耗时与峰值显存。
+
+M3.5 进入产品预设前必须满足：至少三类真实素材同输入 A/B；浮点等级和固定轨迹明显改善；PSNR/SSIM/LPIPS 通过严格门槛；薄结构不出现系统性损失；标准 PLY 跨查看器通过；关闭开关可完全恢复原训练/导出路径。
+
 ## 9. 里程碑 M4：WD-R 感知质量实验
 
 ### 9.1 实施定位
@@ -422,6 +576,35 @@ lambda_wdr in {0.02, 0.05, 0.10}
 ```
 
 具体权重必须根据论文代码的归一化范围校准，不能仅凭数值照搬。
+
+### 9.2.1 2026-08-26 官方实现核对与首轮固定边界
+
+已在隔离 `engines/gsplat/python` 运行时验证官方
+`balle-lab/wasserstein-distortion` 0.1.0（Apache-2.0）、`torchvision`
+0.26.0 与现有 `torch 2.11.0+cu130` 可以共同导入，且预训练
+ImageNet VGG-16 权重已固定缓存于 `engines/gsplat/wdr-cache`。128×128
+CUDA 前向/反向烟雾测试输出有限损失与有限梯度；这只证明运行时可用，
+不构成任何真实素材质量结论。该缓存、Python 包和模型权重均为可选运行时
+payload，禁止作为源码提交或默认安装包内容。
+
+首轮不采用上方临时的 `lambda_wdr` 近似方案，而按论文定义实现真实目标：
+
+```text
+warm-up: 原始 0.8 L1 + 0.2 DSSIM
+WD-R: gamma * (WD_VGG16(sigma=4) + (1 / 0.09) * original_loss)
+```
+
+- `sigma=4` 对应官方 Python 实现的常量 `log2_sigma=2`；不引入未经验证的
+  saliency/depth map；
+- 论文使用 3k（大场景 5k）步 warm-up，并针对素材调节 `gamma` 使 Gaussian
+  数量可比；本项目首轮将 `gamma=0.025` 固定为实验记录字段，后续只能通过
+  同输入、同 cap、同 seed 的 A/B 校准；
+- WD-R 必须默认关闭、仅 gsplat 可选、强制 batch=1，并在任务元数据、`ready`
+  JSONL 与 `validation-metrics.json` 写出模式、warm-up、gamma、beta、sigma 和
+  权重版本；
+- 官方论文报告未优化 WD 约增加 4.5× 单步时间，缓存 GT 特征后仍约 2.8×；在
+  8–24GB 显存设备上先以实际峰值、OOM 回退和真实 A/B 为准，不能承诺加速；
+- WD-R 只改变训练损失，导出仍为标准 PLY，不把 VGG、WD-R 状态写入模型格式。
 
 ### 9.3 验收重点
 
@@ -574,6 +757,13 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
   "dists": {},
   "validationSegments": [],
   "splatCount": 0,
+  "prePruneSplatCount": 0,
+  "prunedSplatCount": 0,
+  "pruneReasonCounts": {},
+  "viewSupportHistogram": [],
+  "contributionPercentiles": {},
+  "spatialIsolationPercentiles": {},
+  "pruneRollback": null,
   "plyBytes": 0,
   "trainingMs": 0,
   "peakVramMb": 0,
@@ -603,6 +793,10 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 - 渲染 depth 的跨视图重投影一致性；
 - 低 opacity/超大 scale Gaussian 比例；
 - 相机包围盒外 Gaussian 比例；
+- 低视角支持且低贡献 Gaussian 比例；
+- kNN 空间孤立度分布；
+- 单相机近场且深度冲突 Gaussian 比例；
+- 裁剪前后各原因的 Gaussian 数和关键细节保护数；
 - 人工标注的 floaters/holes 等级。
 
 这些是代理指标，不能被描述为真实几何精度。
@@ -667,6 +861,10 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 | `dynamicLossMask` | false | 无 mask 的 M0/M1 |
 | `delayedDensification` | false | strategy 默认调度 |
 | `densificationStrategy` | mcmc | MCMC 基线 |
+| `multiViewDensificationGate` | false | 原 strategy 增殖判定 |
+| `floaterPruning` | false | 仅保留既有 opacity 导出过滤 |
+| `postPruneRecoverySteps` | 0 | 不进行裁剪后恢复训练 |
+| `floaterPruningAutoRollback` | true（启用裁剪时） | `pre-prune` checkpoint/PLY |
 | `perceptualLoss` | none | L1+DSSIM |
 | `coarseToFine` | false | 单分辨率训练 |
 | `cameraProjectionMode` | undistorted | COLMAP 去畸变针孔 |
@@ -697,6 +895,9 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 - stage timing；
 - peak VRAM；
 - 最终 splat 数和 PLY SHA-256；
+- 裁剪前后 splat 数、裁剪原因分布、视角支持/贡献/孤立度统计；
+- `pre-prune` 与最终候选 checkpoint/PLY 哈希；
+- 恢复步数、禁止增殖状态和自动回退判定；
 - 全局、分区和 crop 指标；
 - 回退原因和 effective configuration。
 
@@ -723,6 +924,19 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 5. 完成三类真实素材 A/B。
 
 交付条件：至少三组素材通过相对门槛，失败可单项回退。
+
+### 阶段 B.5：多视角浮点抑制
+
+1. 在不改代码的同输入 A/B 中先标定 cap 与 MCMC/AbsGS 基线；
+2. 增加 `floater-diagnostics.json`，只统计不裁剪；
+3. 接入多视角支持、累积贡献、深度冲突和静态可信度统计；
+4. 将多视角证据加入 split/clone/relocation 门禁；
+5. 增加导出前多条件保守裁剪和细节保护；
+6. 增加禁止增殖的短程恢复训练；
+7. 增加 `pre-prune` 产物、严格质量门禁和最多一次自动降级重试；
+8. 完成普通静态、动态干扰、低纹理三类素材的同输入 A/B。
+
+交付条件：浮点在固定轨迹中可重复减少，细杆/叶片/边缘不出现系统性损失，失败自动回到裁剪前标准 PLY。该阶段通过前，不开始用 WD-R 或 ResGS 掩盖结构伪影。
 
 ### 阶段 C：感知和致密化研究
 
@@ -788,6 +1002,12 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 | PPISP 提升训练指标但普通 PLY 变差 | 错误宣传质量 | canonical 导出和第三方查看器复验 |
 | 动态 mask 误伤反射/细节 | 结构缺失 | 软权重、置信度和关闭开关 |
 | AbsGS splat 增长异常 | OOM/冗余 | cap、显存门禁和增长速率监控 |
+| 单纯提高 opacity 阈值 | 细杆、叶片和边缘同时消失 | 训练/导出阈值分离，多视角联合裁剪 |
+| 低视角支持规则写死 | 短视频与画面边缘无法增殖 | 按可见视角数自适应，保护高贡献候选 |
+| 空间孤立或大尺度单条件裁剪 | 大平面、远景和真实薄结构被误删 | 必须与低贡献/深度冲突联合，按 scene radius 归一化 |
+| 裁剪后继续增殖 | 浮点被重新生成 | 恢复阶段硬禁 split/clone/relocation |
+| 强裁剪掩盖错误位姿 | 训练指标正常但几何仍错误 | SfM 门禁优先，失败返回重建阶段 |
+| 浮点其实来自查看器排序 | 删除有效 Gaussian 仍不解决 popping | 固定轨迹分类，分流到 StopThePop/Mip 路线 |
 | WD-R 放大 JPEG 伪影 | 看似锐利但不真实 | crop、轨迹和盲测 |
 | ResGS 改动过大 | 难以归因 | 三步消融，不一次合并 |
 | pose 优化漂移 | 相机和几何共同作弊 | 强正则、小范围、条件触发 |
@@ -805,6 +1025,12 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 - [Mip-Splatting，CVPR 2024](https://openaccess.thecvf.com/content/CVPR2024/html/Yu_Mip-Splatting_Alias-free_3D_Gaussian_Splatting_CVPR_2024_paper.html)。
 - [WildGaussians，NeurIPS 2024](https://proceedings.neurips.cc/paper_files/paper/2024/hash/25c0fe7b157821dd3140727dc07461da-Abstract-Conference.html)。
 - [RobustSplat，ICCV 2025](https://openaccess.thecvf.com/content/ICCV2025/papers/Fu_RobustSplat_Decoupling_Densification_and_Dynamics_for_Transient-Free_3DGS_ICCV_2025_paper.pdf)。
+- [FastGS，CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Ren_FastGS_Training_3D_Gaussian_Splatting_in_100_Seconds_CVPR_2026_paper.html) 与[官方实现](https://github.com/fastgs/FastGS)：多视角一致性增殖、重要度统计和裁剪的首选工程参考。
+- [Taming 3DGS，SIGGRAPH Asia 2024](https://humansensinglab.github.io/taming-3dgs/)：跨视角贡献度驱动的增殖与预算控制参考。
+- [PUP 3D-GS，CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/papers/Hanson_PUP_3D-GS_Principled_Uncertainty_Pruning_for_3D_Gaussian_Splatting_CVPR_2025_paper.pdf)：基于不确定性/Fisher 信息的高质量离线裁剪备选。
+- [SparseGS](https://openreview.net/pdf?id=O9GMl5UJbe)：近相机半透明浮点与深度差异检测参考。
+- [TIDI-GS，2026](https://arxiv.org/abs/2601.09291)：多视角一致性、空间关系、重要度与细节保护的研究参考；在官方实现和本地验证成熟前不作为直接运行时依赖。
+- [SSA-3DGS，2026](https://arxiv.org/abs/2607.05598)：输入 screen-space artifact 烘焙为近相机浮点的专项研究；列入观察路线，不进入首版实现。
 - [PPISP，CVPR 2026](https://research.nvidia.com/labs/sil/projects/ppisp/)。
 - [Drop-In Perceptual Optimization / WD-R，2026](https://machinelearning.apple.com/research/drop-in)。
 - [ResGS，ICCV 2025](https://openaccess.thecvf.com/content/ICCV2025/papers/Lyu_ResGS_Residual_Densification_of_3D_Gaussian_for_Efficient_Detail_Recovery_ICCV_2025_paper.pdf)。
@@ -819,7 +1045,7 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 
 ## 21. 尚未解决的问题
 
-开始 M0 开发前还需在真实素材上确认：
+后续真实素材验收仍需确认：
 
 1. Brush 当前是否自行完成图像去畸变，还是同样依赖已去畸变 COLMAP 输入；
 2. OOOSplat 目标 PLY 查看器支持的最大 SH degree 和属性顺序；
@@ -827,32 +1053,36 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 4. RTX 5090D 上本地 gsplat 1.6.0 MCMC 在 2M/3M cap 的稳定边界；
 5. 时间分块留出对短视频的最低可用帧数；
 6. LPIPS、DISTS 权重和模型的许可证/离线打包方式；
-7. 是否需要为质量评估单独保留不参与 COLMAP 的原视频帧。
+7. 是否需要为质量评估单独保留不参与 COLMAP 的原视频帧；
+8. 多视角支持的有效贡献噪声底如何按分辨率和场景自适应；
+9. MCMC relocation 是否应接受同一套多视角门禁，还是首版只限制新增点；
+10. 三类真实素材上低贡献、孤立度和安全删除比例的稳定分位；
+11. Brush 是否能提供逐 Gaussian 可见性/贡献统计；若不能，M3.5 首版应限定为 gsplat 实验后端。
 
-这些问题不会阻止先完成 M0 的相机、初始化、SH、损失和验证框架，但会影响后续默认预设和发布门禁。
+这些问题不否定已经完成的 M0 基础实现，但会影响 M3/M3.5 的阈值标定、默认预设和发布门禁。
 
 ## 22. 最终推荐
 
-最合理的第一批开发不是实现新的大型模型，而是完成以下闭环：
+M0–M3 已部分进入实现与验证。当前最优先的新开发不是继续增加大型模型或扩大 splat cap，而是补齐以下浮点治理闭环：
 
 ```text
-去畸变相机契约
-  + 标准 kNN/opacity/LR 初始化
-  + SH degree 0 -> 3
-  + L1 + DSSIM
-  + 时间分块验证
-  + PSNR/SSIM/LPIPS/DISTS
-  + 标准 PLY 跨查看器验收
+同输入 MCMC / AbsGS 与 cap 基线
+  -> 多视角支持/贡献/深度/孤立度诊断
+  -> 多视角一致性增殖门控
+  -> 多条件保守裁剪与细节保护
+  -> 禁止增殖的 1,000–3,000 步恢复训练
+  -> 严格指标、关键 crop 和固定轨迹复验
+  -> 不达标自动回退 pre-prune 标准 PLY
 ```
 
-在这一闭环通过后，优先实施：
+整体实施顺序更新为：
 
 ```text
-PPISP
-  -> 动态区域软降权与延迟增殖
-  -> MCMC / AbsGS A/B
+完成 MCMC / AbsGS 三类素材 A/B
+  -> M3.5 多视角浮点抑制与自动回退
+  -> 动态区域软 mask 完整接入
   -> WD-R
   -> ResGS coarse-to-fine
 ```
 
-这套组合同时覆盖视频采集最常见的光度不一致、动态干扰、细节不足和 densification 缺陷，并且大部分改动仍可导出标准 Gaussian PLY。3DGUT、BAD-Gaussians、深度正则、VGGT/Dense-SfM、GLOMAP 与 LightGlue 应继续作为有明确触发条件的恢复或研究路线，而不是默认增加运行时、安装体积和失败面。
+M3.5 首版优先在 gsplat 实验后端落地，因为当前 adapter 可直接访问 rasterization 统计和 Gaussian 参数；Brush 保持产品默认与回退，不在缺少等价逐点统计接口时强行复刻。该方案保持标准 Gaussian PLY，不新增大型模型权重，并直接针对“高于 opacity 阈值但缺乏多视角证据”的浮点。3DGUT、BAD-Gaussians、深度正则、VGGT/Dense-SfM、GLOMAP 与 LightGlue 继续作为有明确触发条件的恢复或研究路线，而不是默认增加运行时、安装体积和失败面。

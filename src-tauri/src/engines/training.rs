@@ -11,6 +11,10 @@ use crate::{
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
+/// AbsGS uses the local gsplat upstream example value. Keep it explicit in
+/// every request for audit and easy rollback; MCMC does not consume it.
+const ABSGRAD_GROW_GRAD2D_EXPERIMENTAL: f64 = 0.0008;
+
 /// The pipeline-facing training selection.  Brush remains the only default and
 /// production-ready choice until the isolated gsplat runtime passes its CUDA smoke test.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +31,28 @@ pub enum PhotometricMode {
     #[default]
     None,
     Ppisp,
+    /// Experimental WD-R perceptual objective. It is deliberately mutually
+    /// exclusive with PPISP so A/B results have one changed variable.
+    Wdr,
+}
+
+/// Densification policy for experimental gsplat runs. MCMC remains the
+/// default; AbsGS is opt-in so comparable runs can be reproduced and reverted.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GsplatDensificationStrategy {
+    #[default]
+    Mcmc,
+    Absgrad,
+}
+
+impl GsplatDensificationStrategy {
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Mcmc => "mcmc",
+            Self::Absgrad => "absgrad",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +64,7 @@ pub struct TrainingRequest {
     pub max_splats: u32,
     pub seed: u64,
     pub photometric_mode: PhotometricMode,
+    pub densification_strategy: GsplatDensificationStrategy,
     pub log_path: PathBuf,
 }
 
@@ -202,15 +229,17 @@ async fn train_gsplat(
         "dataDir": request.dataset_root,
         "resultDir": request.output_directory,
         "outputPly": candidate,
-        "strategy": "mcmc",
+        "strategy": request.densification_strategy.config_name(),
+        "absgradGrowGrad2d": ABSGRAD_GROW_GRAD2D_EXPERIMENTAL,
         "maxSteps": request.total_steps,
         "maxResolution": request.max_resolution,
         "maxSplats": request.max_splats,
         // M2: stabilise the coarse static scene before MCMC adds new splats.
         "delayedDensificationRatio": 0.10,
-        "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp => 1 },
+        "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp | PhotometricMode::Wdr => 1 },
         // M1 is opt-in until it has passed the documented three-material gate.
-        "photometricMode": match request.photometric_mode { PhotometricMode::None => "none", PhotometricMode::Ppisp => "ppisp" },
+        "photometricMode": match request.photometric_mode { PhotometricMode::Ppisp => "ppisp", PhotometricMode::None | PhotometricMode::Wdr => "none" },
+        "perceptualMode": match request.photometric_mode { PhotometricMode::Wdr => "wdr", PhotometricMode::None | PhotometricMode::Ppisp => "none" },
         "ppispController": true,
         "ppispControllerDistillation": true,
         "canonicalExposure": "median",
