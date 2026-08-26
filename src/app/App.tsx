@@ -1,12 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Aperture, ChevronRight, CircleAlert, Clapperboard, Cpu, Download, Eye, FileBox, Info,
-  FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings as SettingsIcon, Square, Trash2,
+  FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings as SettingsIcon, Square, Trash2, X,
   Zap, ZapOff,
 } from "lucide-react";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings, getSupplementDiagnostics,
-  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectVideo,
+  attachSupplementalMedia, cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementPreviews,
+  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
@@ -22,6 +22,7 @@ import type {
   ProjectStatus,
   ProjectSummary,
   SupplementDiagnostics,
+  SupplementPreview,
   PipelineEvent,
   Quality,
   InputSource,
@@ -95,6 +96,13 @@ const trainingLabel = (project: ProjectSummary) => {
   return `gsplat ${strategy} · Splat${cap[project.gsplatSplatCap]}${module}`;
 };
 const statusLabel: Record<ProjectStatus, string> = { running: "处理中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", needsSupplement: "等待补充素材" };
+type ProjectFilter = "all" | "completed" | "needsSupplement" | "failed";
+const taskFilters: Array<{ value: ProjectFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "completed", label: "已完成" },
+  { value: "needsSupplement", label: "等待补充" },
+  { value: "failed", label: "失败/已取消" },
+];
 const stagePosition = (stage?: string) => {
   if (!stage || stage === "created") return 0;
   if (["probingVideo", "planningFrames"].includes(stage)) return 1;
@@ -129,6 +137,9 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
   const [supplementDiagnostics, setSupplementDiagnostics] = useState<SupplementDiagnostics | null>(null);
   const [supplementError, setSupplementError] = useState<string | null>(null);
   const [loadingSupplement, setLoadingSupplement] = useState(false);
+  const [attachingWeakInterval, setAttachingWeakInterval] = useState<number | null>(null);
+  const [supplementPreviews, setSupplementPreviews] = useState<SupplementPreview[]>([]);
+  const [selectedWeakInterval, setSelectedWeakInterval] = useState(0);
   const toggleSupplement = async () => {
     if (supplementOpen) {
       setSupplementOpen(false);
@@ -136,16 +147,38 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
     }
     setSupplementError(null);
     setSupplementOpen(true);
+    setSelectedWeakInterval(0);
     if (supplementDiagnostics || loadingSupplement) return;
     setLoadingSupplement(true);
     try {
-      setSupplementDiagnostics(await getSupplementDiagnostics(project.id));
+      const [diagnostics, previews] = await Promise.all([
+        getSupplementDiagnostics(project.id),
+        getSupplementPreviews(project.id),
+      ]);
+      setSupplementDiagnostics(diagnostics);
+      setSupplementPreviews(previews);
     } catch (error) {
       setSupplementError(messageOf(error));
     } finally {
       setLoadingSupplement(false);
     }
   };
+  const attachMedia = async (weakIntervalIndex: number) => {
+    const path = await selectSupplementalMedia();
+    if (!path) return;
+    setSupplementError(null);
+    setAttachingWeakInterval(weakIntervalIndex);
+    try {
+      setSupplementDiagnostics(await attachSupplementalMedia(project.id, weakIntervalIndex, path));
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setAttachingWeakInterval(null);
+    }
+  };
+  const activeInterval = supplementDiagnostics?.weakIntervals[selectedWeakInterval];
+  const activePreview = supplementPreviews.find((preview) => preview.weakIntervalIndex === selectedWeakInterval);
+  const previewImages = [activePreview?.beforeAnchor, activePreview?.weakFrame, activePreview?.afterAnchor].filter((image): image is NonNullable<typeof image> => image != null);
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -154,12 +187,13 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
         <span className="status-copy">{statusLabel[project.status]}</span>
       </div>
       <p className="project-path" title={project.projectPath}>{project.projectPath}</p>
+      {project.status === "needsSupplement" && <p className="project-supplement-state">{project.weakIntervalCount ?? 0} 个弱区 · 已绑定 {project.supplementalMediaCount} 份素材 · 待验证</p>}
       {project.failureMessage && <p className="project-failure">{project.failureMessage}</p>}
     </div>
     <div className="project-actions">
       <button className="viewer-action" type="button" disabled={busy || opening || !project.finalPly} onClick={() => onView(project)}>{opening ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{opening ? "正在打开" : "查看 3D"}</button>
       <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />资源管理器</button>
-      {project.status === "needsSupplement" && <button className="supplement-action" type="button" disabled={busy || loadingSupplement} onClick={() => void toggleSupplement()}><CircleAlert size={14} />{loadingSupplement ? "正在读取弱区" : supplementOpen ? "收起弱区" : "查看弱区"}</button>}
+      {project.status === "needsSupplement" && <button className="supplement-action" type="button" disabled={busy || loadingSupplement} onClick={() => void toggleSupplement()}><CircleAlert size={14} />{loadingSupplement ? "正在读取弱区" : supplementOpen ? "收起弱区" : "继续补拍"}</button>}
       <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
       <button type="button" onClick={() => setDetailsOpen((open) => !open)}><Info size={14} />{detailsOpen ? "收起详情" : "详情"}</button>
     </div>
@@ -174,22 +208,26 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       <div><dt>SfM 注册</dt><dd>{project.registeredRatio == null ? "—" : `${(project.registeredRatio * 100).toFixed(1)}%`}</dd></div>
       <div><dt>三维点</dt><dd>{project.points3d?.toLocaleString() ?? "—"}</dd></div>
     </dl>}
-    {supplementOpen && <section className="supplement-panel" aria-label="弱区补拍指引">
+    {supplementOpen && <div className="supplement-dialog-backdrop" role="presentation" onMouseDown={() => setSupplementOpen(false)}><section className="supplement-dialog" role="dialog" aria-modal="true" aria-label="弱区补拍指引" onMouseDown={(event) => event.stopPropagation()}>
+      <header><div><strong>继续补拍</strong><span>{project.name} · 已保存，未占用处理资源</span></div><button type="button" aria-label="关闭弱区补拍窗口" onClick={() => setSupplementOpen(false)}><X size={17} /></button></header>
       {supplementError && <p className="supplement-error">无法读取弱区诊断：{supplementError}</p>}
       {loadingSupplement && <p className="supplement-loading">正在读取已持久化的弱区时间轴…</p>}
       {supplementDiagnostics && <>
         <div className="supplement-summary"><strong>需要补充拍摄</strong><span>{supplementDiagnostics.registeredFrames} / {supplementDiagnostics.selectedFrames} 张关键帧已注册</span></div>
-        <p className="supplement-hint">请沿原拍摄轨迹，在以下时间范围补拍相邻视角；让主体在画面中移动约 15–25% 宽度。单目素材没有可靠绝对尺度，因此不显示厘米或米。</p>
-        <ol className="weak-interval-list">
-          {supplementDiagnostics.weakIntervals.map((interval, index) => <li key={`${interval.startPtsSeconds}-${interval.endPtsSeconds}-${index}`}>
-            <div><strong>弱区 {index + 1} · {formatVideoDuration(interval.startPtsSeconds)}–{formatVideoDuration(interval.endPtsSeconds)}</strong><span>{interval.unregisteredFrames} 张未注册关键帧</span></div>
-            <p>问题：{interval.reason === "unregisteredSelectedFrames" ? "视角重叠或视差不足" : interval.reason}</p>
-            <small>锚点：{interval.beforeAnchor ? `${formatVideoDuration(interval.beforeAnchor.ptsSeconds)} · ${interval.beforeAnchor.outputFile}` : "缺少前锚点"} → {interval.afterAnchor ? `${formatVideoDuration(interval.afterAnchor.ptsSeconds)} · ${interval.afterAnchor.outputFile}` : "缺少后锚点"}</small>
-          </li>)}
-        </ol>
-        <p className="supplement-next">下一阶段将从这里上传补充视频或照片，并先做重叠、清晰度与视差验证；当前可通过“资源管理器”核对锚点原图和完整日志。</p>
+        <div className="weak-timeline" role="tablist" aria-label="弱区时间轴">{supplementDiagnostics.weakIntervals.map((interval, index) => <button key={`${interval.startPtsSeconds}-${interval.endPtsSeconds}-${index}`} type="button" role="tab" aria-selected={selectedWeakInterval === index} className={selectedWeakInterval === index ? "selected" : ""} onClick={() => setSelectedWeakInterval(index)} style={{ flexGrow: Math.max(1, interval.endPtsSeconds - interval.startPtsSeconds) }}><span>弱区 {index + 1}</span><small>{formatVideoDuration(interval.startPtsSeconds)}–{formatVideoDuration(interval.endPtsSeconds)}</small></button>)}</div>
+        {activeInterval && <div className="weak-interval-detail">
+          <div className="weak-interval-copy"><strong>弱区 {selectedWeakInterval + 1} · {formatVideoDuration(activeInterval.startPtsSeconds)}–{formatVideoDuration(activeInterval.endPtsSeconds)}</strong><span>{activeInterval.unregisteredFrames} 张未注册关键帧</span><p>问题：{activeInterval.reason === "unregisteredSelectedFrames" ? "视角重叠或视差不足" : activeInterval.reason}</p></div>
+          <div className="weak-preview-strip">{previewImages.map((image) => <figure key={`${image.label}-${image.outputFile}`}><img src={image.dataUrl} alt={`${image.label} ${formatVideoDuration(image.ptsSeconds)}`} /><figcaption><strong>{image.label}</strong><span>{formatVideoDuration(image.ptsSeconds)}</span></figcaption></figure>)}</div>
+          {previewImages.length === 0 && <p className="supplement-loading">关键帧预览不可用；可通过资源管理器查看完整项目帧目录。</p>}
+          <p className="supplement-hint">请沿“前锚点 → 弱区画面 → 后锚点”继续移动并保持主体重叠，让主体在画面中移动约 15–25% 宽度。单目素材没有可靠绝对尺度，因此不显示厘米或米。</p>
+          <div className="supplement-media-row">
+            <button type="button" className="secondary-action" disabled={busy || attachingWeakInterval != null} onClick={() => void attachMedia(selectedWeakInterval)}>{attachingWeakInterval === selectedWeakInterval ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{attachingWeakInterval === selectedWeakInterval ? "正在绑定" : "添加补充视频或照片"}</button>
+            {supplementDiagnostics.supplementalMedia.filter((media) => media.weakIntervalIndex === selectedWeakInterval).map((media) => <small key={media.path}>已绑定 {media.kind === "video" ? "视频" : "照片"}：{basename(media.path)} · 待验证</small>)}
+          </div>
+        </div>}
+        <p className="supplement-next">已绑定的素材尚未解码或送入 COLMAP。下一阶段会先做重叠、清晰度与视差验证；当前可通过“资源管理器”核对完整日志。</p>
       </>}
-    </section>}
+    </section></div>}
   </article>;
 });
 
@@ -254,18 +292,22 @@ function ColmapBackendBlock() {
   );
 }
 
-const ProjectList = memo(function ProjectList({ completed, unfinished, busy, openingProjectId, onDelete, onView }: {
+const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView }: {
   completed: ProjectSummary[];
-  unfinished: ProjectSummary[];
+  waitingSupplement: ProjectSummary[];
+  active: ProjectSummary[];
+  failed: ProjectSummary[];
   busy: boolean;
   openingProjectId: string | null;
   onDelete: (project: ProjectSummary) => void;
   onView: (project: ProjectSummary) => void;
 }) {
   return <>
-    {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
-    {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
-    {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {completed.length === 0 && waitingSupplement.length === 0 && active.length === 0 && failed.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>没有符合筛选条件的任务</strong><p>切换上方筛选，或选择视频后开始生成。</p></div>}
+    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
   </>;
 });
 
@@ -495,9 +537,18 @@ export function App() {
   const [splatcamPath, setSplatcamPath] = useState<string | null>(null);
   const [splatcamReport, setSplatcamReport] = useState<SplatcamImportReport | null>(null);
   const [checkingSplatcam, setCheckingSplatcam] = useState(false);
+  const [projectFilter, setProjectFilter] = useState<ProjectFilter>("all");
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
-  const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
-  const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
+  const filteredProjects = useMemo(() => store.projects.filter((project) => {
+    if (projectFilter === "all") return true;
+    if (projectFilter === "failed") return ["failed", "cancelled", "interrupted"].includes(project.status);
+    return project.status === projectFilter;
+  }), [projectFilter, store.projects]);
+  const completed = useMemo(() => filteredProjects.filter((project) => project.status === "completed"), [filteredProjects]);
+  const waitingSupplement = useMemo(() => filteredProjects.filter((project) => project.status === "needsSupplement"), [filteredProjects]);
+  const activeProjects = useMemo(() => filteredProjects.filter((project) => project.status === "running"), [filteredProjects]);
+  const failedProjects = useMemo(() => filteredProjects.filter((project) => ["failed", "cancelled", "interrupted"].includes(project.status)), [filteredProjects]);
+  const totalWaitingSupplement = useMemo(() => store.projects.filter((project) => project.status === "needsSupplement").length, [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
   const refreshProjects = useCallback(async () => {
     const overview = await getProjectOverview();
@@ -760,9 +811,12 @@ export function App() {
 
         <section className="projects-pane" aria-label="历史任务">
           <div className="pane-header"><h2>02 历史任务</h2><button className="refresh-action" type="button" disabled={isRunning} onClick={() => void refreshProjects()}><RotateCcw size={14} />刷新</button></div>
-          <div className="archive-summary"><span><b>{completed.length}</b><small>已完成</small></span><span><b>{unfinished.length}</b><small>未完成</small></span></div>
+          <div className="project-filter" role="tablist" aria-label="任务状态筛选">
+            {taskFilters.map((filter) => <button key={filter.value} type="button" role="tab" aria-selected={projectFilter === filter.value} className={projectFilter === filter.value ? "selected" : ""} onClick={() => setProjectFilter(filter.value)}>{filter.label}{filter.value === "needsSupplement" && totalWaitingSupplement > 0 && <span>{totalWaitingSupplement}</span>}</button>)}
+          </div>
+          <div className="archive-summary"><span><b>{store.projects.filter((project) => project.status === "completed").length}</b><small>已完成</small></span><span><b>{totalWaitingSupplement}</b><small>等待补充</small></span></div>
 
-          <ProjectList completed={completed} unfinished={unfinished} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} />
+          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} />
         </section>
       </section>
       </div>

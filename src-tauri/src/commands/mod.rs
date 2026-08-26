@@ -121,6 +121,95 @@ pub async fn get_supplement_diagnostics(
     }
     crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
 }
+
+#[tauri::command]
+pub async fn get_supplement_previews(
+    project_id: String,
+) -> std::result::Result<Vec<crate::pipeline::runner::SupplementPreview>, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    crate::pipeline::runner::read_supplement_previews(&project.project_path).await
+}
+
+/// Binds one user-selected video or photo to a weak interval. This intentionally
+/// only records a validated external path; the next validation stage is the
+/// first operation allowed to decode the supplemental media.
+#[tauri::command]
+pub async fn attach_supplemental_media(
+    project_id: String,
+    weak_interval_index: u64,
+    path: String,
+) -> std::result::Result<crate::pipeline::runner::SupplementDiagnostics, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let diagnostics = crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await?;
+    if usize::try_from(weak_interval_index)
+        .ok()
+        .map_or(true, |index| index >= diagnostics.weak_intervals.len())
+    {
+        return Err(SplatError::Process("补充素材未绑定到有效弱区".into()));
+    }
+    let input = PathBuf::from(path);
+    let metadata = tokio::fs::metadata(&input).await.map_err(|_| {
+        SplatError::Process("补充素材文件不存在或无法读取".into())
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(SplatError::Process("补充素材必须是非空的普通文件".into()));
+    }
+    let extension = input
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| SplatError::Process("补充素材缺少受支持的文件扩展名".into()))?;
+    let kind = match extension.as_str() {
+        "mp4" | "mov" => crate::pipeline::SupplementalMediaKind::Video,
+        "jpg" | "jpeg" | "png" => crate::pipeline::SupplementalMediaKind::Photo,
+        _ => return Err(SplatError::Process("补充素材仅支持 MP4、MOV、JPG、JPEG 或 PNG".into())),
+    };
+    let canonical = tokio::task::spawn_blocking(move || input.canonicalize())
+        .await
+        .map_err(|error| SplatError::Process(format!("无法解析补充素材路径：{error}")))??;
+    let metadata_path = project.project_path.join("project.json");
+    let mut project_metadata: crate::pipeline::ProjectMetadata = serde_json::from_slice(
+        &tokio::fs::read(&metadata_path).await?,
+    )?;
+    project_metadata.supplemental_media.retain(|media| {
+        !(media.weak_interval_index == weak_interval_index && media.path == canonical)
+    });
+    project_metadata.supplemental_media.push(crate::pipeline::SupplementalMedia {
+        path: canonical,
+        kind,
+        weak_interval_index,
+        validation_status: crate::pipeline::SupplementalValidationStatus::Pending,
+        validation_reason: None,
+    });
+    crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
+    let state_path = project.project_path.join("state.json");
+    if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
+        state.supplemental_media = project_metadata.supplemental_media.clone();
+        crate::project::atomic_write_json(&state_path, &state).await?;
+    }
+    crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
+}
 #[tauri::command]
 pub async fn set_projects_root(
     projects_root: String,

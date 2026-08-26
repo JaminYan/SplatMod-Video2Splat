@@ -106,6 +106,8 @@ pub struct ProjectSummary {
     pub registered_ratio: Option<f64>,
     pub points_3d: Option<u64>,
     pub failure_message: Option<String>,
+    pub weak_interval_count: Option<u64>,
+    pub supplemental_media_count: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -448,6 +450,12 @@ async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
         registered_ratio: output.map(|v| v.registered_ratio),
         points_3d: output.map(|v| v.points_3d),
         failure_message: metadata.failure_message,
+        weak_interval_count: metadata
+            .needs_supplement
+            .as_ref()
+            .map(|requirement| requirement.weak_interval_count),
+        supplemental_media_count: u64::try_from(metadata.supplemental_media.len())
+            .expect("supplemental media count always fits u64"),
     })
 }
 pub async fn delete_project(id: Uuid) -> Result<()> {

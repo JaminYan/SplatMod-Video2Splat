@@ -38,6 +38,7 @@ use crate::{
     },
 };
 use chrono::Utc;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -112,6 +113,8 @@ pub struct SupplementDiagnostics {
     pub selected_frames: u64,
     pub registered_frames: u64,
     pub weak_intervals: Vec<SupplementWeakInterval>,
+    #[serde(default)]
+    pub supplemental_media: Vec<crate::pipeline::SupplementalMedia>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,15 +137,96 @@ pub struct SupplementAnchor {
     pub pts_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementPreview {
+    pub weak_interval_index: u64,
+    pub before_anchor: Option<SupplementPreviewImage>,
+    pub weak_frame: Option<SupplementPreviewImage>,
+    pub after_anchor: Option<SupplementPreviewImage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementPreviewImage {
+    pub label: String,
+    pub output_file: String,
+    pub pts_seconds: f64,
+    pub data_url: String,
+}
+
 pub async fn read_supplement_diagnostics(project: &Path) -> Result<SupplementDiagnostics> {
     let diagnostics_path = project.join("logs").join("adaptive-registered-frames.json");
-    let diagnostics = serde_json::from_slice::<SupplementDiagnostics>(
+    let mut diagnostics = serde_json::from_slice::<SupplementDiagnostics>(
         &tokio::fs::read(&diagnostics_path).await?,
     )?;
     if diagnostics.weak_intervals.is_empty() {
         return Err(SplatError::Process("项目没有可展示的弱区诊断".into()));
     }
+    let metadata: ProjectMetadata = serde_json::from_slice(
+        &tokio::fs::read(project.join("project.json")).await?,
+    )?;
+    diagnostics.supplemental_media = metadata.supplemental_media;
     Ok(diagnostics)
+}
+
+/// Produces bounded JPEG previews for precisely the files referenced by the
+/// persisted weak-interval report. The WebView never receives a filesystem
+/// path, preventing a diagnostic dialog from becoming a general local-file
+/// viewer.
+pub async fn read_supplement_previews(project: &Path) -> Result<Vec<SupplementPreview>> {
+    let diagnostics = read_supplement_diagnostics(project).await?;
+    let frames = project.join("frames");
+    tokio::task::spawn_blocking(move || {
+        diagnostics
+            .weak_intervals
+            .iter()
+            .enumerate()
+            .map(|(index, interval)| Ok(SupplementPreview {
+                weak_interval_index: index as u64,
+                before_anchor: interval.before_anchor.as_ref().and_then(|anchor| {
+                    preview_image(&frames, "前锚点", &anchor.output_file, anchor.pts_seconds).ok()
+                }),
+                weak_frame: preview_image(
+                    &frames,
+                    "弱区画面",
+                    &interval.first_output_file,
+                    interval.start_pts_seconds,
+                )
+                .ok(),
+                after_anchor: interval.after_anchor.as_ref().and_then(|anchor| {
+                    preview_image(&frames, "后锚点", &anchor.output_file, anchor.pts_seconds).ok()
+                }),
+            }))
+            .collect::<Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("弱区预览任务异常结束：{error}")))?
+}
+
+fn preview_image(frames: &Path, label: &str, output_file: &str, pts_seconds: f64) -> Result<SupplementPreviewImage> {
+    let file_name = Path::new(output_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SplatError::Process("弱区预览文件名无效".into()))?;
+    if file_name != output_file {
+        return Err(SplatError::Process("弱区预览路径不属于项目关键帧目录".into()));
+    }
+    let source = frames.join(file_name);
+    let image = image::ImageReader::open(&source)?.decode().map_err(|error| {
+        SplatError::Process(format!("无法读取弱区预览 {}：{error}", source.display()))
+    })?;
+    let thumbnail = image.thumbnail(320, 220).to_rgb8();
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 82)
+        .encode_image(&thumbnail)
+        .map_err(|error| SplatError::Process(format!("无法编码弱区预览：{error}")))?;
+    Ok(SupplementPreviewImage {
+        label: label.into(),
+        output_file: file_name.into(),
+        pts_seconds,
+        data_url: format!("data:image/jpeg;base64,{}", BASE64.encode(encoded)),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3140,6 +3224,19 @@ mod progress_tests {
         assert_eq!(diagnostics.selected_frames, 12);
         assert_eq!(diagnostics.weak_intervals[0].before_anchor.as_ref().unwrap().pts_seconds, 3.5);
         assert!(diagnostics.weak_intervals[0].after_anchor.is_none());
+    }
+
+    #[test]
+    fn supplement_preview_is_bounded_data_url_and_rejects_nested_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frame = temporary.path().join("frame_000001.jpg");
+        image::RgbImage::from_pixel(640, 480, image::Rgb([11, 42, 73]))
+            .save(&frame)
+            .unwrap();
+        let preview = preview_image(temporary.path(), "弱区画面", "frame_000001.jpg", 1.25).unwrap();
+        assert!(preview.data_url.starts_with("data:image/jpeg;base64,"));
+        assert_eq!(preview.output_file, "frame_000001.jpg");
+        assert!(preview_image(temporary.path(), "x", "nested/frame.jpg", 0.0).is_err());
     }
 
     #[test]

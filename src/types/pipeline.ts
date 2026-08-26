@@ -122,6 +122,8 @@ export interface ProjectSummary {
   registeredRatio: number | null;
   points3d: number | null;
   failureMessage: string | null;
+  weakIntervalCount: number | null;
+  supplementalMediaCount: number;
 }
 export interface ProjectOverview {
   projectsRoot: string;
@@ -146,6 +148,26 @@ export interface SupplementDiagnostics {
   selectedFrames: number;
   registeredFrames: number;
   weakIntervals: SupplementWeakInterval[];
+  supplementalMedia: SupplementalMedia[];
+}
+export interface SupplementalMedia {
+  path: string;
+  kind: "video" | "photo";
+  weakIntervalIndex: number;
+  validationStatus: "pending" | "passed" | "failed";
+  validationReason: string | null;
+}
+export interface SupplementPreviewImage {
+  label: string;
+  outputFile: string;
+  ptsSeconds: number;
+  dataUrl: string;
+}
+export interface SupplementPreview {
+  weakIntervalIndex: number;
+  beforeAnchor: SupplementPreviewImage | null;
+  weakFrame: SupplementPreviewImage | null;
+  afterAnchor: SupplementPreviewImage | null;
 }
 export interface SplatcamImportReport {
   sourcePath: string;

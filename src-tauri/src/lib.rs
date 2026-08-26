@@ -24,6 +24,8 @@ pub fn run_app() {
             commands::export_ply,
             commands::get_project_overview,
             commands::get_supplement_diagnostics,
+            commands::get_supplement_previews,
+            commands::attach_supplemental_media,
             commands::set_projects_root,
             commands::set_colmap_backend,
             commands::set_cuda_colmap_flavor,

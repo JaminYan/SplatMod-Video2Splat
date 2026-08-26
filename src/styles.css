@@ -210,11 +210,18 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .archive-summary span:last-child { border: 0; }
 .archive-summary b { overflow: hidden; text-overflow: ellipsis; font: 650 20px/1 "Bahnschrift", sans-serif; }
 .archive-summary small { color: var(--faint); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.project-filter { margin: -8px 0 16px; display: flex; flex-wrap: wrap; border-bottom: 1px solid var(--line-dark); }
+.project-filter button { min-height: 34px; padding: 7px 10px; display: flex; align-items: center; gap: 6px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; cursor: pointer; font-size: 11px; font-weight: 650; }
+.project-filter button:hover { color: var(--ink); background: var(--surface-hover); }
+.project-filter button.selected { color: var(--blue); border-bottom-color: var(--blue); }
+.project-filter span { min-width: 16px; height: 16px; padding: 0 4px; display: grid; place-items: center; color: var(--on-accent); background: var(--amber); border-radius: var(--radius-badge); font: 700 10px/1 "Cascadia Mono", monospace; }
 .empty-state { min-height: 340px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-empty); text-align: center; border-bottom: 1px solid var(--line); }
 .empty-state strong { margin-top: 13px; color: var(--text-empty-strong); font-size: 14px; }
 .empty-state p { max-width: 300px; margin: 8px 0 0; font-size: 12px; line-height: 1.7; }
 .project-group { margin-top: 2px; }
 .project-group.unfinished { margin-top: 34px; }
+.project-group.waiting-supplement { margin-top: 2px; }
+.project-group.completed-group { margin-top: 34px; }
 .group-heading { height: 38px; display: flex; align-items: center; justify-content: space-between; color: var(--text-group); border-bottom: 1px solid var(--line-dark); font-size: 12px; font-weight: 700; }
 .group-heading small { color: var(--faint); font-weight: 400; }
 .project-row { padding: var(--space-3) 0 var(--space-2); border-bottom: 1px solid var(--line); }
@@ -229,6 +236,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-status.needsSupplement { background: var(--amber); box-shadow: 0 0 0 3px var(--warning-ring); }
 .status-copy { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 10px; }
 .project-path { margin: 8px 0 0 14px; overflow: hidden; color: var(--muted); font: 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.project-supplement-state { margin: 7px 0 0 14px; color: var(--text-success); font: 600 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
 .project-failure { margin: 8px 0 0 14px; color: var(--red); font-size: 11px; line-height: 1.5; }
 .project-stats { margin: 15px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .project-stats > div { min-width: 0; padding: 0 10px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
@@ -254,7 +262,35 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .weak-interval-list strong { color: var(--ink); font-size: 12px; }
 .weak-interval-list span, .weak-interval-list small { color: var(--muted); font: 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
 .weak-interval-list p { margin: 5px 0 3px; color: var(--text-body); font-size: 11px; }
+.supplement-media-row { margin-top: 9px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.supplement-media-row .secondary-action { min-height: 30px; padding: 6px 9px; font-size: 11px; }
+.supplement-media-row small { overflow: hidden; max-width: 100%; text-overflow: ellipsis; white-space: nowrap; }
 .supplement-next { color: var(--muted); }
+.supplement-dialog-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 24px; background: rgba(23, 32, 51, .42); }
+.supplement-dialog { width: min(860px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow: auto; padding: 20px 22px; color: var(--ink); background: var(--surface-topbar); border: 1px solid var(--line-dark); box-shadow: var(--shadow-drawer); }
+.supplement-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding-bottom: 15px; border-bottom: 1px solid var(--line-dark); }
+.supplement-dialog > header div { display: grid; gap: 5px; }
+.supplement-dialog > header strong { font: 650 20px/1 "Bahnschrift", "Microsoft YaHei UI", sans-serif; }
+.supplement-dialog > header span { color: var(--muted); font-size: 11px; }
+.supplement-dialog > header button { width: 30px; height: 30px; display: grid; place-items: center; color: var(--muted); background: transparent; border: 1px solid var(--line); cursor: pointer; }
+.supplement-dialog > header button:hover { color: var(--ink); background: var(--surface-hover); }
+.weak-timeline { margin-top: 16px; display: flex; gap: 3px; min-height: 52px; padding: 4px; background: var(--surface); border: 1px solid var(--line); }
+.weak-timeline button { min-width: 86px; padding: 7px 10px; display: grid; align-content: center; gap: 4px; color: var(--text-body); text-align: left; background: var(--surface-control); border: 1px solid transparent; cursor: pointer; }
+.weak-timeline button:hover { border-color: var(--line-dark); }
+.weak-timeline button.selected { color: var(--blue); background: var(--surface-selected); border-color: var(--border-active); }
+.weak-timeline span { font-size: 11px; font-weight: 700; }
+.weak-timeline small { font: 10px/1 "Cascadia Mono", monospace; }
+.weak-interval-detail { margin-top: 16px; }
+.weak-interval-copy { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; align-items: baseline; }
+.weak-interval-copy strong { font-size: 14px; }
+.weak-interval-copy span { color: var(--muted); font: 11px/1.3 "Cascadia Mono", monospace; }
+.weak-interval-copy p { grid-column: 1 / -1; margin: 0; color: var(--text-body); font-size: 12px; }
+.weak-preview-strip { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.weak-preview-strip figure { min-width: 0; margin: 0; background: var(--surface); border: 1px solid var(--line); }
+.weak-preview-strip img { width: 100%; aspect-ratio: 4 / 3; display: block; object-fit: cover; background: var(--surface-control); }
+.weak-preview-strip figcaption { padding: 7px 8px; display: flex; justify-content: space-between; gap: 8px; }
+.weak-preview-strip figcaption strong { font-size: 11px; }
+.weak-preview-strip figcaption span { color: var(--muted); font: 10px/1.3 "Cascadia Mono", monospace; }
 .zoom-dock {
   position: fixed;
   right: 18px;
@@ -345,6 +381,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
   .process-metrics span:last-child { border-bottom: 0; }
   .project-actions { flex-wrap: wrap; row-gap: 8px; margin-left: 0; }
   .project-stats { grid-template-columns: 1fr 1fr; }
+  .weak-preview-strip { grid-template-columns: 1fr; }
 }
 
 /* === 本地扩展：Brush 3D 查看器入口 === */

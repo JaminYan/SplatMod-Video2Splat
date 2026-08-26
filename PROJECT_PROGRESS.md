@@ -1,8 +1,8 @@
 # OOOSplat 项目进度
 
-> 更新时间：2026-08-24  
+> 更新时间：2026-08-26
 > 当前版本：本地升级版 0.48
-> 当前分支：`codex/NewInputSfM`
+> 当前分支：`main`
 
 本文记录当前代码、运行时、性能优化、验证和发布边界。已实施功能、局部验证结果和仍待验收的计划分开记录。
 
@@ -16,6 +16,10 @@
 - FFmpeg 支持关闭、自动、D3D11VA 和 CUDA/NVDEC 解码模式。当前 CUDA 路径是硬件解码加 CPU/系统内存后处理，不宣传为完整 GPU 图像管线。
 - gsplat CUDA 作为可选实验训练后端接入：隔离 Python/CUDA 运行时、三级健康检查、统一 `training-input`、GPU 图片 LRU、splat 上限、MCMC 正则和 Gaussian PLY 校验。
 - UI 增加设置抽屉、引擎状态、后端选择、训练预设、splat 上限、阶段进度、日志和历史任务查看入口。
+- 完成弱区补充素材诊断入口：为 `needsSupplement` 任务读取弱区诊断、生成受限尺寸预览，并支持绑定 MP4/MOV/JPG/JPEG/PNG 到指定弱区；绑定路径和待校验状态写入项目元数据与状态文件。
+- 历史任务增加全部、已完成、等待补充、失败/已取消筛选，补充素材任务可在不读取大型 PLY 的情况下查看诊断和预览。
+- gsplat 设置增加 MCMC/AbsGS 增殖策略与 WD-R 附加训练模块开关；实验选项明确保留固定素材、seed、cap 和基线 A/B 验收边界。
+- 前端实时进程拆分为 memo 组件，日志列表与历史项目列表不再随每秒计时器重复重绘；窄窗口改为上下工作流，样式颜色与间距收敛为语义令牌。
 
 ## 验证状态
 
@@ -23,8 +27,8 @@
 |---|---|---|
 | Rust 单元测试 | 已有通过记录 | `cargo test --manifest-path src-tauri\\Cargo.toml --lib`：22/22 |
 | 引擎/许可证校验 | 已有通过记录 | 包括 manifest、引擎健康和许可证检查；仍应在目标机器复核实际 DLL/驱动 |
-| 前端测试 | 待复核 | 权限/锁阻塞已修正；此前 3 通过、1 失败，失败为进度状态断言，不能写成全绿 |
-| 自适应 SfM | 运行时已接入 | 真实素材的 COLMAP 注册率、点质量和补帧闭环仍待验收 |
+| 前端测试 | 待复核 | 当前代码变更后尚未重新完成全量测试；此前曾受 Vite 临时目录权限/锁影响，不能写成全绿 |
+| 自适应 SfM | 运行时已接入 | 真实素材的 COLMAP 注册率、点质量和补帧闭环仍待验收；当前新增的是弱区诊断与安全绑定入口 |
 | CASPAR CUDA | 实验路径已接入 | 需要固定相同输入、设备和配置完成中大型 A/B 性能与质量对比 |
 | Brush/gsplat | 适配器已接入 | 尚未完成三组同输入的完整质量、耗时和查看器验收 |
 
@@ -42,13 +46,14 @@
 ## 近期维护改进
 
 - 已完成完整代码/文档/引擎/构建产物备份：`A:\project\backup\Splat Back`。
-- 已清理项目目录中的约 93.9 GB 临时内容，包括多轮 Cargo 验证目录、vcpkg/CASPAR 编译缓存、Rust Debug 中间产物、Python `__pycache__`、Node/Vite 缓存和 TypeScript 增量缓存。
-- 保留 `.git`、`.backup`、源码、实现文档、`engines`、`node_modules`、`dist` 和 `src-tauri\\target\\release` 发行构建产物。
+- 已清理项目目录中的约 122 GB 临时内容，包括 `.tmp` 多轮 Cargo 验证目录、前端 `dist`、TypeScript 增量缓存和未锁定的 Rust 构建产物。
+- 保留 `.git`、`.backup`、源码、实现文档、`engines` 和 `node_modules`；被正在运行的 `splat-app.exe` 占用的少量 debug 文件暂未强制删除。
 - 后续测试建议使用备用 `CARGO_TARGET_DIR`，避免把大型 Rust 中间产物重新写回项目目录。
 
 ## 待完成与发布边界
 
 - 重新执行清理后的完整 `npm test` 和 Rust 全量测试，并修复前端过期进度事件断言。
+- 验证 `needsSupplement` 任务的弱区预览、补充素材绑定、路径持久化和后续定向重建闭环。
 - 使用真实 42/64/273/631 帧级样本完成 CPU、官方 CUDA、CASPAR、Brush 和 gsplat 的可复现实验矩阵。
 - 验收自适应 SfM 的注册率、稀疏点质量、定向补帧和 `needsSupplement` 恢复流程。
 - 在目标机器现场验证 COLMAP 4.1.1 的 DLL、驱动、CUDA SIFT 和 CASPAR 依赖；manifest 哈希不能替代现场运行。

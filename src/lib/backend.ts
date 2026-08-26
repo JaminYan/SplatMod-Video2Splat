@@ -21,6 +21,7 @@ import type {
   ProjectOverview,
   ProjectSummary,
   SupplementDiagnostics,
+  SupplementPreview,
   Quality,
   SplatcamImportReport,
   VideoInfo,
@@ -59,6 +60,18 @@ export async function setColmapBackend(backend: ColmapBackend): Promise<AppSetti
 
 export async function setFfmpegHwAccel(mode: FfmpegHwAccel): Promise<AppSettingsLike> {
   return invoke("set_ffmpeg_hw_accel", { mode }) as Promise<AppSettingsLike>;
+}
+
+export async function selectSupplementalMedia(): Promise<string | null> {
+  if (!inTauri()) return null;
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [
+      { name: "补充视频或照片", extensions: ["mp4", "mov", "jpg", "jpeg", "png"] },
+    ],
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function selectSplatcamDirectory(): Promise<string | null> {
@@ -115,6 +128,17 @@ export async function getProjectOverview(): Promise<ProjectOverview> {
 /** Reads the persisted weak-interval report only; it never resumes a pipeline. */
 export async function getSupplementDiagnostics(projectId: string): Promise<SupplementDiagnostics> {
   return invoke("get_supplement_diagnostics", { projectId });
+}
+export async function getSupplementPreviews(projectId: string): Promise<SupplementPreview[]> {
+  return invoke("get_supplement_previews", { projectId });
+}
+
+export async function attachSupplementalMedia(
+  projectId: string,
+  weakIntervalIndex: number,
+  path: string,
+): Promise<SupplementDiagnostics> {
+  return invoke("attach_supplemental_media", { projectId, weakIntervalIndex, path });
 }
 
 export async function setProjectsRoot(

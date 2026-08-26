@@ -137,6 +137,8 @@ pub struct ProjectMetadata {
     pub timings: PipelineTimings,
     #[serde(default)]
     pub needs_supplement: Option<SupplementRequirement>,
+    #[serde(default)]
+    pub supplemental_media: Vec<SupplementalMedia>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +225,35 @@ pub struct SupplementRequirement {
     pub diagnostics_path: PathBuf,
 }
 
+/// A user-selected file bound to one diagnosed weak interval. It is a
+/// reference, not a copied payload: validation and a future reconstruction
+/// attempt must read the original file without modifying it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementalMedia {
+    pub path: PathBuf,
+    pub kind: SupplementalMediaKind,
+    pub weak_interval_index: u64,
+    pub validation_status: SupplementalValidationStatus,
+    pub validation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SupplementalMediaKind {
+    Video,
+    Photo,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SupplementalValidationStatus {
+    #[default]
+    Pending,
+    Passed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOutput {
@@ -261,6 +292,8 @@ pub struct PipelineStateFile {
     pub auto_bridge_frames: bool,
     #[serde(default)]
     pub needs_supplement: Option<SupplementRequirement>,
+    #[serde(default)]
+    pub supplemental_media: Vec<SupplementalMedia>,
 }
 
 impl PipelineStateFile {
@@ -282,6 +315,7 @@ impl PipelineStateFile {
             colmap_execution: ColmapExecution::default(),
             auto_bridge_frames: true,
             needs_supplement: None,
+            supplemental_media: Vec::new(),
         }
     }
 }
