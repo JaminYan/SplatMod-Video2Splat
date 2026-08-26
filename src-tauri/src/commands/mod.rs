@@ -337,6 +337,8 @@ pub async fn start_pipeline(
         settings.brush_training_preset,
         settings.gsplat_splat_cap,
         settings.gsplat_densification_strategy,
+        settings.multi_view_densification_gate,
+        settings.floater_pruning,
         settings.photometric_mode,
         settings.training_backend,
         auto_bridge_frames,
@@ -394,6 +396,8 @@ pub async fn start_splatcam_pipeline(
         settings.brush_training_preset,
         settings.gsplat_splat_cap,
         settings.gsplat_densification_strategy,
+        settings.multi_view_densification_gate,
+        settings.floater_pruning,
         settings.photometric_mode,
         settings.training_backend,
         false,
@@ -471,6 +475,14 @@ pub async fn set_gsplat_densification_strategy(
     strategy: GsplatDensificationStrategy,
 ) -> Result<AppSettings> {
     catalog::save_gsplat_densification_strategy(strategy).await
+}
+#[tauri::command]
+pub async fn set_multi_view_densification_gate(enabled: bool) -> Result<AppSettings> {
+    catalog::save_multi_view_densification_gate(enabled).await
+}
+#[tauri::command]
+pub async fn set_floater_pruning(enabled: bool) -> Result<AppSettings> {
+    catalog::save_floater_pruning(enabled).await
 }
 #[tauri::command]
 pub async fn set_photometric_mode(mode: crate::engines::training::PhotometricMode) -> Result<AppSettings> {

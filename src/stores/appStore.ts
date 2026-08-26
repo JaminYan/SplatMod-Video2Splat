@@ -8,6 +8,8 @@ import {
   setBrushTrainingPreset as setBrushTrainingPresetInvoke,
   setGsplatSplatCap as setGsplatSplatCapInvoke,
   setGsplatDensificationStrategy as setGsplatDensificationStrategyInvoke,
+  setMultiViewDensificationGate as setMultiViewDensificationGateInvoke,
+  setFloaterPruning as setFloaterPruningInvoke,
   setTrainingBackend as setTrainingBackendInvoke,
   setPhotometricMode as setPhotometricModeInvoke,
 } from "../lib/backend";
@@ -66,6 +68,8 @@ interface AppState {
   setBrushTrainingPreset: (preset: BrushTrainingPreset) => Promise<void>;
   setGsplatSplatCap: (cap: GsplatSplatCap) => Promise<void>;
   setGsplatDensificationStrategy: (strategy: GsplatDensificationStrategy) => Promise<void>;
+  setMultiViewDensificationGate: (enabled: boolean) => Promise<void>;
+  setFloaterPruning: (enabled: boolean) => Promise<void>;
   setTrainingBackend: (backend: TrainingBackend) => Promise<void>;
   setPhotometricMode: (mode: PhotometricMode) => Promise<void>;
   downloadCudaColmap: () => Promise<void>;
@@ -189,6 +193,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? "AbsGS 实验策略已开启；请固定素材、随机种子、质量档与 splat 上限进行对照。"
         : "gsplat 已恢复为已验证的 MCMC 默认策略。",
     });
+  },
+  setMultiViewDensificationGate: async (enabled) => {
+    const { settings } = get();
+    if (!settings || settings.settings.multiViewDensificationGate === enabled) return;
+    const next = await setMultiViewDensificationGateInvoke(enabled);
+    set({ settings: { ...settings, settings: next }, settingsNotice: enabled ? "多视角新增点门控已开启；仅用于 MCMC 同输入 A/B。" : "多视角新增点门控已关闭，恢复标准 MCMC。" });
+  },
+  setFloaterPruning: async (enabled) => {
+    const { settings } = get();
+    if (!settings || settings.settings.floaterPruning === enabled) return;
+    const next = await setFloaterPruningInvoke(enabled);
+    set({ settings: { ...settings, settings: next }, settingsNotice: enabled ? "保守导出副本裁剪已开启；只有严格 A/B 门槛通过才会采用候选 PLY。" : "保守导出副本裁剪已关闭，始终导出原始训练结果。" });
   },
   setPhotometricMode: async (mode) => {
     const { settings } = get();

@@ -172,6 +172,8 @@ async fn execute(cli: Cli) -> Result<()> {
                 ooo_splat::presets::BrushTrainingPreset::A,
                 ooo_splat::presets::GsplatSplatCap::Auto,
                 ooo_splat::engines::GsplatDensificationStrategy::Mcmc,
+                false,
+                false,
                 ooo_splat::engines::PhotometricMode::None,
                 ooo_splat::engines::TrainingBackend::Brush,
                 true,

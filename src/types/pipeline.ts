@@ -43,6 +43,8 @@ export interface AppSettingsLike {
   trainingBackend: TrainingBackend;
   gsplatSplatCap: GsplatSplatCap;
   gsplatDensificationStrategy: GsplatDensificationStrategy;
+  multiViewDensificationGate: boolean;
+  floaterPruning: boolean;
   photometricMode: PhotometricMode;
 }
 export interface EffectiveSettings {

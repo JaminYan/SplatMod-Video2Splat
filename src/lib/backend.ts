@@ -101,6 +101,12 @@ export async function setGsplatSplatCap(cap: GsplatSplatCap): Promise<AppSetting
 export async function setGsplatDensificationStrategy(strategy: GsplatDensificationStrategy): Promise<AppSettingsLike> {
   return invoke("set_gsplat_densification_strategy", { strategy }) as Promise<AppSettingsLike>;
 }
+export async function setMultiViewDensificationGate(enabled: boolean): Promise<AppSettingsLike> {
+  return invoke("set_multi_view_densification_gate", { enabled }) as Promise<AppSettingsLike>;
+}
+export async function setFloaterPruning(enabled: boolean): Promise<AppSettingsLike> {
+  return invoke("set_floater_pruning", { enabled }) as Promise<AppSettingsLike>;
+}
 export async function setPhotometricMode(mode: PhotometricMode): Promise<AppSettingsLike> {
   return invoke("set_photometric_mode", { mode }) as Promise<AppSettingsLike>;
 }

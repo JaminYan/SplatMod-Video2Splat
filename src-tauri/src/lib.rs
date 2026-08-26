@@ -35,6 +35,8 @@ pub fn run_app() {
             commands::set_training_backend,
             commands::set_gsplat_splat_cap,
             commands::set_gsplat_densification_strategy,
+            commands::set_multi_view_densification_gate,
+            commands::set_floater_pruning,
             commands::set_photometric_mode,
             commands::inspect_splatcam_import,
             commands::download_colmap_cuda,

@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-const CURRENT_SETTINGS_SCHEMA: u32 = 9;
+const CURRENT_SETTINGS_SCHEMA: u32 = 11;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -40,6 +40,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub gsplat_densification_strategy: GsplatDensificationStrategy,
     #[serde(default)]
+    pub multi_view_densification_gate: bool,
+    #[serde(default)]
+    pub floater_pruning: bool,
+    #[serde(default)]
     pub photometric_mode: PhotometricMode,
 }
 impl Default for AppSettings {
@@ -55,6 +59,8 @@ impl Default for AppSettings {
             training_backend: TrainingBackend::Brush,
             gsplat_splat_cap: GsplatSplatCap::Auto,
             gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
+            multi_view_densification_gate: false,
+            floater_pruning: false,
             photometric_mode: PhotometricMode::None,
         }
     }
@@ -178,6 +184,8 @@ pub async fn load_settings() -> Result<AppSettings> {
                         training_backend: TrainingBackend::Brush,
                         gsplat_splat_cap: GsplatSplatCap::Auto,
                         gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
+                        multi_view_densification_gate: false,
+                        floater_pruning: false,
                         photometric_mode: PhotometricMode::None,
                     });
                 }
@@ -195,6 +203,8 @@ pub async fn load_settings() -> Result<AppSettings> {
         training_backend: TrainingBackend::Brush,
         gsplat_splat_cap: GsplatSplatCap::Auto,
         gsplat_densification_strategy: GsplatDensificationStrategy::Mcmc,
+        multi_view_densification_gate: false,
+        floater_pruning: false,
         photometric_mode: PhotometricMode::None,
     })
 }
@@ -252,6 +262,28 @@ pub async fn save_gsplat_densification_strategy(
 ) -> Result<AppSettings> {
     let mut settings = load_settings().await?;
     settings.gsplat_densification_strategy = strategy;
+    if strategy != GsplatDensificationStrategy::Mcmc {
+        settings.multi_view_densification_gate = false;
+        settings.floater_pruning = false;
+    }
+    persist(&settings).await?;
+    Ok(settings)
+}
+pub async fn save_multi_view_densification_gate(enabled: bool) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.multi_view_densification_gate = enabled;
+    if enabled {
+        settings.floater_pruning = false;
+    }
+    persist(&settings).await?;
+    Ok(settings)
+}
+pub async fn save_floater_pruning(enabled: bool) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    if enabled && (settings.gsplat_densification_strategy != GsplatDensificationStrategy::Mcmc || settings.multi_view_densification_gate) {
+        return Err(SplatError::Process("保守浮点裁剪仅支持关闭新增点门控的 gsplat MCMC。".into()));
+    }
+    settings.floater_pruning = enabled;
     persist(&settings).await?;
     Ok(settings)
 }

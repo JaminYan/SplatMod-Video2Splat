@@ -561,14 +561,17 @@ M3.5 进入产品预设前必须满足：至少三类真实素材同输入 A/B�
   `logs/floater-diagnostics.json`；
 - 记录活跃 Gaussian 的采样视角支持数、投影半径和
   `opacity × projectedRadius²` 投影面积代理，以及最大世界尺度相对场景半径的分位数；
+- 第二批只读统计已加入：双错位体素网格的邻域支持代理、最近相机距离和“低视角支持且处于本场景最近相机距离 P10 内”的联合计数。实现为线性内存诊断，不使用全量 kNN 矩阵；因此不会把该体素代理误称为精确 kNN 孤立度，也不会用于自动裁剪。
 - `projectedFootprintProxy` 明确只是可见面积代理，不能误称为精确的
   `alpha × transmittance` 累积贡献；
 - 文件写明当前未覆盖的空间孤立、深度冲突、近相机冲突和动态可信度，避免将不完整统计用于自动删除；
 - 此阶段不更改 strategy、opacity、导出选择或 PLY，因而可作为 MCMC、AbsGS、WD-R
   的同输入基线证据。
-- 诊断的 opacity 向量必须在与 `radii` 相乘前压平成一维；否则 `[N,1] × [N]` 会被广播为 `N×N`，在大模型完成训练后造成非必要的显存失败。诊断代码还必须独立容错：统计失败写入 `status: failed` 和告警，但不得阻断已经完成的验证与标准 PLY 导出。
+- 诊断的 opacity 向量必须在与 `radii` 相乘前压平成一维；否则 `[N,1] × [N]` 会被广播为 `N×N`，在大模型完成训练后造成非必要的显存失败。gsplat 返回每轴半径时还必须先将 `[...,N,2]` 沿轴取最大值，得到严格的 `[N]`。诊断代码还必须独立容错：统计失败写入 `status: failed` 和告警，但不得阻断已经完成的验证与标准 PLY 导出。
 
-接下来的实现顺序固定为：用三类真实素材收集这份诊断并标定场景内分位数；增加空间孤立与近相机统计；再引入仅限制新增点的多视角门控；最后才在 `pre-prune` 备份、短程禁止增殖恢复和自动回退均完成后测试保守导出裁剪。
+已开始第二阶段的**仅限新增点**门控，默认关闭且只支持 MCMC：启用时将最多 12 个均匀训练视角的可见性保存在每个 Gaussian 的紧凑位集里；MCMC 仅从至少两个采样视角可见的父点生成新点，新点继承父点的支持记录。已有 Gaussian、MCMC relocation、导出 opacity 过滤和 PLY 均不变。配置及增长审计会写入 `training-split.json` 与 `floater-diagnostics.json`。AbsGS 不显示此开关，切换到 AbsGS 会自动关闭它。
+
+接下来的实现顺序固定为：对这份门控在反光、低纹理和常规素材做同输入 A/B；只在质量门槛通过后才考虑扩大范围；最后才在 `pre-prune` 备份、短程禁止增殖恢复和自动回退均完成后测试保守导出裁剪。
 
 ## 9. 里程碑 M4：WD-R 感知质量实验
 
@@ -1059,6 +1062,123 @@ StopThePop 通过更准确的 per-pixel/hierarchical sorting 减少相机旋转�
 - [Faster-GS，CVPR 2026 官方实现](https://github.com/nerficg-project/faster-gaussian-splatting)。
 - [StopThePop，SIGGRAPH 2024 官方实现](https://github.com/r4dl/StopThePop)。
 - [2DGS](https://arxiv.org/abs/2403.17888)、[PGSR](https://github.com/zju3dv/PGSR)、[GOF](https://github.com/autonomousvision/gaussian-opacity-fields)：独立表面/网格路线。
+
+## 20A. M3.5 文献复核与 MCMC 参数结论（2026-08-27）
+
+本节将本地的两组 M3.5 同输入运行与公开论文、gsplat 当前官方实现对照。它是下一轮设计依据，**不是**把论文中的参数直接宣布为产品默认。
+
+### 20A.1 可复用的官方 MCMC 基线
+
+gsplat 当前 `MCMCStrategy` 的公开默认值为：`cap_max=1,000,000`、`noise_lr=500,000`、`refine_start_iter=500`、`refine_stop_iter=25,000`、`refine_every=100`、`min_opacity=0.005`。官方的 Mip-NeRF 360 MCMC 脚本同样使用 1M cap，并按室内/室外场景做输入分辨率下采样。官方训练器会在改变总步数时按同一比例缩放开始、停止与间隔，而不是把绝对步数原样照搬。
+
+| 项目 | 官方 MCMC 基线 | OOOSplat 当前 15,000 步基线 | 本轮结论 |
+| --- | --- | --- | --- |
+| splat cap | 1,000,000 | 1,000,000（可选更高） | cap 是显存/模型体积上限，不是质量目标；不应因为可到 3M 就提高默认值。 |
+| `min_opacity` | 0.005 | 0.005 | 保持；单独提高它会误删细杆、叶片和边缘。 |
+| `refine_every` | 100 | 100 | 保持。 |
+| 增殖起止 | 500–25,000（官方长训练默认） | `max(500, 0.10 * total)` 至 `0.80 * total`，即 1,500–12,000 | 这是已独立验证过的延迟增殖变量；不能和 M3.5 门控同时改回官方绝对步数。后续若改总步数，按比例比较。 |
+| MCMC noise | `noise_lr=500,000` | 沿用策略默认值 | 保持，除非做单变量稳定性实验。 |
+| MCMC 正则 | 论文强调未使用 Gaussian 的移除正则 | `opacity=0.01`、`scale=0.01` | 保持为当前基线；它们不是反光/低纹理的万能修复。 |
+| 多视角控制 | 原生 MCMC 无“至少 N 视角才新增”的参数 | 12 个固定采样视图、至少 2 个可见视图的实验门控 | 不可作为通用成熟参数；必须重设计为多证据、相对阈值策略。 |
+
+来源：[gsplat MCMC 策略实现](https://github.com/nerfstudio-project/gsplat/blob/main/gsplat/strategy/mcmc.py)、[官方 MCMC 基准脚本](https://github.com/nerfstudio-project/gsplat/blob/main/examples/benchmarks/mcmc.sh)、[官方训练器的步数缩放](https://github.com/nerfstudio-project/gsplat/blob/main/examples/simple_trainer.py)、[MCMC 原论文](https://arxiv.org/abs/2404.09591)。
+
+### 20A.2 为什么当前“2/12 可见性”不是论文认可的成熟参数
+
+[MVG-Splatting](https://arxiv.org/abs/2407.11840) 使用多视角深度和光度几何一致性，并按深度/场景分布采用分位数自适应增殖；[MVGS](https://arxiv.org/abs/2410.02103) 也采用选定视图上的多视角监督与 cross-ray densification。两者都不是把某个 Gaussian 父点的原始可见次数设成固定阈值。反光、重复纹理、曝光变化和画面边缘都可能让“可见次数少”成为真实细节而非浮点。
+
+因此，下一版门控必须先只做 shadow diagnostics，再在一个观察窗口内对候选同时要求：
+
+1. 低多视角支持；
+2. 低渲染贡献（真实 alpha/compositing contribution，而不是只看 opacity 或投影半径代理）；
+3. 孤立或相对异常尺度；
+4. 在可用时存在多视角深度/重投影冲突。
+
+四项应按场景分位数和可见训练视图数自适应。只满足一项或两项时保留候选；没有可靠深度/残差的反光素材只记录诊断，不触发新增点否决或裁剪。
+
+### 20A.3 本地结果对文献结论的复核
+
+| 同输入素材 | 对照结果 | 结论 |
+| --- | --- | --- |
+| `20260826_room`（25 张、低纹理柜门） | 实验门控：PSNR `18.9480 -> 20.0291`，SSIM `0.77809 -> 0.77772`，导出 splat `850,489 -> 839,855`，训练时间约 `+0.36%`。 | 单例有潜力，但不足以设默认；需要重复运行和固定轨迹查看。 |
+| `20260826_grass`（19 张、反光压力素材） | 实验门控：PSNR `12.1534 -> 11.7250`，SSIM `0.56663 -> 0.55840`，导出 splat `198,962 -> 198,174`，训练时间约 `+2%`。 | 质量门槛失败，说明硬可见性门控会伤害这类素材；不应继续在 `gamedesk` 上验证此版本。 |
+
+`grass` 的低基线分数不能单独证明拍摄失败，但它确实是几何一致性弱、反射/视差歧义强的压力样本，不能拿来标定通用阈值。`room` 可以用于低纹理分支的后续复测，但必须固定输入、seed、训练计划、验证集和查看轨迹。
+
+### 20A.4 当前产品决策与下一步门槛
+
+- 保持“多视角新增点门控（实验）”默认关闭；不为 AbsGS 或 Brush 显示/复用该参数。
+- MCMC 默认继续采用 1M cap、`min_opacity=0.005`、100 步 refine 和现有 10%/80% 的 15k 训练节奏；先不要叠加调高 cap、修改正则、缩短/延长增殖窗口。
+- 已实现 shadow candidate diagnostics：`floater-diagnostics.json` 现在按 active Gaussian 的场景 p10/p90 输出低可见支持、低 projected-footprint proxy、空间孤立、高尺度四项信号及其交集数量；它严格为 observe-only，不改变训练、迁移、裁剪或 PLY。当前 gsplat 栅格化接口没有公开逐 Gaussian 累计 alpha-transmittance，故 `projectedFootprintProxy` 仍明确是代理值，不能伪称真实贡献。
+- 已实现 shadow group ablation：对四项弱信号交集的完整候选组，训练结束后仅在诊断渲染中临时置零其 opacity，并报告相对完整渲染的平均与 p99 RGB 差异。它测量的是**该组**的实际最终画面影响，不声称可归因到单个 Gaussian；任何诊断错误都只写入状态，不影响已完成的训练或 PLY。
+- 下一个代码阶段不是继续试 `2/12`、`3/12` 等阈值，而是为上述 shadow report 接入可选深度/重投影冲突，并在 fixed trajectory 上将 group ablation 与质量门槛共同复核；没有深度冲突证据的素材只允许诊断。
+- 只有普通静态、低纹理、反光/动态干扰三类素材各至少 3 次、以中位 PSNR/SSIM、固定轨迹细节和导出 splat 共同通过，才允许把新策略从实验开关提升为候选预设。
+
+### 20A.5 冰箱实拍运行记录（`20260826_fridge`）
+
+该运行导入 73 张 Splatcam RGB/位姿和 247,509 个初始化点，73/73 注册成功；使用 gsplat MCMC、balanced、`maxResolution=1024`、15,000 步、1M cap。最终 logical Gaussian 达到 1,000,000，导出 895,871，训练 322.2 秒，峰值显存 2,649 MB，验证 PSNR `18.9077`、SSIM `0.71505`。
+
+它启用了旧的 `multiViewDensificationGate`，因此不能与标准 MCMC 或 `room`/`grass` 的开关结果做质量归因。新的 observe-only shadow report 记录：12 个采样训练视图中，p10 支持度为 1、p10 projected-footprint proxy 为 `0.7632`、p90 归一化最大尺度为 `0.01919`；四项弱信号交集为 354 个（约占已导出 Gaussian 的 0.04%）。这只说明严格交集很小，绝不说明这 354 个就是可删除浮点。
+
+原始素材包含低纹理冰箱门、金属/玻璃反射、室内不同深度和部分运动模糊帧。它可保留为复杂压力素材，但不用于拟合通用阈值。若需要测旧门控的净效应，唯一有效的补跑是同一输入、seed、1M cap、15k、1024、MCMC，**只关闭** `multiViewDensificationGate`；更推荐把后续新素材作为门控关闭的默认基线运行。
+
+### 20A.6 小桌实拍基线记录（`20260826_small_desk`）
+
+该运行是当前应采用的默认基线：35/35 Splatcam RGB/位姿成功导入，78,174 个初始化点，gsplat MCMC、balanced、`maxResolution=1024`、15,000 步、1M cap，且 `multiViewDensificationGate=false`。最终 logical Gaussian 为 431,165、导出 417,623，未触及 cap；训练 281.1 秒，验证 PSNR `18.9086`、SSIM `0.69536`。
+
+验证图中中心的碗、包装和笔记本仍可辨识，但桌面边缘、地板和高反光/遮挡区域出现明显拖影与漂浮感。这与仅 35 张、复杂遮挡、光亮木面及包装反射的素材特性一致；不能因这些伪影就把 cap 从 1M 调高，因为本次只用了约 43% cap。shadow report 的四项弱信号交集为 535 个（约占导出 Gaussian 的 0.13%），同样只能作为后续 attribution/depth-conflict 设计的观测样本，不能直接裁剪。
+
+该案例应固定为“默认 MCMC、门控关闭、反光和遮挡压力”基线。下一轮任何 M3.5 干预都必须以它做同输入 A/B：保持 seed、训练/验证划分、分辨率、15k 与 cap 不变，并同时复核上述四张验证图；否则不能把视觉改善归因于浮点治理。
+
+### 20A.7 椅子实拍与 group-ablation 首次结果（`20260826_chair 2`）
+
+该运行使用 50/50 Splatcam RGB/位姿、159,360 初始化点，gsplat MCMC、`multiViewDensificationGate=false`、balanced、1M cap、15,000 步。最终 logical Gaussian 为 878,989、导出 796,445，未打满 cap；训练 375.2 秒，验证 PSNR `21.6683`、SSIM `0.78312`，是目前这批默认 MCMC 实拍基线中质量最稳定的一组。
+
+shadow candidate analysis 选出 851 个四项弱信号交集候选（约占导出 Gaussian 的 0.11%）。首次 `shadowGroupAblation` 已完成：12 个采样视图中，候选组整体置零的平均 RGB 绝对差均值为 `1.06e-6`，其视图级 p99 绝对差均为 0。这说明**这一完整候选组在这些采样视图的最终画面中几乎没有贡献**，并证明 group-level ablation 诊断可运行；它不证明组内每个 Gaussian 在所有未采样视图均无贡献，也不授权自动删除。
+
+后续若做保守裁剪研究，应先在同一输入上仅对该组执行“预导出副本 + 固定轨迹 + 验证/PLY 对照”的一次性实验，并设置任何可见差异或指标回退即回滚；在此之前，默认产品和当前训练输出保持不裁剪。
+
+### 20A.8 已实现的保守导出副本裁剪（默认关闭）
+
+gsplat MCMC 设置中新增“保守浮点导出裁剪（实验）”，仅在新增点门控关闭时可开启。训练完成后它会：
+
+1. 保留原参数并导出 `pre-prune.ply`；
+2. 仅对已完成 group-ablation 的四项交集候选临时置零 opacity；
+3. 保存 `prune-candidate.ply` 和固定验证视图的候选渲染；
+4. 比较裁剪前后验证指标和 group RGB 影响；
+5. 仅在 PSNR 下降不超过 `0.01 dB`、SSIM 下降不超过 `0.0001`、group mean absolute RGB delta 不超过 `1e-5` 时采用候选 PLY；否则恢复原 opacity 并导出原 PLY。
+
+每次启用均写入 `logs/prune-manifest.json`，保留 pre/candidate 产物和接受、拒绝或失败理由。该路径不做恢复训练、不删训练 checkpoint/参数，且默认关闭；真实 `chair 2` 同输入 A/B 与固定轨迹复核尚未执行，因而不能将它表述为已验证质量收益。
+
+### 20A.9 椅子裁剪副本首轮运行（`20260826_chair 3`）
+
+该次运行正确启用 MCMC、关闭新增点门控并开启导出副本裁剪。它产出 1,062 个候选，`pre-prune.ply` 为 909,105 splat、`prune-candidate.ply` 为 908,043 splat。候选验证为 PSNR `21.70709 -> 21.70752`、SSIM `0.780876 -> 0.780875`，即 PSNR 不降、SSIM 下降约 `0.00000163`；group mean absolute RGB delta 为 `8.60e-7`，均在门槛内。
+
+但该首轮在接受分支恢复内存中 opacity 参数时触发 PyTorch leaf-variable 原地写入异常，manifest 标记 `failed`，并按安全路径导出原始 PLY。这个恢复操作已改为 `torch.no_grad()`；须以相同设置重跑一次，确认 manifest 为 `accepted` 后，才能将候选 PLY 作为最终导出。首轮产生的 pre/candidate PLY 和验证渲染保留作对照，不能通过手工替换项目最终文件绕开新的验证记录。
+
+### 20A.10 椅子裁剪副本确认运行（`20260826_chair 4`）
+
+修复后以同类设置重新运行，manifest 为 `accepted`、`finalOutput=candidate`。本次有 856 个候选；`pre-prune.ply` 为 793,448 splat，候选/最终 `chair.ply` 为 792,592，减少 856（约 0.108%）。最终 PLY 与 `prune-candidate.ply` 的 SHA-256 完全一致，确认没有错误导出原模型。
+
+候选验证 PSNR `21.728047 -> 21.727668`，下降 `0.000379 dB`；SSIM `0.7828166 -> 0.7827997`，下降 `0.0000169`；group mean absolute RGB delta `4.95e-7`。均严格低于当前门槛。固定验证图的人工快速复核未见由这组删除产生的可见差异。该结果只验证这一个场景、这一个极小且多证据重叠候选组的**导出副本裁剪安全性**；它不构成一般浮点消除效果或默认开启的证据。
+
+### 20A.11 小桌压力素材裁剪确认（`20260826_small_desk 2`）
+
+该次运行同样为 MCMC、门控关闭、裁剪开启；manifest 为 `accepted`、最终 PLY 与 `prune-candidate.ply` SHA-256 一致。530 个候选从 417,530 splat 裁至 417,000（约 0.127%）。候选验证 PSNR `18.896955 -> 18.897027`、SSIM `0.6944605 -> 0.6944614`，两项均有极小正向变化；group mean absolute RGB delta 为 `3.44e-6`，低于 `1e-5` 门槛。固定验证图快速对比未出现该候选组删除导致的新增可见差异。
+
+这使导出副本裁剪在“较稳定椅子”和“反光/遮挡小桌”两类素材上各通过一次，但两个运行都只删除约 0.1% splat，不能宣称它已实质性解决小桌原有拖影或浮点。下一步仍须以低纹理柜门或冰箱压力素材验证安全回退/接受行为，并把开关继续保留为实验、默认关闭。
+
+### 20A.12 冰箱低纹理/反光压力结果与门槛收紧（`20260826_fridge 2`）
+
+该运行以当时的旧门槛 `0.05 dB / 0.001` 获得 `accepted`：351 个候选从 898,566 裁至 898,215（约 0.039%）。然而候选验证 PSNR `18.975171 -> 18.931461`，下降 `0.04371 dB`；SSIM `0.7160034 -> 0.7156383`，下降 `0.0003652`。虽然表面上没有越过旧门槛，但这已消耗其约 87% PSNR 余量，而删除比例极小；固定验证图亦可见细微局部变化。因此该场景不应被视为安全接受证据。
+
+随后默认门槛收紧为 PSNR 下降不超过 `0.01 dB`、SSIM 下降不超过 `0.0001`，RGB 组级门槛维持 `1e-5`。`chair 4` 与 `small_desk 2` 仍会通过该更严格条件；`fridge 2` 会被拒绝并自动导出 pre-prune 原模型。既有 `fridge 2` 不应手工替换文件；如需正式产物，应按相同设置重跑，让新门槛生成完整回退记录。
+
+### 20A.13 冰箱自动回退确认（`20260826_fridge 3`）
+
+按收紧后的门槛重跑后，319 个候选从 900,908 形成 900,589 splat 的候选 PLY。候选 PSNR 下降 `0.004148 dB`，仍在 `0.01 dB` 内；但 SSIM 下降 `0.00010486`，刚好超过 `0.0001` 门槛，因此 manifest 正确写入 `rejected`、`finalOutput=original`。最终 `fridge.ply` 与同次 `pre-prune.ply` 的 SHA-256 完全一致，且与 `prune-candidate.ply` 不同，证明程序实际回退而不是仅修改状态。
+
+至此，导出副本裁剪在当前门槛下已完成两类“安全接受”（椅子、小桌）和一类“安全回退”（冰箱）的真实 Splatcam 验证。功能保持实验、默认关闭；下一阶段不应提高裁剪比例，而应补充深度/重投影冲突证据和固定轨迹查看器复核。
 
 ## 21. 尚未解决的问题
 

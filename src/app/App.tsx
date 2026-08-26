@@ -478,6 +478,22 @@ function GsplatDensificationStrategyBlock() {
   return <div className="settings-block"><div className="settings-block-title">gsplat 增殖策略</div><p className="settings-block-hint">仅 gsplat 生效。AbsGS 不会改变默认策略；首轮对照请关闭 PPISP，以保证只比较增殖策略。</p><div className="backend-toggle" role="radiogroup" aria-label="gsplat 增殖策略">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setGsplatDensificationStrategy(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
+function MultiViewDensificationGateBlock() {
+  const store = useAppStore();
+  const settings = store.settings;
+  if (!settings || settings.settings.trainingBackend !== "gsplat" || settings.settings.gsplatDensificationStrategy !== "mcmc") return null;
+  const enabled = settings.settings.multiViewDensificationGate;
+  return <div className="settings-block"><div className="settings-block-title">多视角新增点门控（实验）</div><p className="settings-block-hint">仅限制 MCMC 新增点的父点选择；已有 splat、导出与裁剪均不变。请只在固定素材、seed、质量档和 cap 的 A/B 中开启。</p><button type="button" className={enabled ? "backend-option selected" : "backend-option"} disabled={store.phase === "running"} onClick={() => void store.setMultiViewDensificationGate(!enabled)}><span className="backend-text"><strong>{enabled ? "已开启" : "默认关闭"}</strong><small>{enabled ? "父点须获得至少两个采样训练视角支持。" : "标准 MCMC，不施加新增点门控。"}</small></span></button></div>;
+}
+
+function FloaterPruningBlock() {
+  const store = useAppStore();
+  const settings = store.settings;
+  if (!settings || settings.settings.trainingBackend !== "gsplat" || settings.settings.gsplatDensificationStrategy !== "mcmc" || settings.settings.multiViewDensificationGate) return null;
+  const enabled = settings.settings.floaterPruning;
+  return <div className="settings-block"><div className="settings-block-title">保守浮点导出裁剪（实验）</div><p className="settings-block-hint">只在训练结束后对多证据候选生成副本 PLY，并用固定验证视图和 RGB 消融门槛决定是否采用；不改变训练过程。MCMC 默认关闭，且不能与新增点门控同时使用。</p><button type="button" className={enabled ? "backend-option selected" : "backend-option"} disabled={store.phase === "running"} onClick={() => void store.setFloaterPruning(!enabled)}><span className="backend-text"><strong>{enabled ? "已开启（严格回退）" : "默认关闭"}</strong><small>{enabled ? "保存 pre-prune/candidate 产物；质量回退则自动导出原模型。" : "仅写诊断，不生成裁剪候选。"}</small></span></button></div>;
+}
+
 function PhotometricModeBlock() {
  const store = useAppStore();
  const settings = store.settings;
@@ -509,6 +525,8 @@ function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose
         <TrainingBackendBlock />
         <GsplatSplatCapBlock />
         <GsplatDensificationStrategyBlock />
+        <MultiViewDensificationGateBlock />
+        <FloaterPruningBlock />
         <PhotometricModeBlock />
         <BrushTrainingPresetBlock inputSource={inputSource} />
         {store.settingsNotice && (

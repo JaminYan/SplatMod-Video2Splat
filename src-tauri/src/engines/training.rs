@@ -65,6 +65,8 @@ pub struct TrainingRequest {
     pub seed: u64,
     pub photometric_mode: PhotometricMode,
     pub densification_strategy: GsplatDensificationStrategy,
+    pub multi_view_densification_gate: bool,
+    pub floater_pruning: bool,
     pub log_path: PathBuf,
 }
 
@@ -230,6 +232,8 @@ async fn train_gsplat(
         "resultDir": request.output_directory,
         "outputPly": candidate,
         "strategy": request.densification_strategy.config_name(),
+        "multiViewDensificationGate": request.multi_view_densification_gate,
+        "floaterPruning": request.floater_pruning,
         "absgradGrowGrad2d": ABSGRAD_GROW_GRAD2D_EXPERIMENTAL,
         "maxSteps": request.total_steps,
         "maxResolution": request.max_resolution,
