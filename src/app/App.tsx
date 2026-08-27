@@ -5,8 +5,8 @@ import {
   Zap, ZapOff,
 } from "lucide-react";
 import {
-  attachSupplementalMedia, cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementPreviews,
-  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo,
+  attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews,
+  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, validateSupplementalMedia,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
@@ -131,14 +131,19 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void }) {
+const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView, onSupplementChanged }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void; onSupplementChanged: () => Promise<void> }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [supplementOpen, setSupplementOpen] = useState(false);
   const [supplementDiagnostics, setSupplementDiagnostics] = useState<SupplementDiagnostics | null>(null);
   const [supplementError, setSupplementError] = useState<string | null>(null);
   const [loadingSupplement, setLoadingSupplement] = useState(false);
   const [attachingWeakInterval, setAttachingWeakInterval] = useState<number | null>(null);
+  const [attachingMediaCount, setAttachingMediaCount] = useState(0);
+  const [removingSupplementPath, setRemovingSupplementPath] = useState<string | null>(null);
+  const [validatingWeakInterval, setValidatingWeakInterval] = useState<number | null>(null);
   const [supplementPreviews, setSupplementPreviews] = useState<SupplementPreview[]>([]);
+  const [originalPreview, setOriginalPreview] = useState<{ label: string; dataUrl: string } | null>(null);
+  const [loadingOriginalPreview, setLoadingOriginalPreview] = useState(false);
   const [selectedWeakInterval, setSelectedWeakInterval] = useState(0);
   const toggleSupplement = async () => {
     if (supplementOpen) {
@@ -163,22 +168,64 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       setLoadingSupplement(false);
     }
   };
+  const validateMedia = async (weakIntervalIndex: number) => {
+    setSupplementError(null);
+    setValidatingWeakInterval(weakIntervalIndex);
+    try {
+      setSupplementDiagnostics(await validateSupplementalMedia(project.id, weakIntervalIndex));
+      void onSupplementChanged();
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setValidatingWeakInterval(null);
+    }
+  };
+  const openOriginalPreview = async (label: string, outputFile: string) => {
+    setSupplementError(null);
+    setLoadingOriginalPreview(true);
+    try {
+      setOriginalPreview({ label, dataUrl: await getSupplementOriginalPreview(project.id, outputFile) });
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setLoadingOriginalPreview(false);
+    }
+  };
   const attachMedia = async (weakIntervalIndex: number) => {
-    const path = await selectSupplementalMedia();
-    if (!path) return;
+    const paths = await selectSupplementalMedia();
+    if (paths.length === 0) return;
     setSupplementError(null);
     setAttachingWeakInterval(weakIntervalIndex);
+    setAttachingMediaCount(paths.length);
     try {
-      setSupplementDiagnostics(await attachSupplementalMedia(project.id, weakIntervalIndex, path));
+      setSupplementDiagnostics(await attachSupplementalMediaBatch(project.id, weakIntervalIndex, paths));
+      void onSupplementChanged();
     } catch (error) {
       setSupplementError(messageOf(error));
     } finally {
       setAttachingWeakInterval(null);
+      setAttachingMediaCount(0);
+    }
+  };
+  const detachMedia = async (weakIntervalIndex: number, path: string) => {
+    setSupplementError(null);
+    setRemovingSupplementPath(path);
+    try {
+      setSupplementDiagnostics(await detachSupplementalMedia(project.id, weakIntervalIndex, path));
+      void onSupplementChanged();
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setRemovingSupplementPath(null);
     }
   };
   const activeInterval = supplementDiagnostics?.weakIntervals[selectedWeakInterval];
   const activePreview = supplementPreviews.find((preview) => preview.weakIntervalIndex === selectedWeakInterval);
-  const previewImages = [activePreview?.beforeAnchor, activePreview?.weakFrame, activePreview?.afterAnchor].filter((image): image is NonNullable<typeof image> => image != null);
+  const previewSlots = [
+    { label: "前锚点", image: activePreview?.beforeAnchor, missing: "缺少前锚点" },
+    { label: "弱区画面", image: activePreview?.weakFrame, missing: "预览不可用" },
+    { label: "后锚点", image: activePreview?.afterAnchor, missing: activeInterval?.afterAnchor ? "预览不可用" : "视频结束，缺少后锚点" },
+  ];
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -217,17 +264,24 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
         <div className="weak-timeline" role="tablist" aria-label="弱区时间轴">{supplementDiagnostics.weakIntervals.map((interval, index) => <button key={`${interval.startPtsSeconds}-${interval.endPtsSeconds}-${index}`} type="button" role="tab" aria-selected={selectedWeakInterval === index} className={selectedWeakInterval === index ? "selected" : ""} onClick={() => setSelectedWeakInterval(index)} style={{ flexGrow: Math.max(1, interval.endPtsSeconds - interval.startPtsSeconds) }}><span>弱区 {index + 1}</span><small>{formatVideoDuration(interval.startPtsSeconds)}–{formatVideoDuration(interval.endPtsSeconds)}</small></button>)}</div>
         {activeInterval && <div className="weak-interval-detail">
           <div className="weak-interval-copy"><strong>弱区 {selectedWeakInterval + 1} · {formatVideoDuration(activeInterval.startPtsSeconds)}–{formatVideoDuration(activeInterval.endPtsSeconds)}</strong><span>{activeInterval.unregisteredFrames} 张未注册关键帧</span><p>问题：{activeInterval.reason === "unregisteredSelectedFrames" ? "视角重叠或视差不足" : activeInterval.reason}</p></div>
-          <div className="weak-preview-strip">{previewImages.map((image) => <figure key={`${image.label}-${image.outputFile}`}><img src={image.dataUrl} alt={`${image.label} ${formatVideoDuration(image.ptsSeconds)}`} /><figcaption><strong>{image.label}</strong><span>{formatVideoDuration(image.ptsSeconds)}</span></figcaption></figure>)}</div>
-          {previewImages.length === 0 && <p className="supplement-loading">关键帧预览不可用；可通过资源管理器查看完整项目帧目录。</p>}
+          <div className="weak-preview-strip">{previewSlots.map((slot) => <figure className={slot.image ? undefined : "unavailable"} key={slot.label}>{slot.image ? <img title="单击查看原图" onClick={() => void openOriginalPreview(slot.image!.label, slot.image!.outputFile)} src={slot.image.dataUrl} alt={`${slot.image.label} ${formatVideoDuration(slot.image.ptsSeconds)}`} /> : <div className="weak-preview-missing">{slot.missing}</div>}<figcaption><strong>{slot.image?.label ?? slot.label}</strong><span>{slot.image ? formatVideoDuration(slot.image.ptsSeconds) : "无可用帧"}</span></figcaption></figure>)}</div>
+          {loadingOriginalPreview && <p className="supplement-loading">正在读取原图预览…</p>}
           <p className="supplement-hint">请沿“前锚点 → 弱区画面 → 后锚点”继续移动并保持主体重叠，让主体在画面中移动约 15–25% 宽度。单目素材没有可靠绝对尺度，因此不显示厘米或米。</p>
           <div className="supplement-media-row">
-            <button type="button" className="secondary-action" disabled={busy || attachingWeakInterval != null} onClick={() => void attachMedia(selectedWeakInterval)}>{attachingWeakInterval === selectedWeakInterval ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{attachingWeakInterval === selectedWeakInterval ? "正在绑定" : "添加补充视频或照片"}</button>
-            {supplementDiagnostics.supplementalMedia.filter((media) => media.weakIntervalIndex === selectedWeakInterval).map((media) => <small key={media.path}>已绑定 {media.kind === "video" ? "视频" : "照片"}：{basename(media.path)} · 待验证</small>)}
+            <button type="button" className="secondary-action" disabled={busy || attachingWeakInterval != null} onClick={() => void attachMedia(selectedWeakInterval)}>{attachingWeakInterval === selectedWeakInterval ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{attachingWeakInterval === selectedWeakInterval ? `正在绑定 ${attachingMediaCount} 个文件` : "添加候补文件（可多选）"}</button>
+            <button type="button" className="secondary-action" disabled={busy || validatingWeakInterval != null || supplementDiagnostics.supplementalMedia.every((media) => media.weakIntervalIndex !== selectedWeakInterval)} onClick={() => void validateMedia(selectedWeakInterval)}>{validatingWeakInterval === selectedWeakInterval ? <LoaderCircle className="spin" size={14} /> : <CircleAlert size={14} />}{validatingWeakInterval === selectedWeakInterval ? "正在验证候补素材" : "验证候补素材"}</button>
+            <div className="supplement-media-list" aria-label="已绑定候补素材">
+              {supplementDiagnostics.supplementalMedia.filter((media) => media.weakIntervalIndex === selectedWeakInterval).map((media) => <div className="supplement-media-entry" key={media.path}>
+                <span><strong>{media.kind === "video" ? "视频" : "照片"}</strong><small>{basename(media.path)} · {media.validationStatus === "pending" ? "待验证" : media.validationStatus === "passed" ? "已通过" : "未通过"}{media.validationReason ? `：${media.validationReason}` : ""}</small></span>
+                <button type="button" disabled={busy || removingSupplementPath != null} onClick={() => void detachMedia(selectedWeakInterval, media.path)}>{removingSupplementPath === media.path ? <LoaderCircle className="spin" size={13} /> : <Trash2 size={13} />}{removingSupplementPath === media.path ? "正在移除" : "移除"}</button>
+              </div>)}
+            </div>
           </div>
         </div>}
         <p className="supplement-next">已绑定的素材尚未解码或送入 COLMAP。下一阶段会先做重叠、清晰度与视差验证；当前可通过“资源管理器”核对完整日志。</p>
       </>}
     </section></div>}
+    {originalPreview && <div className="original-preview-backdrop" role="presentation" onMouseDown={() => setOriginalPreview(null)}><section className="original-preview-dialog" role="dialog" aria-modal="true" aria-label={`${originalPreview.label} 原图预览`} onMouseDown={(event) => event.stopPropagation()}><header><strong>{originalPreview.label} · 原图预览</strong><button type="button" aria-label="关闭原图预览" onClick={() => setOriginalPreview(null)}><X size={17} /></button></header><img src={originalPreview.dataUrl} alt={`${originalPreview.label} 原图`} /></section></div>}
   </article>;
 });
 
@@ -292,7 +346,7 @@ function ColmapBackendBlock() {
   );
 }
 
-const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView }: {
+const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView, onSupplementChanged }: {
   completed: ProjectSummary[];
   waitingSupplement: ProjectSummary[];
   active: ProjectSummary[];
@@ -301,13 +355,14 @@ const ProjectList = memo(function ProjectList({ completed, waitingSupplement, ac
   openingProjectId: string | null;
   onDelete: (project: ProjectSummary) => void;
   onView: (project: ProjectSummary) => void;
+  onSupplementChanged: () => Promise<void>;
 }) {
   return <>
     {completed.length === 0 && waitingSupplement.length === 0 && active.length === 0 && failed.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>没有符合筛选条件的任务</strong><p>切换上方筛选，或选择视频后开始生成。</p></div>}
-    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
-    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
-    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
-    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} />)}</div>}
+    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
+    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
+    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
+    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
   </>;
 });
 
@@ -834,7 +889,7 @@ export function App() {
           </div>
           <div className="archive-summary"><span><b>{store.projects.filter((project) => project.status === "completed").length}</b><small>已完成</small></span><span><b>{totalWaitingSupplement}</b><small>等待补充</small></span></div>
 
-          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} />
+          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} onSupplementChanged={refreshProjects} />
         </section>
       </section>
       </div>

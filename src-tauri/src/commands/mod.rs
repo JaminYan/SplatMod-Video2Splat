@@ -1,6 +1,6 @@
 use crate::{
     engines::{
-        self, brush, ffprobe::probe_video, ColmapBackend, CudaColmapFlavor, EngineKind,
+        self, brush, ffmpeg, ffprobe::probe_video, ColmapBackend, CudaColmapFlavor, EngineKind,
         EnginePaths, EngineStatus, FfmpegHwAccel, GsplatDensificationStrategy, MapperBaMode,
         TrainingBackend,
     },
@@ -11,10 +11,18 @@ use crate::{
         catalog::{self, AppSettings, EffectiveSettings, ProjectOverview},
         ProjectStatus,
     },
-    video::{FramePlan, FrameSelectionStrategy, UniformRatioFrameSelection, VideoInfo},
+    video::{
+        analyze_proxy_images, AdaptiveFrameProfile, FramePlan, FrameSelectionStrategy,
+        SourceFrameTimestamp, UniformRatioFrameSelection, VideoInfo,
+    },
 };
 use serde::Serialize;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashSet},
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -26,9 +34,15 @@ impl PipelineController {
     /// Used by the native close handler. It deliberately checks the Rust-owned
     /// active runner rather than any possibly stale WebView state.
     pub fn cancel_for_close(&self) -> bool {
-        let Ok(active) = self.active.try_lock() else { return true; };
-        let Some(runner) = active.clone() else { return false; };
-        tauri::async_runtime::spawn(async move { runner.cancel().await; });
+        let Ok(active) = self.active.try_lock() else {
+            return true;
+        };
+        let Some(runner) = active.clone() else {
+            return false;
+        };
+        tauri::async_runtime::spawn(async move {
+            runner.cancel().await;
+        });
         true
     }
 }
@@ -140,6 +154,26 @@ pub async fn get_supplement_previews(
     crate::pipeline::runner::read_supplement_previews(&project.project_path).await
 }
 
+#[tauri::command]
+pub async fn get_supplement_original_preview(
+    project_id: String,
+    output_file: String,
+) -> std::result::Result<String, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let project = catalog::get_overview()
+        .await?
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    crate::pipeline::runner::read_supplement_original_preview(&project.project_path, &output_file)
+        .await
+}
+
 /// Binds one user-selected video or photo to a weak interval. This intentionally
 /// only records a validated external path; the next validation stage is the
 /// first operation allowed to decode the supplemental media.
@@ -160,7 +194,8 @@ pub async fn attach_supplemental_media(
     if project.status != ProjectStatus::NeedsSupplement {
         return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
     }
-    let diagnostics = crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await?;
+    let diagnostics =
+        crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await?;
     if usize::try_from(weak_interval_index)
         .ok()
         .map_or(true, |index| index >= diagnostics.weak_intervals.len())
@@ -168,9 +203,9 @@ pub async fn attach_supplemental_media(
         return Err(SplatError::Process("补充素材未绑定到有效弱区".into()));
     }
     let input = PathBuf::from(path);
-    let metadata = tokio::fs::metadata(&input).await.map_err(|_| {
-        SplatError::Process("补充素材文件不存在或无法读取".into())
-    })?;
+    let metadata = tokio::fs::metadata(&input)
+        .await
+        .map_err(|_| SplatError::Process("补充素材文件不存在或无法读取".into()))?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(SplatError::Process("补充素材必须是非空的普通文件".into()));
     }
@@ -182,25 +217,30 @@ pub async fn attach_supplemental_media(
     let kind = match extension.as_str() {
         "mp4" | "mov" => crate::pipeline::SupplementalMediaKind::Video,
         "jpg" | "jpeg" | "png" => crate::pipeline::SupplementalMediaKind::Photo,
-        _ => return Err(SplatError::Process("补充素材仅支持 MP4、MOV、JPG、JPEG 或 PNG".into())),
+        _ => {
+            return Err(SplatError::Process(
+                "补充素材仅支持 MP4、MOV、JPG、JPEG 或 PNG".into(),
+            ))
+        }
     };
     let canonical = tokio::task::spawn_blocking(move || input.canonicalize())
         .await
         .map_err(|error| SplatError::Process(format!("无法解析补充素材路径：{error}")))??;
     let metadata_path = project.project_path.join("project.json");
-    let mut project_metadata: crate::pipeline::ProjectMetadata = serde_json::from_slice(
-        &tokio::fs::read(&metadata_path).await?,
-    )?;
+    let mut project_metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
     project_metadata.supplemental_media.retain(|media| {
         !(media.weak_interval_index == weak_interval_index && media.path == canonical)
     });
-    project_metadata.supplemental_media.push(crate::pipeline::SupplementalMedia {
-        path: canonical,
-        kind,
-        weak_interval_index,
-        validation_status: crate::pipeline::SupplementalValidationStatus::Pending,
-        validation_reason: None,
-    });
+    project_metadata
+        .supplemental_media
+        .push(crate::pipeline::SupplementalMedia {
+            path: canonical,
+            kind,
+            weak_interval_index,
+            validation_status: crate::pipeline::SupplementalValidationStatus::Pending,
+            validation_reason: None,
+        });
     crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
     let state_path = project.project_path.join("state.json");
     if let Ok(bytes) = tokio::fs::read(&state_path).await {
@@ -209,6 +249,412 @@ pub async fn attach_supplemental_media(
         crate::project::atomic_write_json(&state_path, &state).await?;
     }
     crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
+}
+
+/// Binds a selection of videos/photos to the same weak interval. Every file is
+/// validated before project metadata is changed, so a bad selection cannot
+/// leave a partial set of candidate media behind.
+#[tauri::command]
+pub async fn attach_supplemental_media_batch(
+    project_id: String,
+    weak_interval_index: u64,
+    paths: Vec<String>,
+) -> std::result::Result<crate::pipeline::runner::SupplementDiagnostics, SplatError> {
+    if paths.is_empty() {
+        return Err(SplatError::Process("未选择补充素材文件".into()));
+    }
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let diagnostics =
+        crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await?;
+    if usize::try_from(weak_interval_index)
+        .ok()
+        .map_or(true, |index| index >= diagnostics.weak_intervals.len())
+    {
+        return Err(SplatError::Process("补充素材未绑定到有效弱区".into()));
+    }
+
+    let mut incoming = Vec::with_capacity(paths.len());
+    let mut seen_paths = HashSet::new();
+    for path in paths {
+        let input = PathBuf::from(path);
+        let file_metadata = tokio::fs::metadata(&input).await.map_err(|_| {
+            SplatError::Process(format!("补充素材文件不存在或无法读取：{}", input.display()))
+        })?;
+        if !file_metadata.is_file() || file_metadata.len() == 0 {
+            return Err(SplatError::Process(format!(
+                "补充素材必须是非空的普通文件：{}",
+                input.display()
+            )));
+        }
+        let extension = input
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| {
+                SplatError::Process(format!(
+                    "补充素材缺少受支持的文件扩展名：{}",
+                    input.display()
+                ))
+            })?;
+        let kind = match extension.as_str() {
+            "mp4" | "mov" => crate::pipeline::SupplementalMediaKind::Video,
+            "jpg" | "jpeg" | "png" => crate::pipeline::SupplementalMediaKind::Photo,
+            _ => {
+                return Err(SplatError::Process(format!(
+                    "补充素材仅支持 MP4、MOV、JPG、JPEG 或 PNG：{}",
+                    input.display()
+                )))
+            }
+        };
+        let canonical = tokio::task::spawn_blocking(move || input.canonicalize())
+            .await
+            .map_err(|error| SplatError::Process(format!("无法解析补充素材路径：{error}")))??;
+        if seen_paths.insert(canonical.clone()) {
+            incoming.push(crate::pipeline::SupplementalMedia {
+                path: canonical,
+                kind,
+                weak_interval_index,
+                validation_status: crate::pipeline::SupplementalValidationStatus::Pending,
+                validation_reason: None,
+            });
+        }
+    }
+    if incoming.is_empty() {
+        return Err(SplatError::Process("未选择有效的补充素材文件".into()));
+    }
+
+    let metadata_path = project.project_path.join("project.json");
+    let mut project_metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+    for media in &incoming {
+        project_metadata.supplemental_media.retain(|existing| {
+            !(existing.weak_interval_index == weak_interval_index && existing.path == media.path)
+        });
+    }
+    project_metadata.supplemental_media.extend(incoming);
+    crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
+    let state_path = project.project_path.join("state.json");
+    if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
+        state.supplemental_media = project_metadata.supplemental_media.clone();
+        crate::project::atomic_write_json(&state_path, &state).await?;
+    }
+    crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
+}
+
+/// Removes only the project's supplemental-media reference. The user's source
+/// video/photo is never deleted or moved.
+#[tauri::command]
+pub async fn detach_supplemental_media(
+    project_id: String,
+    weak_interval_index: u64,
+    path: String,
+) -> std::result::Result<crate::pipeline::runner::SupplementDiagnostics, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let metadata_path = project.project_path.join("project.json");
+    let mut project_metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+    let requested_path = PathBuf::from(path);
+    let legacy_ordinal = project_metadata
+        .supplemental_media
+        .iter()
+        .filter(|media| media.weak_interval_index == weak_interval_index)
+        .position(|media| media.path == requested_path);
+    let count_before = project_metadata.supplemental_media.len();
+    project_metadata.supplemental_media.retain(|media| {
+        !(media.weak_interval_index == weak_interval_index && media.path == requested_path)
+    });
+    if project_metadata.supplemental_media.len() == count_before {
+        return Err(SplatError::Process("该候补素材绑定不存在或已被移除".into()));
+    }
+    clear_validation_cache(&project.project_path, &requested_path, legacy_ordinal).await?;
+    crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
+    let state_path = project.project_path.join("state.json");
+    if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
+        state.supplemental_media = project_metadata.supplemental_media.clone();
+        crate::project::atomic_write_json(&state_path, &state).await?;
+    }
+    crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
+}
+
+/// Performs only a bounded proxy/geometry check. It never starts COLMAP and
+/// never changes the original reconstruction attempt.
+#[tauri::command]
+pub async fn validate_supplemental_media(
+    app: tauri::AppHandle,
+    project_id: String,
+    weak_interval_index: u64,
+) -> std::result::Result<crate::pipeline::runner::SupplementDiagnostics, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let diagnostics =
+        crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await?;
+    let interval = diagnostics
+        .weak_intervals
+        .get(
+            usize::try_from(weak_interval_index)
+                .map_err(|_| SplatError::Process("补充素材弱区编号无效".into()))?,
+        )
+        .ok_or_else(|| SplatError::Process("补充素材未绑定到有效弱区".into()))?;
+    let metadata_path = project.project_path.join("project.json");
+    let mut metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+    let targets = metadata
+        .supplemental_media
+        .iter()
+        .enumerate()
+        .filter(|(_, media)| media.weak_interval_index == weak_interval_index)
+        .map(|(index, media)| (index, media.path.clone(), media.kind))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(SplatError::Process("该弱区尚未绑定候补素材".into()));
+    }
+    let before = interval
+        .before_anchor
+        .as_ref()
+        .ok_or_else(|| SplatError::Process("该弱区位于视频开头，缺少可用于验证的前锚点".into()))?;
+    let reference_before = read_validation_image(
+        &project
+            .project_path
+            .join("frames")
+            .join(&before.output_file),
+    )
+    .await?;
+    let reference_after_path = interval
+        .after_anchor
+        .as_ref()
+        .map(|anchor| &anchor.output_file)
+        .unwrap_or(&interval.first_output_file);
+    let reference_after = read_validation_image(
+        &project
+            .project_path
+            .join("frames")
+            .join(reference_after_path),
+    )
+    .await?;
+    let profile = AdaptiveFrameProfile::for_quality(metadata.quality, 30.0)
+        .ok_or_else(|| SplatError::Process("快速档不支持 SfM 补充素材几何验证".into()))?;
+    let engines = paths_for_app(&app);
+    let manager = crate::process::ProcessManager::new();
+    let mut reports = Vec::with_capacity(targets.len());
+    for (ordinal, (metadata_index, path, kind)) in targets.into_iter().enumerate() {
+        let images = match validation_candidate_images(
+            &engines,
+            &manager,
+            &project.project_path,
+            ordinal,
+            &path,
+            kind,
+        )
+        .await
+        {
+            Ok(images) => images,
+            Err(error) => {
+                metadata.supplemental_media[metadata_index].validation_status =
+                    crate::pipeline::SupplementalValidationStatus::Failed;
+                metadata.supplemental_media[metadata_index].validation_reason =
+                    Some(format!("无法读取候补素材：{error}"));
+                reports.push(serde_json::json!({"path": path, "status": "failed", "reason": metadata.supplemental_media[metadata_index].validation_reason}));
+                continue;
+            }
+        };
+        let mut best: Option<(u32, f64, u32, String)> = None;
+        for image in images {
+            let samples = [
+                SourceFrameTimestamp {
+                    source_index: 0,
+                    pts_seconds: 0.0,
+                },
+                SourceFrameTimestamp {
+                    source_index: 1,
+                    pts_seconds: 1.0,
+                },
+                SourceFrameTimestamp {
+                    source_index: 2,
+                    pts_seconds: 2.0,
+                },
+            ];
+            let analysis = analyze_proxy_images(
+                &samples,
+                &[reference_before.clone(), image, reference_after.clone()],
+            )?;
+            let left = &analysis[1];
+            let right = &analysis[2];
+            let inliers = left.inliers.min(right.inliers);
+            let coverage = left.grid_coverage.min(right.grid_coverage);
+            let tracks = right.three_view_tracks;
+            let reason = if left.textured_cells < profile.min_textured_cells
+                || right.textured_cells < profile.min_textured_cells
+            {
+                "候补画面清晰度或纹理不足".to_string()
+            } else if left.matched_cells < profile.min_matched_cells
+                || right.matched_cells < profile.min_matched_cells
+                || inliers < profile.min_inliers_floor
+            {
+                "与原场景重叠不足".to_string()
+            } else if tracks < profile.min_three_view_floor {
+                "视差不足，未形成稳定三视图连通".to_string()
+            } else {
+                "已通过低成本重叠与视差验证".to_string()
+            };
+            let candidate = (inliers, coverage, tracks, reason);
+            if best.as_ref().map_or(true, |current| {
+                (candidate.0, candidate.2, candidate.1) > (current.0, current.2, current.1)
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let (inliers, coverage, tracks, reason) =
+            best.ok_or_else(|| SplatError::Process("候补视频未能生成代理画面".into()))?;
+        let passed = reason == "已通过低成本重叠与视差验证";
+        metadata.supplemental_media[metadata_index].validation_status = if passed {
+            crate::pipeline::SupplementalValidationStatus::Passed
+        } else {
+            crate::pipeline::SupplementalValidationStatus::Failed
+        };
+        metadata.supplemental_media[metadata_index].validation_reason = Some(reason.clone());
+        reports.push(serde_json::json!({"path": path, "status": if passed { "passed" } else { "failed" }, "reason": reason, "inliers": inliers, "gridCoverage": coverage, "threeViewTracks": tracks}));
+    }
+    crate::project::atomic_write_json(&metadata_path, &metadata).await?;
+    let state_path = project.project_path.join("state.json");
+    if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
+        state.supplemental_media = metadata.supplemental_media.clone();
+        crate::project::atomic_write_json(&state_path, &state).await?;
+    }
+    let log_path = project.project_path.join("logs").join(format!(
+        "supplement-validation-weak-{}.json",
+        weak_interval_index + 1
+    ));
+    crate::project::atomic_write_json(&log_path, &serde_json::json!({"weakIntervalIndex": weak_interval_index, "afterAnchorAvailable": interval.after_anchor.is_some(), "results": reports})).await?;
+    crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
+}
+
+async fn read_validation_image(
+    path: &Path,
+) -> std::result::Result<image::DynamicImage, SplatError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        image::ImageReader::open(&path)
+            .map_err(|error| {
+                SplatError::Process(format!("无法打开验证图像 {}：{error}", path.display()))
+            })?
+            .decode()
+            .map_err(|error| {
+                SplatError::Process(format!("无法解码验证图像 {}：{error}", path.display()))
+            })
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("读取验证图像任务异常结束：{error}")))?
+}
+
+async fn validation_candidate_images(
+    engines: &EnginePaths,
+    manager: &crate::process::ProcessManager,
+    project: &Path,
+    ordinal: usize,
+    path: &Path,
+    kind: crate::pipeline::SupplementalMediaKind,
+) -> std::result::Result<Vec<image::DynamicImage>, SplatError> {
+    if kind == crate::pipeline::SupplementalMediaKind::Photo {
+        return Ok(vec![read_validation_image(path).await?]);
+    }
+    let video = probe_video(
+        &engines.ffprobe,
+        path,
+        Some(project.join("logs").join("supplement-validation.log")),
+    )
+    .await?;
+    let sample_fps = (3.0 / video.duration.max(3.0)).clamp(0.1, 1.0);
+    let output = validation_cache_path(project, path);
+    clear_validation_cache(project, path, Some(ordinal)).await?;
+    let work = output.join("work");
+    let report = ffmpeg::extract_proxy_frames(
+        &engines.ffmpeg,
+        path,
+        &output,
+        &work,
+        video.width,
+        video.height,
+        sample_fps,
+        Some(project.join("logs").join("supplement-validation.log")),
+        manager,
+        None,
+    )
+    .await?;
+    let mut images = Vec::with_capacity(report.frames.len());
+    for index in 1..=report.frames.len() {
+        images.push(read_validation_image(&output.join(format!("proxy_{index:06}.jpg"))).await?);
+    }
+    Ok(images)
+}
+
+fn validation_cache_path(project: &Path, path: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    project
+        .join("work")
+        .join("supplement-validation")
+        .join(format!("media-{:016x}", hasher.finish()))
+}
+
+/// Deletes only disposable, project-owned validation proxies. The legacy
+/// ordinal directory is also removed while migrating projects created before
+/// validation cache directories had a stable media key.
+async fn clear_validation_cache(
+    project: &Path,
+    path: &Path,
+    legacy_ordinal: Option<usize>,
+) -> std::result::Result<(), SplatError> {
+    let root = project.join("work").join("supplement-validation");
+    let stable = validation_cache_path(project, path);
+    let mut directories = vec![stable];
+    if let Some(ordinal) = legacy_ordinal {
+        directories.push(root.join(format!("media-{ordinal:03}")));
+    }
+    for directory in directories {
+        if tokio::fs::try_exists(&directory).await? {
+            tokio::fs::remove_dir_all(&directory)
+                .await
+                .map_err(|error| {
+                    SplatError::Process(format!(
+                        "无法清理候补素材验证缓存 {}：{error}",
+                        directory.display()
+                    ))
+                })?;
+        }
+    }
+    Ok(())
 }
 #[tauri::command]
 pub async fn set_projects_root(
@@ -401,17 +847,34 @@ pub async fn start_splatcam_pipeline(
         settings.photometric_mode,
         settings.training_backend,
         false,
-        move |event| { let _ = emitter.emit("pipeline-event", event); },
+        move |event| {
+            let _ = emitter.emit("pipeline-event", event);
+        },
     ));
     {
         let mut active = state.active.lock().await;
-        if active.is_some() { return Err(SplatError::Process("已有任务正在运行".into())); }
+        if active.is_some() {
+            return Err(SplatError::Process("已有任务正在运行".into()));
+        }
         *active = Some(runner.clone());
     }
-    let result = runner.generate_splatcam(PathBuf::from(path).as_path(), quality, PathBuf::from(projects_root).as_path()).await;
+    let result = runner
+        .generate_splatcam(
+            PathBuf::from(path).as_path(),
+            quality,
+            PathBuf::from(projects_root).as_path(),
+        )
+        .await;
     if let Err(error) = &result {
-        let stage = if matches!(error, SplatError::Cancelled) { crate::pipeline::PipelineStage::Cancelled } else { crate::pipeline::PipelineStage::Failed };
-        let _ = app.emit("pipeline-event", crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()));
+        let stage = if matches!(error, SplatError::Cancelled) {
+            crate::pipeline::PipelineStage::Cancelled
+        } else {
+            crate::pipeline::PipelineStage::Failed
+        };
+        let _ = app.emit(
+            "pipeline-event",
+            crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()),
+        );
     }
     *state.active.lock().await = None;
     result
@@ -485,7 +948,9 @@ pub async fn set_floater_pruning(enabled: bool) -> Result<AppSettings> {
     catalog::save_floater_pruning(enabled).await
 }
 #[tauri::command]
-pub async fn set_photometric_mode(mode: crate::engines::training::PhotometricMode) -> Result<AppSettings> {
+pub async fn set_photometric_mode(
+    mode: crate::engines::training::PhotometricMode,
+) -> Result<AppSettings> {
     catalog::save_photometric_mode(mode).await
 }
 #[tauri::command]

@@ -28,7 +28,8 @@ const PATCH_RADIUS: i32 = 2;
 const PYRAMID_LEVELS: usize = 3;
 const COARSE_SEARCH_RADIUS: i32 = 6;
 const REFINE_SEARCH_RADIUS: i32 = 2;
-const MAX_FULL_SEARCH_RADIUS: i32 = COARSE_SEARCH_RADIUS * 4 + REFINE_SEARCH_RADIUS * 2 + REFINE_SEARCH_RADIUS;
+const MAX_FULL_SEARCH_RADIUS: i32 =
+    COARSE_SEARCH_RADIUS * 4 + REFINE_SEARCH_RADIUS * 2 + REFINE_SEARCH_RADIUS;
 const MIN_PATCH_TEXTURE: f64 = 18.0;
 const MAX_MATCH_ERROR: f64 = 32.0;
 const INLIER_RESIDUAL: f64 = 2.5;
@@ -190,24 +191,35 @@ where
 {
     if samples.len() != images.len() {
         return Err(crate::error::SplatError::Process(format!(
-            "代理时间戳与图像数量不一致：{} / {}", samples.len(), images.len()
+            "代理时间戳与图像数量不一致：{} / {}",
+            samples.len(),
+            images.len()
         )));
     }
     if pyramids.len() != images.len() || pyramids.iter().any(|pyramid| pyramid.is_empty()) {
         return Err(crate::error::SplatError::Process(format!(
             "代理跟踪金字塔与图像数量不一致：{} / {}",
-            pyramids.len(), images.len()
+            pyramids.len(),
+            images.len()
         )));
     }
     let mut result = Vec::with_capacity(samples.len());
     let mut previous_inliers = vec![false; (GRID_COLUMNS * GRID_ROWS) as usize];
     for (index, (sample, image)) in samples.iter().zip(images.iter()).enumerate() {
-        let (motion, textured_cells, matched_cells, inliers, coverage, three_view_tracks, confirmed_scene_change, current_inliers) =
-            if index == 0 {
-                (0.0, 0, 0, 0, 0.0, 0, false, previous_inliers.clone())
-            } else {
-                measure_background_motion(&pyramids[index - 1], &pyramids[index], &previous_inliers)
-            };
+        let (
+            motion,
+            textured_cells,
+            matched_cells,
+            inliers,
+            coverage,
+            three_view_tracks,
+            confirmed_scene_change,
+            current_inliers,
+        ) = if index == 0 {
+            (0.0, 0, 0, 0, 0.0, 0, false, previous_inliers.clone())
+        } else {
+            measure_background_motion(&pyramids[index - 1], &pyramids[index], &previous_inliers)
+        };
         previous_inliers = current_inliers;
         result.push(ProxyFrame {
             source_index: sample.source_index,
@@ -228,7 +240,9 @@ where
 }
 
 fn to_tracking_gray(image: &DynamicImage) -> GrayImage {
-    image.resize_exact(TRACK_WIDTH, TRACK_HEIGHT, FilterType::Triangle).to_luma8()
+    image
+        .resize_exact(TRACK_WIDTH, TRACK_HEIGHT, FilterType::Triangle)
+        .to_luma8()
 }
 
 fn measure_background_motion(
@@ -242,21 +256,38 @@ fn measure_background_motion(
     // Each grid cell is read-only with respect to both pyramids. Parallelize
     // this expensive patch search, then restore the stable grid order before
     // median/inlier reduction so results stay deterministic.
-    let probes = positions.par_iter().copied().enumerate().map(|(index, (x, y))| {
-        let textured = patch_texture(previous, x, y) >= MIN_PATCH_TEXTURE;
-        let matched = textured
-            .then(|| best_patch_match_pyramid(previous_pyramid, current_pyramid, x, y))
-            .flatten()
-            .filter(|(_, _, error)| *error <= MAX_MATCH_ERROR)
-            .map(|(dx, dy, _)| (index, dx, dy));
-        (textured, matched)
-    }).collect::<Vec<_>>();
+    let probes = positions
+        .par_iter()
+        .copied()
+        .enumerate()
+        .map(|(index, (x, y))| {
+            let textured = patch_texture(previous, x, y) >= MIN_PATCH_TEXTURE;
+            let matched = textured
+                .then(|| best_patch_match_pyramid(previous_pyramid, current_pyramid, x, y))
+                .flatten()
+                .filter(|(_, _, error)| *error <= MAX_MATCH_ERROR)
+                .map(|(dx, dy, _)| (index, dx, dy));
+            (textured, matched)
+        })
+        .collect::<Vec<_>>();
     let textured_cells = probes.iter().filter(|(textured, _)| *textured).count() as u32;
-    let mut matches = probes.into_iter().filter_map(|(_, matched)| matched).collect::<Vec<_>>();
+    let mut matches = probes
+        .into_iter()
+        .filter_map(|(_, matched)| matched)
+        .collect::<Vec<_>>();
     matches.sort_by_key(|(index, _, _)| *index);
     let mut current_inliers = vec![false; positions.len()];
     if matches.is_empty() {
-        return (0.0, textured_cells, 0, 0, 0.0, 0, scene_cut(previous, current, 0), current_inliers);
+        return (
+            0.0,
+            textured_cells,
+            0,
+            0,
+            0.0,
+            0,
+            scene_cut(previous, current, 0),
+            current_inliers,
+        );
     }
     let matched_cells = matches.len() as u32;
     let median_dx = median(matches.iter().map(|(_, dx, _)| *dx).collect());
@@ -276,18 +307,33 @@ fn measure_background_motion(
     let motion = (median_dx.powi(2) + median_dy.powi(2)).sqrt() / diagonal;
     let coverage = inlier_count as f64 / positions.len() as f64;
     let confirmed_scene_change = scene_cut(previous, current, inlier_count);
-    (motion, textured_cells, matched_cells, inlier_count, coverage, three_view_tracks, confirmed_scene_change, current_inliers)
+    (
+        motion,
+        textured_cells,
+        matched_cells,
+        inlier_count,
+        coverage,
+        three_view_tracks,
+        confirmed_scene_change,
+        current_inliers,
+    )
 }
 
 fn grid_positions() -> Vec<(i32, i32)> {
     let x_margin = MAX_FULL_SEARCH_RADIUS + PATCH_RADIUS + 1;
     let y_margin = MAX_FULL_SEARCH_RADIUS + PATCH_RADIUS + 1;
     (0..GRID_ROWS)
-        .flat_map(|row| (0..GRID_COLUMNS).map(move |column| {
-            let x = x_margin + (column as i32 * (TRACK_WIDTH as i32 - 2 * x_margin - 1)) / (GRID_COLUMNS as i32 - 1);
-            let y = y_margin + (row as i32 * (TRACK_HEIGHT as i32 - 2 * y_margin - 1)) / (GRID_ROWS as i32 - 1);
-            (x, y)
-        }))
+        .flat_map(|row| {
+            (0..GRID_COLUMNS).map(move |column| {
+                let x = x_margin
+                    + (column as i32 * (TRACK_WIDTH as i32 - 2 * x_margin - 1))
+                        / (GRID_COLUMNS as i32 - 1);
+                let y = y_margin
+                    + (row as i32 * (TRACK_HEIGHT as i32 - 2 * y_margin - 1))
+                        / (GRID_ROWS as i32 - 1);
+                (x, y)
+            })
+        })
         .collect()
 }
 
@@ -355,7 +401,11 @@ fn best_patch_match_pyramid(
         displacement = (dx, dy);
         final_error = error;
     }
-    Some((f64::from(displacement.0), f64::from(displacement.1), final_error))
+    Some((
+        f64::from(displacement.0),
+        f64::from(displacement.1),
+        final_error,
+    ))
 }
 
 fn best_patch_match_near(
@@ -376,8 +426,12 @@ fn best_patch_match_near(
             let mut count = 0.0;
             for patch_y in -PATCH_RADIUS..=PATCH_RADIUS {
                 for patch_x in -PATCH_RADIUS..=PATCH_RADIUS {
-                    let a = f64::from(previous.get_pixel((x + patch_x) as u32, (y + patch_y) as u32)[0]);
-                    let b = f64::from(current.get_pixel((x + dx + patch_x) as u32, (y + dy + patch_y) as u32)[0]);
+                    let a = f64::from(
+                        previous.get_pixel((x + patch_x) as u32, (y + patch_y) as u32)[0],
+                    );
+                    let b = f64::from(
+                        current.get_pixel((x + dx + patch_x) as u32, (y + dy + patch_y) as u32)[0],
+                    );
                     error += (a - b).abs();
                     count += 1.0;
                 }
@@ -404,9 +458,12 @@ fn median(mut values: Vec<f64>) -> f64 {
 }
 
 fn scene_cut(previous: &GrayImage, current: &GrayImage, inliers: u32) -> bool {
-    let mean_difference = previous.pixels().zip(current.pixels())
+    let mean_difference = previous
+        .pixels()
+        .zip(current.pixels())
         .map(|(left, right)| (f64::from(left[0]) - f64::from(right[0])).abs())
-        .sum::<f64>() / f64::from(TRACK_WIDTH * TRACK_HEIGHT);
+        .sum::<f64>()
+        / f64::from(TRACK_WIDTH * TRACK_HEIGHT);
     mean_difference >= 40.0 && inliers < (GRID_COLUMNS * GRID_ROWS) / 5
 }
 
@@ -439,7 +496,9 @@ pub fn adaptive_plan(video: &VideoInfo, quality: Quality) -> Option<FramePlan> {
     let source_fps = if video.fps > 0.0 { video.fps } else { 30.0 };
     Some(FramePlan {
         sampling_fps: profile.anchor_fps,
-        estimated_frames: (video.duration.max(0.0) * profile.anchor_fps).round().max(1.0) as u64,
+        estimated_frames: (video.duration.max(0.0) * profile.anchor_fps)
+            .round()
+            .max(1.0) as u64,
         source_fps,
         source_duration: video.duration,
         strategy: FrameSelectionStrategyKind::AdaptiveSfm,
@@ -521,11 +580,19 @@ fn select_segment(
         let low_motion_duplicate = hamming_distance(frame.phash, last_selected.phash) <= 8
             && accumulated_motion < profile.target_motion * 0.5;
         if geometry_ok && !low_motion_duplicate && accumulated_motion >= profile.target_motion {
-            selected.push(selection(frame, SelectionReason::MotionTarget, accumulated_motion));
+            selected.push(selection(
+                frame,
+                SelectionReason::MotionTarget,
+                accumulated_motion,
+            ));
             last_selected = frame;
             accumulated_motion = 0.0;
         } else if geometry_ok && accumulated_motion >= profile.max_motion {
-            selected.push(selection(frame, SelectionReason::Bridge, accumulated_motion));
+            selected.push(selection(
+                frame,
+                SelectionReason::Bridge,
+                accumulated_motion,
+            ));
             last_selected = frame;
             accumulated_motion = 0.0;
         }
@@ -534,9 +601,14 @@ fn select_segment(
     if let Some(last) = segment.last() {
         if last.source_index != last_selected.source_index
             && passes_proxy_geometry(last, profile)
-            && (last.pts_seconds - last_selected.pts_seconds) * 1000.0 >= profile.min_interval_ms as f64
+            && (last.pts_seconds - last_selected.pts_seconds) * 1000.0
+                >= profile.min_interval_ms as f64
         {
-            selected.push(selection(last, SelectionReason::SegmentEnd, accumulated_motion));
+            selected.push(selection(
+                last,
+                SelectionReason::SegmentEnd,
+                accumulated_motion,
+            ));
         }
     }
 }
@@ -577,17 +649,55 @@ mod tests {
     use image::{ImageBuffer, Luma};
 
     fn profile() -> AdaptiveFrameProfile {
-        AdaptiveFrameProfile { anchor_fps: 2.0, analysis_fps: 6.0, local_refine_fps: 12.0, target_motion: 0.035, max_motion: 0.08, min_interval_ms: 120, min_textured_cells: 12, min_matched_cells: 8, min_inliers_floor: 6, min_inlier_ratio: 0.45, min_three_view_floor: 3, min_three_view_ratio: 0.35 }
+        AdaptiveFrameProfile {
+            anchor_fps: 2.0,
+            analysis_fps: 6.0,
+            local_refine_fps: 12.0,
+            target_motion: 0.035,
+            max_motion: 0.08,
+            min_interval_ms: 120,
+            min_textured_cells: 12,
+            min_matched_cells: 8,
+            min_inliers_floor: 6,
+            min_inlier_ratio: 0.45,
+            min_three_view_floor: 3,
+            min_three_view_ratio: 0.35,
+        }
     }
 
     fn frame(index: u64, pts: f64, motion: f64) -> ProxyFrame {
-        ProxyFrame { source_index: index, pts_seconds: pts, phash: index, sharpness: 1.0, textured_cells: 100, matched_cells: 100, background_motion: motion, inliers: 80, grid_coverage: 0.5, three_view_tracks: 70, confirmed_scene_change: false }
+        ProxyFrame {
+            source_index: index,
+            pts_seconds: pts,
+            phash: index,
+            sharpness: 1.0,
+            textured_cells: 100,
+            matched_cells: 100,
+            background_motion: motion,
+            inliers: 80,
+            grid_coverage: 0.5,
+            three_view_tracks: 70,
+            confirmed_scene_change: false,
+        }
     }
 
     #[test]
     fn uses_pts_not_nominal_source_fps_and_keeps_indices_monotonic() {
-        let result = select_adaptive_frames(&[frame(60, 1.0, 0.0), frame(120, 2.0, 0.04), frame(90, 1.5, 0.04)], profile());
-        assert_eq!(result.iter().map(|item| item.source_index).collect::<Vec<_>>(), vec![60, 90, 120]);
+        let result = select_adaptive_frames(
+            &[
+                frame(60, 1.0, 0.0),
+                frame(120, 2.0, 0.04),
+                frame(90, 1.5, 0.04),
+            ],
+            profile(),
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|item| item.source_index)
+                .collect::<Vec<_>>(),
+            vec![60, 90, 120]
+        );
     }
 
     #[test]
@@ -601,7 +711,11 @@ mod tests {
     #[test]
     fn static_similar_window_does_not_fill_frames() {
         let mut frames = vec![frame(1, 0.0, 0.0)];
-        for index in 2..20 { let mut item = frame(index, index as f64 * 0.2, 0.001); item.phash = 1; frames.push(item); }
+        for index in 2..20 {
+            let mut item = frame(index, index as f64 * 0.2, 0.001);
+            item.phash = 1;
+            frames.push(item);
+        }
         let result = select_adaptive_frames(&frames, profile());
         assert_eq!(result.len(), 2, "only segment endpoints are retained");
     }
@@ -610,19 +724,48 @@ mod tests {
     fn confirmed_cut_creates_independent_segments() {
         let mut cut = frame(3, 1.0, 0.04);
         cut.confirmed_scene_change = true;
-        let result = select_adaptive_frames(&[frame(1, 0.0, 0.0), frame(2, 0.5, 0.04), cut, frame(4, 1.5, 0.04)], profile());
-        assert_eq!(result.iter().filter(|item| item.reason == SelectionReason::SegmentStart).count(), 2);
+        let result = select_adaptive_frames(
+            &[
+                frame(1, 0.0, 0.0),
+                frame(2, 0.5, 0.04),
+                cut,
+                frame(4, 1.5, 0.04),
+            ],
+            profile(),
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|item| item.reason == SelectionReason::SegmentStart)
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn proxy_sampling_follows_vfr_pts_not_frame_number() {
         let source = [
-            SourceFrameTimestamp { source_index: 0, pts_seconds: 0.0 },
-            SourceFrameTimestamp { source_index: 1, pts_seconds: 0.03 },
-            SourceFrameTimestamp { source_index: 2, pts_seconds: 0.51 },
-            SourceFrameTimestamp { source_index: 3, pts_seconds: 0.99 },
+            SourceFrameTimestamp {
+                source_index: 0,
+                pts_seconds: 0.0,
+            },
+            SourceFrameTimestamp {
+                source_index: 1,
+                pts_seconds: 0.03,
+            },
+            SourceFrameTimestamp {
+                source_index: 2,
+                pts_seconds: 0.51,
+            },
+            SourceFrameTimestamp {
+                source_index: 3,
+                pts_seconds: 0.99,
+            },
         ];
-        assert_eq!(choose_proxy_samples(&source, 2.0), vec![source[0], source[2]]);
+        assert_eq!(
+            choose_proxy_samples(&source, 2.0),
+            vec![source[0], source[2]]
+        );
     }
 
     #[test]
@@ -630,8 +773,14 @@ mod tests {
         let black = DynamicImage::ImageLuma8(ImageBuffer::from_pixel(160, 120, Luma([0])));
         let white = DynamicImage::ImageLuma8(ImageBuffer::from_pixel(160, 120, Luma([255])));
         let samples = [
-            SourceFrameTimestamp { source_index: 7, pts_seconds: 0.4 },
-            SourceFrameTimestamp { source_index: 43, pts_seconds: 1.2 },
+            SourceFrameTimestamp {
+                source_index: 7,
+                pts_seconds: 0.4,
+            },
+            SourceFrameTimestamp {
+                source_index: 43,
+                pts_seconds: 1.2,
+            },
         ];
         let result = analyze_proxy_images(&samples, &[black, white]).unwrap();
         assert_eq!(result[1].source_index, 43);
@@ -652,7 +801,8 @@ mod tests {
         let mut previous = GrayImage::new(TRACK_WIDTH, TRACK_HEIGHT);
         for y in 0..TRACK_HEIGHT {
             for x in 0..TRACK_WIDTH {
-                let value = ((x.wrapping_mul(73) ^ y.wrapping_mul(151) ^ x.wrapping_mul(y)) & 0xff) as u8;
+                let value =
+                    ((x.wrapping_mul(73) ^ y.wrapping_mul(151) ^ x.wrapping_mul(y)) & 0xff) as u8;
                 previous.put_pixel(x, y, Luma([value]));
             }
         }
@@ -664,11 +814,17 @@ mod tests {
             }
         }
 
-        let (motion, textured, matched, inliers, _, _, _, _) =
-            measure_background_motion(&tracking_pyramid(&previous), &tracking_pyramid(&current), &vec![false; (GRID_COLUMNS * GRID_ROWS) as usize]);
+        let (motion, textured, matched, inliers, _, _, _, _) = measure_background_motion(
+            &tracking_pyramid(&previous),
+            &tracking_pyramid(&current),
+            &vec![false; (GRID_COLUMNS * GRID_ROWS) as usize],
+        );
         assert!(textured >= 12);
         assert!(matched >= 8);
         assert!(inliers >= 6);
-        assert!(motion > 0.04, "expected 20 px / 400 px diagonal, got {motion}");
+        assert!(
+            motion > 0.04,
+            "expected 20 px / 400 px diagonal, got {motion}"
+        );
     }
 }

@@ -48,26 +48,33 @@ pub async fn probe_frame_timestamps(
     if !input.is_file() {
         return Err(SplatError::InvalidPath(input.to_path_buf()));
     }
-    let output = process_manager.run(ProcessSpec {
-        executable: executable.to_path_buf(),
-        args: vec![
-            OsString::from("-v"), OsString::from("error"),
-            OsString::from("-select_streams"), OsString::from("v:0"),
-            OsString::from("-show_frames"),
-            OsString::from("-show_entries"),
-            OsString::from("frame=best_effort_timestamp_time"),
-            OsString::from("-of"), OsString::from("csv=p=0"),
-            input.as_os_str().to_owned(),
-        ],
-        working_directory: input.parent().map(Path::to_path_buf),
-        log_path,
-        observer,
-    }).await?;
+    let output = process_manager
+        .run(ProcessSpec {
+            executable: executable.to_path_buf(),
+            args: vec![
+                OsString::from("-v"),
+                OsString::from("error"),
+                OsString::from("-select_streams"),
+                OsString::from("v:0"),
+                OsString::from("-show_frames"),
+                OsString::from("-show_entries"),
+                OsString::from("frame=best_effort_timestamp_time"),
+                OsString::from("-of"),
+                OsString::from("csv=p=0"),
+                input.as_os_str().to_owned(),
+            ],
+            working_directory: input.parent().map(Path::to_path_buf),
+            log_path,
+            observer,
+        })
+        .await?;
     if output.cancelled {
         return Err(SplatError::Cancelled);
     }
     if !output.success {
-        return Err(SplatError::InvalidVideo("FFprobe 无法读取帧级时间戳".into()));
+        return Err(SplatError::InvalidVideo(
+            "FFprobe 无法读取帧级时间戳".into(),
+        ));
     }
     parse_frame_timestamp_lines(&output.stdout)
 }

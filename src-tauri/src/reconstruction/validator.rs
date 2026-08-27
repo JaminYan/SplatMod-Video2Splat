@@ -276,6 +276,9 @@ mod tests {
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&points.to_le_bytes());
-        bytes.extend(std::iter::repeat_n(0u8, usize::try_from(points * 24).unwrap()));
+        bytes.extend(std::iter::repeat_n(
+            0u8,
+            usize::try_from(points * 24).unwrap(),
+        ));
     }
 }

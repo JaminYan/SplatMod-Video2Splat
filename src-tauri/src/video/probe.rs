@@ -170,27 +170,45 @@ mod tests {
 
     #[test]
     fn parses_vfr_timestamps_without_using_average_fps() {
-        let frames = parse_frame_timestamps(r#"{"frames":[
+        let frames = parse_frame_timestamps(
+            r#"{"frames":[
             {"media_type":"video","best_effort_timestamp_time":"0.000000"},
             {"media_type":"video","best_effort_timestamp_time":"0.033367"},
             {"media_type":"video","best_effort_timestamp_time":"0.101000"}
-        ]}"#).unwrap();
-        assert_eq!(frames[2], SourceFrameTimestamp { source_index: 2, pts_seconds: 0.101 });
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frames[2],
+            SourceFrameTimestamp {
+                source_index: 2,
+                pts_seconds: 0.101
+            }
+        );
     }
 
     #[test]
     fn rejects_non_monotonic_frame_pts() {
-        let error = parse_frame_timestamps(r#"{"frames":[
+        let error = parse_frame_timestamps(
+            r#"{"frames":[
             {"media_type":"video","best_effort_timestamp_time":"1.0"},
             {"media_type":"video","best_effort_timestamp_time":"0.9"}
-        ]}"#).unwrap_err();
+        ]}"#,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("单调递增"));
     }
 
     #[test]
     fn parses_compact_csv_timestamps_without_json_overhead() {
         let frames = parse_frame_timestamp_lines("0.000000\n0.033367\n0.101000\n").unwrap();
-        assert_eq!(frames[2], SourceFrameTimestamp { source_index: 2, pts_seconds: 0.101 });
+        assert_eq!(
+            frames[2],
+            SourceFrameTimestamp {
+                source_index: 2,
+                pts_seconds: 0.101
+            }
+        );
     }
 }
 
@@ -241,10 +259,16 @@ pub fn parse_frame_timestamp_lines(payload: &str) -> Result<Vec<SourceFrameTimes
     let mut last_pts = f64::NEG_INFINITY;
     for (line_number, line) in payload.lines().enumerate() {
         let value = line.trim().split(',').next().unwrap_or_default();
-        let pts_seconds = value.parse::<f64>().ok().filter(|value| value.is_finite())
-            .ok_or_else(|| SplatError::InvalidVideo(format!(
-                "FFprobe 第 {} 个帧时间戳无效：{line}", line_number + 1
-            )))?;
+        let pts_seconds = value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                SplatError::InvalidVideo(format!(
+                    "FFprobe 第 {} 个帧时间戳无效：{line}",
+                    line_number + 1
+                ))
+            })?;
         if pts_seconds + f64::EPSILON < last_pts {
             return Err(SplatError::InvalidVideo(
                 "FFprobe 返回的显示时间戳不是单调递增，无法安全执行自适应抽帧".into(),
@@ -257,7 +281,9 @@ pub fn parse_frame_timestamp_lines(payload: &str) -> Result<Vec<SourceFrameTimes
         last_pts = pts_seconds;
     }
     if timestamps.is_empty() {
-        return Err(SplatError::InvalidVideo("FFprobe 未返回任何视频帧时间戳".into()));
+        return Err(SplatError::InvalidVideo(
+            "FFprobe 未返回任何视频帧时间戳".into(),
+        ));
     }
     Ok(timestamps)
 }

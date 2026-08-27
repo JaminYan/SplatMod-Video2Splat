@@ -212,6 +212,7 @@ pub enum ProjectStatus {
     Failed,
     Cancelled,
     Interrupted,
+    #[serde(rename = "needsSupplement", alias = "needssupplement")]
     NeedsSupplement,
 }
 
@@ -354,6 +355,16 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(restored.stage, PipelineStage::NeedsSupplement);
         assert_eq!(restored.needs_supplement.unwrap().weak_interval_count, 2);
+    }
+
+    #[test]
+    fn needs_supplement_project_status_uses_camel_case_and_reads_legacy_value() {
+        assert_eq!(
+            serde_json::to_string(&ProjectStatus::NeedsSupplement).unwrap(),
+            "\"needsSupplement\""
+        );
+        let legacy: ProjectStatus = serde_json::from_str("\"needssupplement\"").unwrap();
+        assert_eq!(legacy, ProjectStatus::NeedsSupplement);
     }
 
     #[test]

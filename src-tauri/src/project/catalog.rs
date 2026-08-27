@@ -1,7 +1,7 @@
 use crate::{
     engines::{
-        ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, MapperBaMode,
-        GsplatDensificationStrategy, PhotometricMode, TrainingBackend,
+        ColmapBackend, CudaColmapFlavor, EngineStatus, FfmpegHwAccel, GsplatDensificationStrategy,
+        MapperBaMode, PhotometricMode, TrainingBackend,
     },
     error::{Result, SplatError},
     presets::{BrushTrainingPreset, GsplatSplatCap},
@@ -280,8 +280,13 @@ pub async fn save_multi_view_densification_gate(enabled: bool) -> Result<AppSett
 }
 pub async fn save_floater_pruning(enabled: bool) -> Result<AppSettings> {
     let mut settings = load_settings().await?;
-    if enabled && (settings.gsplat_densification_strategy != GsplatDensificationStrategy::Mcmc || settings.multi_view_densification_gate) {
-        return Err(SplatError::Process("保守浮点裁剪仅支持关闭新增点门控的 gsplat MCMC。".into()));
+    if enabled
+        && (settings.gsplat_densification_strategy != GsplatDensificationStrategy::Mcmc
+            || settings.multi_view_densification_gate)
+    {
+        return Err(SplatError::Process(
+            "保守浮点裁剪仅支持关闭新增点门控的 gsplat MCMC。".into(),
+        ));
     }
     settings.floater_pruning = enabled;
     persist(&settings).await?;

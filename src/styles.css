@@ -264,7 +264,13 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .weak-interval-list p { margin: 5px 0 3px; color: var(--text-body); font-size: 11px; }
 .supplement-media-row { margin-top: 9px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .supplement-media-row .secondary-action { min-height: 30px; padding: 6px 9px; font-size: 11px; }
-.supplement-media-row small { overflow: hidden; max-width: 100%; text-overflow: ellipsis; white-space: nowrap; }
+.supplement-media-list { flex: 1 1 280px; max-height: 186px; display: grid; gap: 6px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; }
+.supplement-media-entry { min-width: 0; padding: 7px 8px; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--surface); border: 1px solid var(--line); }
+.supplement-media-entry > span { min-width: 0; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 7px; align-items: baseline; }
+.supplement-media-entry strong { color: var(--text-label); font-size: 10px; }
+.supplement-media-entry small { overflow: hidden; color: var(--muted); font: 10px/1.4 "Cascadia Mono", "Microsoft YaHei UI", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.supplement-media-entry button { flex: 0 0 auto; padding: 4px 0; display: flex; align-items: center; gap: 4px; color: var(--red); background: transparent; border: 0; cursor: pointer; font-size: 10px; }
+.supplement-media-entry button:hover:not(:disabled) { color: var(--text-error); }
 .supplement-next { color: var(--muted); }
 .supplement-dialog-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 24px; background: rgba(23, 32, 51, .42); }
 .supplement-dialog { width: min(860px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow: auto; padding: 20px 22px; color: var(--ink); background: var(--surface-topbar); border: 1px solid var(--line-dark); box-shadow: var(--shadow-drawer); }
@@ -287,10 +293,18 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .weak-interval-copy p { grid-column: 1 / -1; margin: 0; color: var(--text-body); font-size: 12px; }
 .weak-preview-strip { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .weak-preview-strip figure { min-width: 0; margin: 0; background: var(--surface); border: 1px solid var(--line); }
-.weak-preview-strip img { width: 100%; aspect-ratio: 4 / 3; display: block; object-fit: cover; background: var(--surface-control); }
+.weak-preview-strip img { width: 100%; height: 180px; display: block; object-fit: contain; cursor: zoom-in; background: var(--surface-control); }
+.weak-preview-strip figure.unavailable { border-style: dashed; }
+.weak-preview-missing { width: 100%; aspect-ratio: 4 / 3; display: grid; place-items: center; padding: 12px; color: var(--muted); text-align: center; background: var(--surface-control); font-size: 11px; }
 .weak-preview-strip figcaption { padding: 7px 8px; display: flex; justify-content: space-between; gap: 8px; }
 .weak-preview-strip figcaption strong { font-size: 11px; }
 .weak-preview-strip figcaption span { color: var(--muted); font: 10px/1.3 "Cascadia Mono", monospace; }
+.original-preview-backdrop { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 24px; background: rgba(23, 32, 51, .7); }
+.original-preview-dialog { width: min(1180px, 100%); max-height: calc(100vh - 48px); display: grid; grid-template-rows: auto minmax(0, 1fr); padding: 14px; background: var(--surface-topbar); border: 1px solid var(--line-dark); box-shadow: var(--shadow-drawer); }
+.original-preview-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 10px; }
+.original-preview-dialog > header strong { font-size: 13px; }
+.original-preview-dialog > header button { width: 30px; height: 30px; display: grid; place-items: center; color: var(--muted); background: transparent; border: 1px solid var(--line); cursor: pointer; }
+.original-preview-dialog > img { max-width: 100%; max-height: calc(100vh - 120px); justify-self: center; object-fit: contain; }
 .zoom-dock {
   position: fixed;
   right: 18px;

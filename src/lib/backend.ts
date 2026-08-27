@@ -62,16 +62,17 @@ export async function setFfmpegHwAccel(mode: FfmpegHwAccel): Promise<AppSettings
   return invoke("set_ffmpeg_hw_accel", { mode }) as Promise<AppSettingsLike>;
 }
 
-export async function selectSupplementalMedia(): Promise<string | null> {
-  if (!inTauri()) return null;
+export async function selectSupplementalMedia(): Promise<string[]> {
+  if (!inTauri()) return [];
   const selected = await open({
-    multiple: false,
+    multiple: true,
     directory: false,
     filters: [
       { name: "补充视频或照片", extensions: ["mp4", "mov", "jpg", "jpeg", "png"] },
     ],
   });
-  return typeof selected === "string" ? selected : null;
+  if (Array.isArray(selected)) return selected;
+  return typeof selected === "string" ? [selected] : [];
 }
 
 export async function selectSplatcamDirectory(): Promise<string | null> {
@@ -138,6 +139,9 @@ export async function getSupplementDiagnostics(projectId: string): Promise<Suppl
 export async function getSupplementPreviews(projectId: string): Promise<SupplementPreview[]> {
   return invoke("get_supplement_previews", { projectId });
 }
+export async function getSupplementOriginalPreview(projectId: string, outputFile: string): Promise<string> {
+  return invoke("get_supplement_original_preview", { projectId, outputFile });
+}
 
 export async function attachSupplementalMedia(
   projectId: string,
@@ -145,6 +149,25 @@ export async function attachSupplementalMedia(
   path: string,
 ): Promise<SupplementDiagnostics> {
   return invoke("attach_supplemental_media", { projectId, weakIntervalIndex, path });
+}
+/** Validates the complete selection before binding any candidate media. */
+export async function attachSupplementalMediaBatch(
+  projectId: string,
+  weakIntervalIndex: number,
+  paths: string[],
+): Promise<SupplementDiagnostics> {
+  return invoke("attach_supplemental_media_batch", { projectId, weakIntervalIndex, paths });
+}
+/** Removes only the project binding. It never deletes the source file. */
+export async function detachSupplementalMedia(
+  projectId: string,
+  weakIntervalIndex: number,
+  path: string,
+): Promise<SupplementDiagnostics> {
+  return invoke("detach_supplemental_media", { projectId, weakIntervalIndex, path });
+}
+export async function validateSupplementalMedia(projectId: string, weakIntervalIndex: number): Promise<SupplementDiagnostics> {
+  return invoke("validate_supplemental_media", { projectId, weakIntervalIndex });
 }
 
 export async function setProjectsRoot(

@@ -37,8 +37,8 @@ use crate::{
         SelectionReason, SourceFrameTimestamp, UniformRatioFrameSelection, VideoInfo,
     },
 };
-use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -163,9 +163,8 @@ pub async fn read_supplement_diagnostics(project: &Path) -> Result<SupplementDia
     if diagnostics.weak_intervals.is_empty() {
         return Err(SplatError::Process("项目没有可展示的弱区诊断".into()));
     }
-    let metadata: ProjectMetadata = serde_json::from_slice(
-        &tokio::fs::read(project.join("project.json")).await?,
-    )?;
+    let metadata: ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(project.join("project.json")).await?)?;
     diagnostics.supplemental_media = metadata.supplemental_media;
     Ok(diagnostics)
 }
@@ -182,40 +181,86 @@ pub async fn read_supplement_previews(project: &Path) -> Result<Vec<SupplementPr
             .weak_intervals
             .iter()
             .enumerate()
-            .map(|(index, interval)| Ok(SupplementPreview {
-                weak_interval_index: index as u64,
-                before_anchor: interval.before_anchor.as_ref().and_then(|anchor| {
-                    preview_image(&frames, "前锚点", &anchor.output_file, anchor.pts_seconds).ok()
-                }),
-                weak_frame: preview_image(
-                    &frames,
-                    "弱区画面",
-                    &interval.first_output_file,
-                    interval.start_pts_seconds,
-                )
-                .ok(),
-                after_anchor: interval.after_anchor.as_ref().and_then(|anchor| {
-                    preview_image(&frames, "后锚点", &anchor.output_file, anchor.pts_seconds).ok()
-                }),
-            }))
+            .map(|(index, interval)| {
+                Ok(SupplementPreview {
+                    weak_interval_index: index as u64,
+                    before_anchor: interval.before_anchor.as_ref().and_then(|anchor| {
+                        preview_image(&frames, "前锚点", &anchor.output_file, anchor.pts_seconds)
+                            .ok()
+                    }),
+                    weak_frame: preview_image(
+                        &frames,
+                        "弱区画面",
+                        &interval.first_output_file,
+                        interval.start_pts_seconds,
+                    )
+                    .ok(),
+                    after_anchor: interval.after_anchor.as_ref().and_then(|anchor| {
+                        preview_image(&frames, "后锚点", &anchor.output_file, anchor.pts_seconds)
+                            .ok()
+                    }),
+                })
+            })
             .collect::<Result<Vec<_>>>()
     })
     .await
     .map_err(|error| SplatError::Process(format!("弱区预览任务异常结束：{error}")))?
 }
 
-fn preview_image(frames: &Path, label: &str, output_file: &str, pts_seconds: f64) -> Result<SupplementPreviewImage> {
+/// Returns one diagnostic-referenced source JPEG for an explicit user preview.
+/// The filename is checked against the persisted weak-interval report before
+/// any project frame can be read.
+pub async fn read_supplement_original_preview(project: &Path, output_file: &str) -> Result<String> {
+    let diagnostics = read_supplement_diagnostics(project).await?;
+    let allowed = diagnostics.weak_intervals.iter().any(|interval| {
+        interval.first_output_file == output_file
+            || interval.last_output_file == output_file
+            || interval
+                .before_anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.output_file == output_file)
+            || interval
+                .after_anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.output_file == output_file)
+    });
+    if !allowed {
+        return Err(SplatError::Process("原图预览文件不属于弱区诊断".into()));
+    }
+    let file_name = Path::new(output_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| *name == output_file)
+        .ok_or_else(|| SplatError::Process("原图预览文件名无效".into()))?;
+    let source = project.join("frames").join(file_name);
+    let bytes = tokio::fs::read(&source).await?;
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err(SplatError::Process("原图预览超过 25 MB 上限".into()));
+    }
+    Ok(format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)))
+}
+
+fn preview_image(
+    frames: &Path,
+    label: &str,
+    output_file: &str,
+    pts_seconds: f64,
+) -> Result<SupplementPreviewImage> {
     let file_name = Path::new(output_file)
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| SplatError::Process("弱区预览文件名无效".into()))?;
     if file_name != output_file {
-        return Err(SplatError::Process("弱区预览路径不属于项目关键帧目录".into()));
+        return Err(SplatError::Process(
+            "弱区预览路径不属于项目关键帧目录".into(),
+        ));
     }
     let source = frames.join(file_name);
-    let image = image::ImageReader::open(&source)?.decode().map_err(|error| {
-        SplatError::Process(format!("无法读取弱区预览 {}：{error}", source.display()))
-    })?;
+    let image = image::ImageReader::open(&source)?
+        .decode()
+        .map_err(|error| {
+            SplatError::Process(format!("无法读取弱区预览 {}：{error}", source.display()))
+        })?;
     let thumbnail = image.thumbnail(320, 220).to_rgb8();
     let mut encoded = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 82)
@@ -2907,7 +2952,9 @@ enum ObserverMode {
     /// Sparse `select` extraction needs to report scan time, not just the
     /// number of JPEGs already emitted. The latter can reach its total before
     /// FFmpeg has decoded the tail of the source video.
-    FfmpegSelected { source_duration_seconds: f64 },
+    FfmpegSelected {
+        source_duration_seconds: f64,
+    },
     BracketProgress,
     Mapper,
     Brush(PathBuf),
@@ -2980,11 +3027,8 @@ fn parse_progress(
                 }
                 return None;
             }
-            let source_seconds = line
-                .strip_prefix("out_time_us=")?
-                .parse::<f64>()
-                .ok()?
-                / 1_000_000.0;
+            let source_seconds =
+                line.strip_prefix("out_time_us=")?.parse::<f64>().ok()? / 1_000_000.0;
             let source_total_seconds = source_duration_seconds.max(0.001);
             let source_current_seconds = source_seconds
                 .ceil()
@@ -3206,7 +3250,10 @@ mod progress_tests {
         assert!(parse_progress("frame=9", &mode, Some(12), &mut state).is_none());
         let sample = parse_progress("out_time_us=10500000", &mode, Some(12), &mut state).unwrap();
         assert_eq!(sample.0, 0.5);
-        assert_eq!(sample.1, "正在扫描原视频 10.5 / 21.0 秒；已编码 9 / 12 张关键帧");
+        assert_eq!(
+            sample.1,
+            "正在扫描原视频 10.5 / 21.0 秒；已编码 9 / 12 张关键帧"
+        );
         assert_eq!(sample.2, 11);
         assert_eq!(sample.3, Some(21));
         assert_eq!(sample.4.as_deref(), Some("秒"));
@@ -3232,7 +3279,14 @@ mod progress_tests {
         )
         .unwrap();
         assert_eq!(diagnostics.selected_frames, 12);
-        assert_eq!(diagnostics.weak_intervals[0].before_anchor.as_ref().unwrap().pts_seconds, 3.5);
+        assert_eq!(
+            diagnostics.weak_intervals[0]
+                .before_anchor
+                .as_ref()
+                .unwrap()
+                .pts_seconds,
+            3.5
+        );
         assert!(diagnostics.weak_intervals[0].after_anchor.is_none());
     }
 
@@ -3243,7 +3297,8 @@ mod progress_tests {
         image::RgbImage::from_pixel(640, 480, image::Rgb([11, 42, 73]))
             .save(&frame)
             .unwrap();
-        let preview = preview_image(temporary.path(), "弱区画面", "frame_000001.jpg", 1.25).unwrap();
+        let preview =
+            preview_image(temporary.path(), "弱区画面", "frame_000001.jpg", 1.25).unwrap();
         assert!(preview.data_url.starts_with("data:image/jpeg;base64,"));
         assert_eq!(preview.output_file, "frame_000001.jpg");
         assert!(preview_image(temporary.path(), "x", "nested/frame.jpg", 0.0).is_err());

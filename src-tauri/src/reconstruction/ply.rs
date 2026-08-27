@@ -210,14 +210,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("degree-three.ply");
         let mut file = File::create(&path).unwrap();
-        writeln!(file, "ply\nformat binary_little_endian 1.0\nelement vertex 1").unwrap();
-        for property in ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"] {
+        writeln!(
+            file,
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1"
+        )
+        .unwrap();
+        for property in [
+            "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+        ] {
             writeln!(file, "property float {property}").unwrap();
         }
         for index in 0..45 {
             writeln!(file, "property float f_rest_{index}").unwrap();
         }
-        for property in ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"] {
+        for property in [
+            "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ] {
             writeln!(file, "property float {property}").unwrap();
         }
         writeln!(file, "end_header").unwrap();

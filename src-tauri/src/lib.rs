@@ -25,7 +25,11 @@ pub fn run_app() {
             commands::get_project_overview,
             commands::get_supplement_diagnostics,
             commands::get_supplement_previews,
+            commands::get_supplement_original_preview,
             commands::attach_supplemental_media,
+            commands::attach_supplemental_media_batch,
+            commands::detach_supplemental_media,
+            commands::validate_supplemental_media,
             commands::set_projects_root,
             commands::set_colmap_backend,
             commands::set_cuda_colmap_flavor,
@@ -45,12 +49,19 @@ pub fn run_app() {
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.state::<commands::PipelineController>().cancel_for_close() {
+                if window
+                    .state::<commands::PipelineController>()
+                    .cancel_for_close()
+                {
                     api.prevent_close();
-                    let _ = window.emit("pipeline-event", crate::pipeline::PipelineEvent::mapped(
-                        crate::pipeline::PipelineStage::Cancelled, 1.0,
-                        "正在终止活动任务；清理完成后请再次关闭窗口。",
-                    ));
+                    let _ = window.emit(
+                        "pipeline-event",
+                        crate::pipeline::PipelineEvent::mapped(
+                            crate::pipeline::PipelineStage::Cancelled,
+                            1.0,
+                            "正在终止活动任务；清理完成后请再次关闭窗口。",
+                        ),
+                    );
                 }
             }
         })
