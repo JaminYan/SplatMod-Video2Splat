@@ -159,6 +159,12 @@ export interface SupplementalMedia {
   validationStatus: "pending" | "passed" | "failed";
   validationReason: string | null;
 }
+export interface SupplementReconstructionPlan {
+  attemptId: string;
+  createdAt: string;
+  originalFrameCount: number;
+  approvedMedia: SupplementalMedia[];
+}
 export interface SupplementPreviewImage {
   label: string;
   outputFile: string;

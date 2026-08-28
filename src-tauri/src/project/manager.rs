@@ -132,6 +132,7 @@ impl ProjectManager {
             colmap_execution: crate::pipeline::ColmapExecution::default(),
             needs_supplement: None,
             supplemental_media: Vec::new(),
+            supplement_reconstruction_plan: None,
         };
         self.write_metadata(&paths.metadata, &metadata).await?;
         Ok((paths, metadata))

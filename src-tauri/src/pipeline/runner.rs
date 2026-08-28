@@ -4100,7 +4100,7 @@ async fn run_ceres_mapper(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<(PathBuf, ReconstructionReport)> {
-    colmap::map(
+    if let Err(error) = colmap::map(
         executable,
         database,
         images,
@@ -4108,12 +4108,92 @@ async fn run_ceres_mapper(
         IncrementalMapperOptions {
             ba_backend: IncrementalBaBackend::Ceres,
         },
-        log,
+        log.clone(),
         manager,
         observer,
     )
-    .await?;
+    .await
+    {
+        if matches!(error, SplatError::Cancelled) {
+            return Err(error);
+        }
+        let diagnostic = mapper_initialization_diagnostic(images, database, &log, &error).await;
+        let diagnostic_path = log
+            .parent()
+            .unwrap_or(images)
+            .join("mapper-initialization-diagnostics.json");
+        if let Ok(diagnostic) = diagnostic {
+            let _ = tokio::fs::write(
+                &diagnostic_path,
+                serde_json::to_vec_pretty(&diagnostic).unwrap_or_default(),
+            )
+            .await;
+        }
+        return Err(SplatError::Process(format!(
+            "{}；未能建立任何稀疏模型。请检查 {}（常见原因：相邻关键帧重叠/视差不足，或几何验证后匹配链断裂）",
+            error,
+            diagnostic_path.display()
+        )));
+    }
     best_sparse_model(images, sparse)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapperInitializationDiagnostic {
+    input_jpegs: u64,
+    database_bytes: u64,
+    mapper_log: PathBuf,
+    failure_kind: &'static str,
+    log_tail: Vec<String>,
+}
+
+async fn mapper_initialization_diagnostic(
+    images: &Path,
+    database: &Path,
+    log: &Path,
+    error: &SplatError,
+) -> Result<MapperInitializationDiagnostic> {
+    let mut entries = tokio::fs::read_dir(images).await?;
+    let mut input_jpegs = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+        {
+            input_jpegs += 1;
+        }
+    }
+    let log_text = tokio::fs::read_to_string(log).await.unwrap_or_default();
+    let failure_kind = if log_text.contains("Failed to create any sparse model") {
+        "noSparseModelInitialized"
+    } else if log_text.contains("No images with matches found") {
+        "noVerifiedMatches"
+    } else {
+        "mapperFailed"
+    };
+    let log_tail = log_text
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_owned)
+        .collect();
+    let database_bytes = tokio::fs::metadata(database)
+        .await
+        .map(|value| value.len())
+        .unwrap_or(0);
+    let _ = error;
+    Ok(MapperInitializationDiagnostic {
+        input_jpegs,
+        database_bytes,
+        mapper_log: log.to_path_buf(),
+        failure_kind,
+        log_tail,
+    })
 }
 
 fn best_sparse_model(frames: &Path, sparse_root: &Path) -> Result<(PathBuf, ReconstructionReport)> {

@@ -16,6 +16,7 @@ use crate::{
         SourceFrameTimestamp, UniformRatioFrameSelection, VideoInfo,
     },
 };
+use chrono::Utc;
 use serde::Serialize;
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
@@ -172,6 +173,109 @@ pub async fn get_supplement_original_preview(
     }
     crate::pipeline::runner::read_supplement_original_preview(&project.project_path, &output_file)
         .await
+}
+
+/// Persists a no-process preflight for an isolated `supplemented-<n>` attempt.
+/// The later execution command must consume this exact plan rather than infer
+/// candidate media again from a mutable UI selection.
+#[tauri::command]
+pub async fn prepare_supplement_reconstruction(
+    project_id: String,
+) -> std::result::Result<crate::pipeline::SupplementReconstructionPlan, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let project = catalog::get_overview()
+        .await?
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let metadata_path = project.project_path.join("project.json");
+    let mut metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+    let approved_media = metadata
+        .supplemental_media
+        .iter()
+        .filter(|media| {
+            media.validation_status == crate::pipeline::SupplementalValidationStatus::Passed
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if approved_media.is_empty() {
+        return Err(SplatError::Process(
+            "尚无通过低成本验证的候补素材，不能开始补充重建".into(),
+        ));
+    }
+    for media in &approved_media {
+        let file = tokio::fs::metadata(&media.path).await.map_err(|_| {
+            SplatError::Process(format!(
+                "已通过的候补素材已不存在：{}",
+                media.path.display()
+            ))
+        })?;
+        if !file.is_file() || file.len() == 0 {
+            return Err(SplatError::Process(format!(
+                "已通过的候补素材不可读取：{}",
+                media.path.display()
+            )));
+        }
+    }
+    let mut frames = tokio::fs::read_dir(project.project_path.join("frames")).await?;
+    let mut original_frame_count = 0;
+    while let Some(entry) = frames.next_entry().await? {
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+        {
+            original_frame_count += 1;
+        }
+    }
+    if original_frame_count == 0 {
+        return Err(SplatError::Process(
+            "原关键帧目录为空，不能创建补充重建计划".into(),
+        ));
+    }
+    let attempts = project.project_path.join("work").join("colmap-attempts");
+    let mut next = 1_u64;
+    if let Ok(mut entries) = tokio::fs::read_dir(&attempts).await {
+        while let Some(entry) = entries.next_entry().await? {
+            if let Some(value) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("supplemented-"))
+                .and_then(|number| number.parse::<u64>().ok())
+            {
+                next = next.max(value.saturating_add(1));
+            }
+        }
+    }
+    let plan = crate::pipeline::SupplementReconstructionPlan {
+        attempt_id: format!("supplemented-{next}"),
+        created_at: Utc::now(),
+        original_frame_count,
+        approved_media,
+    };
+    metadata.supplement_reconstruction_plan = Some(plan.clone());
+    crate::project::atomic_write_json(&metadata_path, &metadata).await?;
+    let state_path = project.project_path.join("state.json");
+    if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
+        state.supplement_reconstruction_plan = Some(plan.clone());
+        crate::project::atomic_write_json(&state_path, &state).await?;
+    }
+    crate::project::atomic_write_json(
+        &project
+            .project_path
+            .join("logs")
+            .join("supplement-reconstruction-plan.json"),
+        &plan,
+    )
+    .await?;
+    Ok(plan)
 }
 
 /// Binds one user-selected video or photo to a weak interval. This intentionally

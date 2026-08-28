@@ -22,6 +22,7 @@ import type {
   ProjectSummary,
   SupplementDiagnostics,
   SupplementPreview,
+  SupplementReconstructionPlan,
   Quality,
   SplatcamImportReport,
   VideoInfo,
@@ -141,6 +142,9 @@ export async function getSupplementPreviews(projectId: string): Promise<Suppleme
 }
 export async function getSupplementOriginalPreview(projectId: string, outputFile: string): Promise<string> {
   return invoke("get_supplement_original_preview", { projectId, outputFile });
+}
+export async function prepareSupplementReconstruction(projectId: string): Promise<SupplementReconstructionPlan> {
+  return invoke("prepare_supplement_reconstruction", { projectId });
 }
 
 export async function attachSupplementalMedia(

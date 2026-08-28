@@ -139,6 +139,8 @@ pub struct ProjectMetadata {
     pub needs_supplement: Option<SupplementRequirement>,
     #[serde(default)]
     pub supplemental_media: Vec<SupplementalMedia>,
+    #[serde(default)]
+    pub supplement_reconstruction_plan: Option<SupplementReconstructionPlan>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,6 +257,18 @@ pub enum SupplementalValidationStatus {
     Failed,
 }
 
+/// Persisted preflight for the future isolated supplemented reconstruction.
+/// Creating this plan does not decode media, start COLMAP, or alter the
+/// original attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementReconstructionPlan {
+    pub attempt_id: String,
+    pub created_at: DateTime<Utc>,
+    pub original_frame_count: u64,
+    pub approved_media: Vec<SupplementalMedia>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOutput {
@@ -295,6 +309,8 @@ pub struct PipelineStateFile {
     pub needs_supplement: Option<SupplementRequirement>,
     #[serde(default)]
     pub supplemental_media: Vec<SupplementalMedia>,
+    #[serde(default)]
+    pub supplement_reconstruction_plan: Option<SupplementReconstructionPlan>,
 }
 
 impl PipelineStateFile {
@@ -317,6 +333,7 @@ impl PipelineStateFile {
             auto_bridge_frames: true,
             needs_supplement: None,
             supplemental_media: Vec::new(),
+            supplement_reconstruction_plan: None,
         }
     }
 }
