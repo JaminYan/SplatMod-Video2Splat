@@ -115,6 +115,8 @@ pub struct SupplementDiagnostics {
     pub weak_intervals: Vec<SupplementWeakInterval>,
     #[serde(default)]
     pub supplemental_media: Vec<crate::pipeline::SupplementalMedia>,
+    #[serde(default)]
+    pub reconstruction_plan: Option<crate::pipeline::SupplementReconstructionPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +168,7 @@ pub async fn read_supplement_diagnostics(project: &Path) -> Result<SupplementDia
     let metadata: ProjectMetadata =
         serde_json::from_slice(&tokio::fs::read(project.join("project.json")).await?)?;
     diagnostics.supplemental_media = metadata.supplemental_media;
+    diagnostics.reconstruction_plan = metadata.supplement_reconstruction_plan;
     Ok(diagnostics)
 }
 
@@ -1568,6 +1571,372 @@ impl PipelineRunner {
             ProjectManager::for_diagnostics(projects_root.to_path_buf()),
         )
         .await
+    }
+
+    /// Runs only the isolated SfM attempt described by a persisted supplement
+    /// plan. The original frames, database, sparse model and final PLY remain
+    /// untouched; training consumes this result in a later step.
+    pub async fn run_supplement_reconstruction(
+        &self,
+        project: &Path,
+        plan: &crate::pipeline::SupplementReconstructionPlan,
+    ) -> Result<crate::pipeline::SupplementReconstructionResult> {
+        let metadata_path = project.join("project.json");
+        let metadata: ProjectMetadata =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+        if metadata.status != ProjectStatus::NeedsSupplement {
+            return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+        }
+        if metadata
+            .supplement_reconstruction_plan
+            .as_ref()
+            .is_none_or(|stored| stored.attempt_id != plan.attempt_id)
+        {
+            return Err(SplatError::Process(
+                "补充重建计划已过期，请重新准备补充重建".into(),
+            ));
+        }
+        supplement_attempt_number(&plan.attempt_id)?;
+        let attempt_root = project
+            .join("work")
+            .join("colmap-attempts")
+            .join(&plan.attempt_id);
+        if attempt_root.exists() {
+            return Err(SplatError::Process(format!(
+                "补充重建 attempt 已存在：{}；请重新准备新计划",
+                plan.attempt_id
+            )));
+        }
+        match self.colmap_backend {
+            ColmapBackend::Cpu => engines::require_cpu_colmap(&self.engines).await?,
+            ColmapBackend::Cuda => {
+                engines::require_cuda_colmap(&self.engines, self.cuda_colmap_flavor).await?
+            }
+        }
+        colmap::require_verified_cli(self.colmap_executable())?;
+        self.events
+            .set_task_log(project.join("logs").join("task.log"));
+
+        let frames = attempt_root.join("frames");
+        let ffmpeg_root = attempt_root.join("ffmpeg");
+        tokio::fs::create_dir_all(&frames).await?;
+        tokio::fs::create_dir_all(&ffmpeg_root).await?;
+        let source_frames = project.join("frames");
+        let diagnostics = read_supplement_diagnostics(project).await?;
+        let mut original = Vec::new();
+        let mut entries = tokio::fs::read_dir(&source_frames).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+            {
+                original.push(path);
+            }
+        }
+        original.sort();
+        if original.len() as u64 != plan.original_frame_count {
+            return Err(SplatError::Process(format!(
+                "原关键帧数量发生变化：计划 {}，当前 {}",
+                plan.original_frame_count,
+                original.len()
+            )));
+        }
+        self.events.send(
+            PipelineStage::ExtractingFrames,
+            Some(PipelineEngine::System),
+            EventKind::Progress,
+            EventLevel::Info,
+            Some(0.0),
+            false,
+            format!("补充 attempt：复制 {} 张原关键帧", original.len()),
+            Some(0),
+            Some((original.len() + plan.approved_media.len()) as u64),
+            Some("张"),
+        );
+        for (index, source) in original.iter().enumerate() {
+            let name = source
+                .file_name()
+                .ok_or_else(|| SplatError::Process("原关键帧文件名无效".into()))?;
+            tokio::fs::copy(source, frames.join(name)).await?;
+            if index % 25 == 0 || index + 1 == original.len() {
+                self.events.send(
+                    PipelineStage::ExtractingFrames,
+                    Some(PipelineEngine::System),
+                    EventKind::Progress,
+                    EventLevel::Info,
+                    Some((index + 1) as f32 / original.len().max(1) as f32 * 0.35),
+                    false,
+                    format!(
+                        "补充 attempt：已复制 {}/{} 张原关键帧",
+                        index + 1,
+                        original.len()
+                    ),
+                    Some((index + 1) as u64),
+                    Some((original.len() + plan.approved_media.len()) as u64),
+                    Some("张"),
+                );
+            }
+        }
+
+        let mut supplemental_frame_count = 0_u64;
+        let mut manifest = Vec::new();
+        for (media_index, media) in plan.approved_media.iter().enumerate() {
+            let file = tokio::fs::metadata(&media.path).await.map_err(|_| {
+                SplatError::Process(format!(
+                    "已通过的候补素材已不存在：{}",
+                    media.path.display()
+                ))
+            })?;
+            if !file.is_file() || file.len() == 0 {
+                return Err(SplatError::Process(format!(
+                    "已通过的候补素材不可读取：{}",
+                    media.path.display()
+                )));
+            }
+            let interval = diagnostics
+                .weak_intervals
+                .get(media.weak_interval_index as usize)
+                .ok_or_else(|| SplatError::Process("补充素材绑定的弱区已不存在".into()))?;
+            let frame_prefix = supplement_frame_prefix(interval, media_index);
+            let mut output_files = Vec::new();
+            match media.kind {
+                crate::pipeline::SupplementalMediaKind::Photo => {
+                    let extension = media
+                        .path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("jpg")
+                        .to_ascii_lowercase();
+                    let output = frames.join(format!("{frame_prefix}.{extension}"));
+                    tokio::fs::copy(&media.path, &output).await?;
+                    output_files.push(output.file_name().unwrap().to_string_lossy().into_owned());
+                    supplemental_frame_count += 1;
+                }
+                crate::pipeline::SupplementalMediaKind::Video => {
+                    let video_output = ffmpeg_root.join(format!("media-{media_index:03}"));
+                    let video = probe_video(
+                        &self.engines.ffprobe,
+                        &media.path,
+                        Some(project.join("logs").join("supplement-reconstruction.log")),
+                    )
+                    .await?;
+                    let media_plan =
+                        UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset());
+                    self.events.stage(
+                        PipelineStage::ExtractingFrames,
+                        0.35 + media_index as f32 / plan.approved_media.len().max(1) as f32 * 0.55,
+                        format!(
+                            "候补素材 {}/{}：正在抽取视频画面（约 {} 张）",
+                            media_index + 1,
+                            plan.approved_media.len(),
+                            media_plan.estimated_frames
+                        ),
+                    );
+                    extract_uniform_frames(
+                        &self.engines.ffmpeg,
+                        &media.path,
+                        &video_output,
+                        &media_plan,
+                        self.ffmpeg_hw_accel,
+                        Some(project.join("logs").join("supplement-reconstruction.log")),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::ExtractingFrames,
+                            PipelineEngine::Ffmpeg,
+                            Some(media_plan.estimated_frames.max(1)),
+                            ObserverMode::Ffmpeg,
+                        )),
+                    )
+                    .await?;
+                    let mut extracted = Vec::new();
+                    let mut video_entries = tokio::fs::read_dir(&video_output).await?;
+                    while let Some(entry) = video_entries.next_entry().await? {
+                        let path = entry.path();
+                        if path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+                        {
+                            extracted.push(path);
+                        }
+                    }
+                    extracted.sort();
+                    for (frame_index, source) in extracted.iter().enumerate() {
+                        let output = frames.join(format!("{frame_prefix}_{frame_index:06}.jpg"));
+                        tokio::fs::rename(source, &output).await?;
+                        output_files
+                            .push(output.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                    supplemental_frame_count += output_files.len() as u64;
+                    tokio::fs::remove_dir_all(video_output).await?;
+                }
+            }
+            manifest.push(serde_json::json!({
+                "source": media.path,
+                "kind": media.kind,
+                "weakIntervalIndex": media.weak_interval_index,
+                "outputFiles": output_files,
+            }));
+            self.events.send(
+                PipelineStage::ExtractingFrames,
+                Some(PipelineEngine::System),
+                EventKind::Progress,
+                EventLevel::Info,
+                Some(
+                    0.35 + (media_index + 1) as f32 / plan.approved_media.len().max(1) as f32
+                        * 0.65,
+                ),
+                false,
+                format!(
+                    "候补素材 {}/{} 已加入独立帧目录",
+                    media_index + 1,
+                    plan.approved_media.len()
+                ),
+                Some((original.len() as u64) + supplemental_frame_count),
+                Some((original.len() as u64) + supplemental_frame_count),
+                Some("张"),
+            );
+        }
+        if supplemental_frame_count == 0 {
+            return Err(SplatError::Process(
+                "通过验证的候补素材没有产生可用画面".into(),
+            ));
+        }
+        tokio::fs::write(
+            attempt_root.join("supplement-media.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )
+        .await?;
+        let input_images = original.len() as u64 + supplemental_frame_count;
+        self.events.stage(
+            PipelineStage::ExtractingFrames,
+            1.0,
+            format!(
+                "补充 attempt 帧目录完成：原帧 {} + 候补 {}",
+                original.len(),
+                supplemental_frame_count
+            ),
+        );
+
+        let database = attempt_root.join("database.db");
+        let colmap_log = attempt_root.join("colmap.log");
+        let sparse = attempt_root.join("incremental-ceres").join("sparse");
+        let compute = match self.colmap_backend {
+            ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+            ColmapBackend::Cuda => ColmapComputeMode::Cuda { gpu_index: -1 },
+        };
+        let backend_label = match self.colmap_backend {
+            ColmapBackend::Cpu => "CPU",
+            ColmapBackend::Cuda => "CUDA",
+        };
+        self.events.stage(
+            PipelineStage::ExtractingFeatures,
+            0.0,
+            format!(
+                "补充 attempt：正在使用 {backend_label} 提取 {} 张特征",
+                input_images
+            ),
+        );
+        colmap::extract_features(
+            self.colmap_executable(),
+            &database,
+            &frames,
+            ColmapFeatureOptions { compute },
+            colmap_log.clone(),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ExtractingFeatures,
+                PipelineEngine::Colmap,
+                Some(input_images),
+                ObserverMode::BracketProgress,
+            )),
+        )
+        .await?;
+        self.events.stage(
+            PipelineStage::ExtractingFeatures,
+            1.0,
+            "补充 attempt 特征提取完成",
+        );
+        self.events.stage(
+            PipelineStage::Matching,
+            0.0,
+            format!("补充 attempt：正在进行 {backend_label} 顺序匹配"),
+        );
+        colmap::match_sequential(
+            self.colmap_executable(),
+            &database,
+            ColmapMatchingOptions {
+                compute,
+                overlap: 10,
+            },
+            colmap_log.clone(),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::Matching,
+                PipelineEngine::Colmap,
+                Some(input_images),
+                ObserverMode::BracketProgress,
+            )),
+        )
+        .await?;
+        self.events
+            .stage(PipelineStage::Matching, 1.0, "补充 attempt 顺序匹配完成");
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            0.0,
+            "补充 attempt：正在使用 Ceres 增量重建相机轨迹",
+        );
+        let (_, report) = run_ceres_mapper(
+            self.colmap_executable(),
+            &database,
+            &frames,
+            &sparse,
+            colmap_log,
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::Reconstructing,
+                PipelineEngine::Colmap,
+                Some(input_images),
+                ObserverMode::Mapper,
+            )),
+        )
+        .await?;
+        let report_path = attempt_root.join("supplement-reconstruction-report.json");
+        tokio::fs::write(
+            &report_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "attemptId": plan.attempt_id,
+                "originalFrameCount": plan.original_frame_count,
+                "supplementalFrameCount": supplemental_frame_count,
+                "inputImages": report.input_images,
+                "registeredImages": report.registered_images,
+                "registeredRatio": report.registered_ratio,
+                "points3d": report.points_3d,
+                "quality": report.quality,
+            }))?,
+        )
+        .await?;
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            1.0,
+            format!(
+                "补充 SfM 验证完成：注册 {}/{} 张（{:.1}%）· 三维点 {}；原任务未修改",
+                report.registered_images,
+                report.input_images,
+                report.registered_ratio * 100.0,
+                report.points_3d
+            ),
+        );
+        Ok(crate::pipeline::SupplementReconstructionResult {
+            attempt_id: plan.attempt_id.clone(),
+            original_frame_count: plan.original_frame_count,
+            supplemental_frame_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+            report_path,
+        })
     }
     /// Runs an already reconstructed Splatcam export. This intentionally bypasses all video
     /// probing/extraction, feature extraction, matching and mapper/CASPAR calls.
@@ -3155,6 +3524,43 @@ mod progress_tests {
     use super::*;
 
     #[test]
+    fn accepts_only_generated_supplement_attempt_ids() {
+        assert_eq!(supplement_attempt_number("supplemented-3").unwrap(), 3);
+        assert!(supplement_attempt_number("supplemented-0").is_err());
+        assert!(supplement_attempt_number("../supplemented-3").is_err());
+    }
+
+    #[test]
+    fn supplement_frames_sort_after_before_anchor_and_before_next_frame() {
+        let interval = SupplementWeakInterval {
+            reason: "test".into(),
+            start_pts_seconds: 1.0,
+            end_pts_seconds: 2.0,
+            unregistered_frames: 1,
+            first_output_file: "frame_000005.jpg".into(),
+            last_output_file: "frame_000005.jpg".into(),
+            before_anchor: Some(SupplementAnchor {
+                output_file: "frame_000004.jpg".into(),
+                pts_seconds: 0.5,
+            }),
+            after_anchor: Some(SupplementAnchor {
+                output_file: "frame_000006.jpg".into(),
+                pts_seconds: 2.5,
+            }),
+        };
+        let mut names = vec![
+            "frame_000004.jpg".to_string(),
+            format!("{}.jpg", supplement_frame_prefix(&interval, 0)),
+            "frame_000005.jpg".to_string(),
+        ];
+        let sorted = {
+            names.sort();
+            names
+        };
+        assert_eq!(sorted[1], "frame_000004_supplement_000.jpg");
+    }
+
+    #[test]
     fn parses_gsplat_jsonl_progress_for_live_ui() {
         let line = r#"{"event":"progress","step":13700,"total":15000,"loss":0.01941635087132454,"splats":5920}"#;
         let sample = parse_progress(
@@ -4194,6 +4600,24 @@ async fn mapper_initialization_diagnostic(
         failure_kind,
         log_tail,
     })
+}
+
+fn supplement_attempt_number(attempt_id: &str) -> Result<u64> {
+    attempt_id
+        .strip_prefix("supplemented-")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| SplatError::Process("补充重建 attempt 编号无效".into()))
+}
+
+fn supplement_frame_prefix(interval: &SupplementWeakInterval, media_index: usize) -> String {
+    let base = interval
+        .before_anchor
+        .as_ref()
+        .and_then(|anchor| Path::new(&anchor.output_file).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("frame_000000");
+    format!("{base}_supplement_{media_index:03}")
 }
 
 fn best_sparse_model(frames: &Path, sparse_root: &Path) -> Result<(PathBuf, ReconstructionReport)> {

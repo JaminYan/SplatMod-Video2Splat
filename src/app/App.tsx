@@ -5,8 +5,8 @@ import {
   Zap, ZapOff,
 } from "lucide-react";
 import {
-  attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews,
-  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, validateSupplementalMedia,
+  attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews, prepareSupplementReconstruction,
+  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, startSupplementReconstruction, validateSupplementalMedia,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
@@ -22,6 +22,8 @@ import type {
   ProjectStatus,
   ProjectSummary,
   SupplementDiagnostics,
+  SupplementReconstructionPlan,
+  SupplementReconstructionResult,
   SupplementPreview,
   PipelineEvent,
   Quality,
@@ -131,7 +133,7 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView, onSupplementChanged }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void; onSupplementChanged: () => Promise<void> }) {
+const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView, onSupplementChanged, onSupplementReconstruction }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void; onSupplementChanged: () => Promise<void>; onSupplementReconstruction: (projectId: string) => Promise<SupplementReconstructionResult> }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [supplementOpen, setSupplementOpen] = useState(false);
   const [supplementDiagnostics, setSupplementDiagnostics] = useState<SupplementDiagnostics | null>(null);
@@ -142,6 +144,10 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
   const [removingSupplementPath, setRemovingSupplementPath] = useState<string | null>(null);
   const [validatingWeakInterval, setValidatingWeakInterval] = useState<number | null>(null);
   const [supplementPreviews, setSupplementPreviews] = useState<SupplementPreview[]>([]);
+  const [reconstructionPlan, setReconstructionPlan] = useState<SupplementReconstructionPlan | null>(null);
+  const [supplementResult, setSupplementResult] = useState<SupplementReconstructionResult | null>(null);
+  const [startingSupplementReconstruction, setStartingSupplementReconstruction] = useState(false);
+  const [preparingReconstruction, setPreparingReconstruction] = useState(false);
   const [originalPreview, setOriginalPreview] = useState<{ label: string; dataUrl: string } | null>(null);
   const [loadingOriginalPreview, setLoadingOriginalPreview] = useState(false);
   const [selectedWeakInterval, setSelectedWeakInterval] = useState(0);
@@ -161,6 +167,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
         getSupplementPreviews(project.id),
       ]);
       setSupplementDiagnostics(diagnostics);
+      setReconstructionPlan(diagnostics.reconstructionPlan);
       setSupplementPreviews(previews);
     } catch (error) {
       setSupplementError(messageOf(error));
@@ -170,6 +177,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
   };
   const validateMedia = async (weakIntervalIndex: number) => {
     setSupplementError(null);
+    setReconstructionPlan(null);
     setValidatingWeakInterval(weakIntervalIndex);
     try {
       setSupplementDiagnostics(await validateSupplementalMedia(project.id, weakIntervalIndex));
@@ -195,6 +203,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
     const paths = await selectSupplementalMedia();
     if (paths.length === 0) return;
     setSupplementError(null);
+    setReconstructionPlan(null);
     setAttachingWeakInterval(weakIntervalIndex);
     setAttachingMediaCount(paths.length);
     try {
@@ -209,6 +218,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
   };
   const detachMedia = async (weakIntervalIndex: number, path: string) => {
     setSupplementError(null);
+    setReconstructionPlan(null);
     setRemovingSupplementPath(path);
     try {
       setSupplementDiagnostics(await detachSupplementalMedia(project.id, weakIntervalIndex, path));
@@ -219,6 +229,30 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       setRemovingSupplementPath(null);
     }
   };
+  const prepareReconstruction = async () => {
+    setSupplementError(null);
+    setPreparingReconstruction(true);
+    try {
+      setReconstructionPlan(await prepareSupplementReconstruction(project.id));
+      void onSupplementChanged();
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setPreparingReconstruction(false);
+    }
+  };
+  const runSupplementReconstruction = async () => {
+    if (!reconstructionPlan) return;
+    setSupplementError(null);
+    setStartingSupplementReconstruction(true);
+    try {
+      setSupplementResult(await onSupplementReconstruction(project.id));
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setStartingSupplementReconstruction(false);
+    }
+  };
   const activeInterval = supplementDiagnostics?.weakIntervals[selectedWeakInterval];
   const activePreview = supplementPreviews.find((preview) => preview.weakIntervalIndex === selectedWeakInterval);
   const previewSlots = [
@@ -226,6 +260,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
     { label: "弱区画面", image: activePreview?.weakFrame, missing: "预览不可用" },
     { label: "后锚点", image: activePreview?.afterAnchor, missing: activeInterval?.afterAnchor ? "预览不可用" : "视频结束，缺少后锚点" },
   ];
+  const approvedMediaCount = supplementDiagnostics?.supplementalMedia.filter((media) => media.validationStatus === "passed").length ?? 0;
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -278,7 +313,14 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
             </div>
           </div>
         </div>}
-        <p className="supplement-next">已绑定的素材尚未解码或送入 COLMAP。下一阶段会先做重叠、清晰度与视差验证；当前可通过“资源管理器”核对完整日志。</p>
+        <div className="supplement-reconstruction-plan">
+          <div><strong>独立补充重建</strong><small>{approvedMediaCount > 0 ? `${approvedMediaCount} 份素材已通过验证，可生成隔离 attempt` : "需要至少一份通过验证的候补素材"}</small></div>
+          <button type="button" className="secondary-action" disabled={busy || preparingReconstruction || approvedMediaCount === 0} onClick={() => void prepareReconstruction()}>{preparingReconstruction ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}{preparingReconstruction ? "正在生成计划" : "准备补充重建"}</button>
+        </div>
+        {reconstructionPlan && <div className="supplement-plan-confirmation"><strong>计划已保存：{reconstructionPlan.attemptId}</strong><span>{reconstructionPlan.originalFrameCount} 张原关键帧 · {reconstructionPlan.approvedMedia.length} 份已通过素材</span><small>下一步将使用独立帧目录、数据库和稀疏模型，不修改原 attempt。</small></div>}
+        {reconstructionPlan && <button type="button" className="primary-action supplement-run-action" disabled={busy || startingSupplementReconstruction || supplementResult != null} onClick={() => void runSupplementReconstruction()}>{startingSupplementReconstruction ? <LoaderCircle className="spin" size={14} /> : <Play size={14} fill="currentColor" />}{startingSupplementReconstruction ? "正在运行补充 SfM" : supplementResult ? "补充 SfM 已完成" : "开始补充 SfM 验证"}</button>}
+        {supplementResult && <div className="supplement-plan-confirmation"><strong>SfM 验证完成：{supplementResult.attemptId}</strong><span>注册 {supplementResult.registeredImages} / {supplementResult.inputImages} 张（{(supplementResult.registeredRatio * 100).toFixed(1)}%）· 三维点 {supplementResult.points3d.toLocaleString()}</span><small>证据：{supplementResult.reportPath}；当前尚未训练或替换原 PLY。</small></div>}
+        <p className="supplement-next">{reconstructionPlan ? "计划已保存；后续重建会在隔离目录中执行，原任务保持不变。" : "候补素材通过验证后，可生成隔离的补充重建计划；当前仍不会修改原任务。"}</p>
       </>}
     </section></div>}
     {originalPreview && <div className="original-preview-backdrop" role="presentation" onMouseDown={() => setOriginalPreview(null)}><section className="original-preview-dialog" role="dialog" aria-modal="true" aria-label={`${originalPreview.label} 原图预览`} onMouseDown={(event) => event.stopPropagation()}><header><strong>{originalPreview.label} · 原图预览</strong><button type="button" aria-label="关闭原图预览" onClick={() => setOriginalPreview(null)}><X size={17} /></button></header><img src={originalPreview.dataUrl} alt={`${originalPreview.label} 原图`} /></section></div>}
@@ -346,7 +388,7 @@ function ColmapBackendBlock() {
   );
 }
 
-const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView, onSupplementChanged }: {
+const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView, onSupplementChanged, onSupplementReconstruction }: {
   completed: ProjectSummary[];
   waitingSupplement: ProjectSummary[];
   active: ProjectSummary[];
@@ -356,13 +398,14 @@ const ProjectList = memo(function ProjectList({ completed, waitingSupplement, ac
   onDelete: (project: ProjectSummary) => void;
   onView: (project: ProjectSummary) => void;
   onSupplementChanged: () => Promise<void>;
+  onSupplementReconstruction: (projectId: string) => Promise<SupplementReconstructionResult>;
 }) {
   return <>
     {completed.length === 0 && waitingSupplement.length === 0 && active.length === 0 && failed.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>没有符合筛选条件的任务</strong><p>切换上方筛选，或选择视频后开始生成。</p></div>}
-    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
-    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
-    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
-    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} />)}</div>}
+    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
+    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
+    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
+    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
   </>;
 });
 
@@ -732,6 +775,20 @@ export function App() {
       try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
     }
   };
+  const runSupplementReconstruction = useCallback(async (projectId: string): Promise<SupplementReconstructionResult> => {
+    store.beginRun();
+    try {
+      const result = await startSupplementReconstruction(projectId);
+      store.setPhase("needsSupplement");
+      try { await refreshProjects(); } catch { /* the isolated attempt remains on disk */ }
+      return result;
+    } catch (error) {
+      const message = messageOf(error);
+      store.setError(message);
+      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+      throw error;
+    }
+  }, [refreshProjects, store.beginRun, store.setError, store.setPhase]);
   const removeProject = useCallback(async (project: ProjectSummary) => {
     try {
       if (await confirmAndDeleteProject(project)) await refreshProjects();
@@ -889,7 +946,7 @@ export function App() {
           </div>
           <div className="archive-summary"><span><b>{store.projects.filter((project) => project.status === "completed").length}</b><small>已完成</small></span><span><b>{totalWaitingSupplement}</b><small>等待补充</small></span></div>
 
-          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} onSupplementChanged={refreshProjects} />
+          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} onSupplementChanged={refreshProjects} onSupplementReconstruction={runSupplementReconstruction} />
         </section>
       </section>
       </div>

@@ -269,6 +269,19 @@ pub struct SupplementReconstructionPlan {
     pub approved_media: Vec<SupplementalMedia>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplementReconstructionResult {
+    pub attempt_id: String,
+    pub original_frame_count: u64,
+    pub supplemental_frame_count: u64,
+    pub input_images: u64,
+    pub registered_images: u64,
+    pub registered_ratio: f64,
+    pub points_3d: u64,
+    pub report_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOutput {

@@ -271,6 +271,14 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .supplement-media-entry small { overflow: hidden; color: var(--muted); font: 10px/1.4 "Cascadia Mono", "Microsoft YaHei UI", monospace; text-overflow: ellipsis; white-space: nowrap; }
 .supplement-media-entry button { flex: 0 0 auto; padding: 4px 0; display: flex; align-items: center; gap: 4px; color: var(--red); background: transparent; border: 0; cursor: pointer; font-size: 10px; }
 .supplement-media-entry button:hover:not(:disabled) { color: var(--text-error); }
+.supplement-reconstruction-plan { margin-top: 12px; padding: 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--surface); border: 1px solid var(--line-dark); }
+.supplement-reconstruction-plan > div { min-width: 0; display: grid; gap: 4px; }
+.supplement-reconstruction-plan strong { font-size: 12px; }
+.supplement-reconstruction-plan small, .supplement-plan-confirmation span, .supplement-plan-confirmation small { color: var(--muted); font: 10px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.supplement-reconstruction-plan .secondary-action { flex: 0 0 auto; min-height: 30px; padding: 6px 9px; font-size: 11px; }
+.supplement-plan-confirmation { margin-top: 8px; padding: 8px 10px; display: grid; gap: 3px; background: var(--surface-control); border: 1px solid var(--line); }
+.supplement-plan-confirmation strong { color: var(--text-success); font-size: 11px; }
+.supplement-run-action { width: 100%; margin-top: 10px; }
 .supplement-next { color: var(--muted); }
 .supplement-dialog-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 24px; background: rgba(23, 32, 51, .42); }
 .supplement-dialog { width: min(860px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow: auto; padding: 20px 22px; color: var(--ink); background: var(--surface-topbar); border: 1px solid var(--line-dark); box-shadow: var(--shadow-drawer); }

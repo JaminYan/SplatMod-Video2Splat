@@ -1357,6 +1357,48 @@ adapter 已经在 `logs/quality/validation-renders` 保存裁剪前的固定验�
 
 审查裁剪时应以同一 manifest 的 `fixedValidation.frames` 为顺序，配对查看 `originalRenders` 和既有 `candidateValidationRenders` 中同名 PNG，再结合 PSNR/SSIM/RGB 门槛和 PLY 哈希判断。该索引解决“看见候选图但不确定是否同一轨迹”的审计问题；它不是自动图像质量判定，也不替代人工关键区域复核。
 
+### 20A.40 椅子素材 AbsGS 对照验收（`20260904_chair`）
+
+本次为 Splatcam 椅子素材的 AbsGS 运行：`balanced` 质量档、1M splat cap、seed 42、50 张输入图像。训练完成，`trainingMs=276,308`、总耗时 `281,033 ms`（约 276.3 s / 281.0 s），导出标准 PLY 为 512,215 splat、127,030,851 bytes。该运行未启用 floater pruning，因此没有 `prune-manifest.json`；本次只能作为训练策略 A/B，不作为裁剪接受证据。
+
+固定验证指标为 PSNR `20.9557 dB`、SSIM `0.765075`。诊断共发现 414 个四项弱信号候选，5 个候选取得有效全相机来源，1 个候选出现高冲突中心残差；覆盖率仍不足以把候选级信号推广为全模型结论。
+
+与同一 `A:\\tmp\\chair`、同为均衡/1M/seed42 的 MCMC 基线 `20260827_chair`（411.1 s 训练、416.0 s 总耗时、907,525 splat、PSNR `21.9396 dB`、SSIM `0.783376`）相比，AbsGS 快 134.9 s（约 32.4%），模型少 43.6%，但 PSNR 低 `0.9839 dB`、SSIM 低 `0.018301`。由于 MCMC/AbsGS 的增殖与 CUDA 执行不保证逐 bit 相同，这不是严格可重复性证明；方向性结论足够明确：当前均衡档下 AbsGS 是“更快、更小”的配置，不是 MCMC 的质量等价替代。后续默认质量基线继续使用 MCMC；AbsGS 仅适合作为速度/体积优先的显式选项，除非再完成参数调优并在三类素材上复核。
+
+### 20A.41 AbsGS 三素材门禁的下一步
+
+椅子只完成了 AbsGS 的第一类真实素材。为满足“先完成三类 MCMC/AbsGS A/B，再决定是否进入动态 mask 或进一步的 WD-R/ResGS 调参”的门禁，下一轮只补两次 AbsGS：`A:\\tmp\\small_desk`（反光/遮挡）和 `A:\\tmp\\gamedesk`（复杂细节/遮挡）。两次均固定 `quality=balanced`、`cap=1m`、`seed=42`、`photometricMode=none`、`perceptualMode=none`、`multiViewDensificationGate=false`、`floaterPruning=false`，不要同时改分辨率、步数或 `absgradGrowGrad2d`。
+
+每次记录总耗时、训练耗时、最终 splat 数、PSNR、SSIM、峰值显存和 `floater-diagnostics.json` 的候选覆盖；分别与已有同素材 MCMC 基线（`20260828_small_desk 2`、`20260828_gamedesk 2`）对照。门禁只回答“AbsGS 的速度/体积代价是否在不同素材保持方向一致”，不把候选诊断或单次 SSIM 变化转成自动裁剪规则。两次完成后再决定是否进入下一开发阶段；在此之前不接动态软 mask，也不扩大 cap。
+
+### 20A.42 小桌素材 AbsGS 对照验收（`20260904_small_desk`）
+
+本次为 35 张图像的小桌素材，配置固定为 AbsGS、`balanced`、1M cap、seed 42，未启用 PPISP/WD-R、多视角增殖门控或 floater pruning。训练耗时 `569,841 ms`、总耗时 `572,610 ms`（约 569.8 s / 572.6 s），最终输出 441,246 splat、109,430,539 bytes；PSNR `18.9481 dB`、SSIM `0.685969`。
+
+与同输入、同声明配置的 MCMC 基线 `20260828_small_desk 2` 的**裁剪前**模型（训练约 296.4 s、总耗时约 298.8 s、417,466 splat、PSNR `18.8930 dB`、SSIM `0.692696`）比较，AbsGS 慢约 283.4 s（总耗时约 +98.0%），模型多 5.7%，PSNR 仅高 `0.0551 dB`，SSIM 反而低 `0.006727`。因此 AbsGS 的“更快”只在椅子样本成立，不能作为通用结论；在该反光/遮挡素材上，它既没有体积优势，也没有结构相似度优势。
+
+本次诊断发现 1,993 个四项弱信号候选，但 12 对重投影中没有候选中心取得目标表面或有效来源（`candidatesWithTargetSurface=0`、`candidatesWithValidSource=0`），故没有高冲突否决，也没有任何裁剪证据。场景级残差 p50 `0.04613`、p90 `0.18369` 只能说明输入/位姿存在一定不一致，不能归因到候选点。
+
+该首轮结果受 GPU 外部任务占用影响，不能单独作为性能结论；其质量指标仍保留为同 seed 下的随机性参考。性能判断以 `20A.43` 空闲 GPU 复跑为准。三素材门禁还缺 `gamedesk` AbsGS；完成后应按“每素材分别判断”决定是否保留 AbsGS 速度档。
+
+### 20A.43 小桌 AbsGS 空闲 GPU 复跑（`20260904_small_desk 2`）
+
+为排除上一轮 GPU 被其他任务占用的影响，在完全相同配置（AbsGS、`balanced`、1M、seed 42、`absgradGrowGrad2d=0.0008`、其余实验开关关闭）下复跑。训练耗时降至 `262,683 ms`、总耗时 `265,160 ms`（约 262.7 s / 265.2 s），相对上一轮 572.6 s 缩短 53.7%，证明上一轮耗时不能作为 AbsGS 性能结论。日志记录 RTX 5090 D v2 总显存 24,427 MB、峰值分配 1,604 MB；没有连续 GPU utilization 采样，因此不据此宣称平均利用率。
+
+本次输出 439,724 splat、约 104.0 MiB，PSNR `18.7751 dB`、SSIM `0.685910`。相对 MCMC `20260828_small_desk 2`（298.8 s、416,924 最终 splat、PSNR `18.8930 dB`、SSIM `0.692696`），AbsGS 快 33.6 s（约 11.2%），但模型多 5.5%，PSNR 低 `0.1179 dB`、SSIM 低 `0.006786`。因此在空闲 GPU 下 AbsGS 对该素材确有有限的速度优势，但仍不是质量等价方案，默认质量后端继续使用 MCMC。
+
+本次诊断有 1,773 个四项弱信号候选，但目标表面和有效全相机来源均为 0；没有高冲突否决，也没有裁剪证据。该结果只修正性能判断，不改变 M3.5 的 observe-only 边界。
+
+### 20A.44 游戏桌素材 AbsGS 对照验收（`20260904_gamedesk`）
+
+本次为 46 张图像的游戏桌素材，配置为 AbsGS、`balanced`、1M cap、seed 42，`absgradGrowGrad2d=0.0008`，未启用 PPISP/WD-R、多视角增殖门控或 floater pruning。训练耗时 `255,674 ms`、总耗时 `257,914 ms`（约 255.7 s / 257.9 s），最终输出 545,317 splat、约 129.0 MiB；峰值显存 1,822 MB（RTX 5090 D v2，总显存 24,427 MB）。
+
+与同输入、同声明配置的 MCMC 基线 `20260828_gamedesk 2` 裁剪前模型（训练约 367.6 s、总耗时约 369.9 s、958,332 splat、PSNR `18.4408 dB`、SSIM `0.728485`）相比，AbsGS 快 112.0 s（约 30.3%），模型少 43.1%，但 PSNR 低 `1.3114 dB`、SSIM 低 `0.049280`。这确认 AbsGS 在该复杂遮挡素材上虽然更快且更小，但质量损失已经明显超过椅子和小桌，不能作为默认质量方案。
+
+诊断发现 177 个四项弱信号候选；其中 2 个进入目标表面，但没有取得有效全相机来源，故高冲突候选为 0，额外 RGB+ED 渲染 34 次、同步诊断耗时 173 ms。该覆盖仍不足以支持逐点归因或自动裁剪。
+
+至此三素材 AbsGS/MCMC A/B 已完成：AbsGS 的速度优势在空闲 GPU 下方向一致，但 splat 数和质量代价随素材变化，且复杂场景质量退化显著。下一步进入 M3.5 固定轨迹/关键区域人工复核；自动裁剪、动态软 mask 和新的增殖策略继续关闭。
+
 ## 21. 尚未解决的问题
 
 后续真实素材验收仍需确认：

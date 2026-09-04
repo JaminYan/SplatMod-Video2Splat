@@ -278,6 +278,73 @@ pub async fn prepare_supplement_reconstruction(
     Ok(plan)
 }
 
+#[tauri::command]
+pub async fn start_supplement_reconstruction(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    project_id: String,
+) -> std::result::Result<crate::pipeline::SupplementReconstructionResult, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let project = catalog::get_overview()
+        .await?
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(project.project_path.join("project.json")).await?)?;
+    let plan = metadata
+        .supplement_reconstruction_plan
+        .ok_or_else(|| SplatError::Process("尚未准备补充重建计划".into()))?;
+    let settings = catalog::load_settings().await?;
+    let emitter = app.clone();
+    let runner = Arc::new(PipelineRunner::new(
+        paths_for_app(&app),
+        settings.colmap_backend,
+        settings.cuda_colmap_flavor,
+        settings.mapper_ba_mode,
+        settings.ffmpeg_hw_accel,
+        settings.brush_training_preset,
+        settings.gsplat_splat_cap,
+        settings.gsplat_densification_strategy,
+        settings.multi_view_densification_gate,
+        settings.floater_pruning,
+        settings.photometric_mode,
+        settings.training_backend,
+        false,
+        move |event| {
+            let _ = emitter.emit("pipeline-event", event);
+        },
+    ));
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() {
+            return Err(SplatError::Process("已有任务正在运行".into()));
+        }
+        *active = Some(runner.clone());
+    }
+    let result = runner
+        .run_supplement_reconstruction(&project.project_path, &plan)
+        .await;
+    if let Err(error) = &result {
+        let stage = if matches!(error, SplatError::Cancelled) {
+            crate::pipeline::PipelineStage::Cancelled
+        } else {
+            crate::pipeline::PipelineStage::Failed
+        };
+        let _ = app.emit(
+            "pipeline-event",
+            crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()),
+        );
+    }
+    *state.active.lock().await = None;
+    result
+}
+
 /// Binds one user-selected video or photo to a weak interval. This intentionally
 /// only records a validated external path; the next validation stage is the
 /// first operation allowed to decode the supplemental media.
@@ -345,11 +412,13 @@ pub async fn attach_supplemental_media(
             validation_status: crate::pipeline::SupplementalValidationStatus::Pending,
             validation_reason: None,
         });
+    project_metadata.supplement_reconstruction_plan = None;
     crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
     let state_path = project.project_path.join("state.json");
     if let Ok(bytes) = tokio::fs::read(&state_path).await {
         let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
         state.supplemental_media = project_metadata.supplemental_media.clone();
+        state.supplement_reconstruction_plan = None;
         crate::project::atomic_write_json(&state_path, &state).await?;
     }
     crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
@@ -446,11 +515,13 @@ pub async fn attach_supplemental_media_batch(
         });
     }
     project_metadata.supplemental_media.extend(incoming);
+    project_metadata.supplement_reconstruction_plan = None;
     crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
     let state_path = project.project_path.join("state.json");
     if let Ok(bytes) = tokio::fs::read(&state_path).await {
         let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
         state.supplemental_media = project_metadata.supplemental_media.clone();
+        state.supplement_reconstruction_plan = None;
         crate::project::atomic_write_json(&state_path, &state).await?;
     }
     crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
@@ -491,12 +562,14 @@ pub async fn detach_supplemental_media(
     if project_metadata.supplemental_media.len() == count_before {
         return Err(SplatError::Process("该候补素材绑定不存在或已被移除".into()));
     }
+    project_metadata.supplement_reconstruction_plan = None;
     clear_validation_cache(&project.project_path, &requested_path, legacy_ordinal).await?;
     crate::project::atomic_write_json(&metadata_path, &project_metadata).await?;
     let state_path = project.project_path.join("state.json");
     if let Ok(bytes) = tokio::fs::read(&state_path).await {
         let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
         state.supplemental_media = project_metadata.supplemental_media.clone();
+        state.supplement_reconstruction_plan = None;
         crate::project::atomic_write_json(&state_path, &state).await?;
     }
     crate::pipeline::runner::read_supplement_diagnostics(&project.project_path).await
@@ -649,11 +722,13 @@ pub async fn validate_supplemental_media(
         metadata.supplemental_media[metadata_index].validation_reason = Some(reason.clone());
         reports.push(serde_json::json!({"path": path, "status": if passed { "passed" } else { "failed" }, "reason": reason, "inliers": inliers, "gridCoverage": coverage, "threeViewTracks": tracks}));
     }
+    metadata.supplement_reconstruction_plan = None;
     crate::project::atomic_write_json(&metadata_path, &metadata).await?;
     let state_path = project.project_path.join("state.json");
     if let Ok(bytes) = tokio::fs::read(&state_path).await {
         let mut state: crate::pipeline::PipelineStateFile = serde_json::from_slice(&bytes)?;
         state.supplemental_media = metadata.supplemental_media.clone();
+        state.supplement_reconstruction_plan = None;
         crate::project::atomic_write_json(&state_path, &state).await?;
     }
     let log_path = project.project_path.join("logs").join(format!(

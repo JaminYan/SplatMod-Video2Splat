@@ -151,6 +151,7 @@ export interface SupplementDiagnostics {
   registeredFrames: number;
   weakIntervals: SupplementWeakInterval[];
   supplementalMedia: SupplementalMedia[];
+  reconstructionPlan: SupplementReconstructionPlan | null;
 }
 export interface SupplementalMedia {
   path: string;
@@ -164,6 +165,16 @@ export interface SupplementReconstructionPlan {
   createdAt: string;
   originalFrameCount: number;
   approvedMedia: SupplementalMedia[];
+}
+export interface SupplementReconstructionResult {
+  attemptId: string;
+  originalFrameCount: number;
+  supplementalFrameCount: number;
+  inputImages: number;
+  registeredImages: number;
+  registeredRatio: number;
+  points3d: number;
+  reportPath: string;
 }
 export interface SupplementPreviewImage {
   label: string;

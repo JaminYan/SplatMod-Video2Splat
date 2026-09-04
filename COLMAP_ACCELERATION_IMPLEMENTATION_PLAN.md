@@ -593,7 +593,9 @@ adaptiveRepairMs
 
 当自动补帧关闭，或一次受限的自动补帧仍不能让自适应重建达到质量门禁时，项目进入持久化的 `needsSupplement` 状态。它不是运行中的进程暂停：所有 FFmpeg、COLMAP 和训练子进程已经结束并释放资源；项目保留诊断和可恢复上下文，等待用户作出下一步选择。
 
-当前实现状态（2026-08-24）：关闭自动补帧且诊断到弱区时，系统会在训练前写入 `state.json` / `project.json` 的 `needsSupplement`，将项目状态显示为“等待补充素材”，并停止正常流水线；已释放的任务不会以“暂停中”形式占用 FFmpeg、COLMAP 或训练资源。开启自动补帧时，系统会写入完整代理分析和 `logs/adaptive-bridge-plan.json`：每个弱区最多两张，合计不超过初选帧的 25%，并排除已选帧、确认场景切换和缺少基本几何证据的候选。若首轮注册率低于 80%，会最多执行一次 `colmap-attempts/supplemented-1`：从原视频重新提取“原关键帧加桥接帧”的完整时间序列，以独立 frames、数据库和稀疏模型做特征、顺序匹配和 Ceres Mapper。只有新 attempt 注册率至少 80%、未失败且注册张数超过原 attempt 时才提升它；否则保留原帧、原数据库和原模型，日志明确记录未采用原因。补充素材上传与低成本验证仍是后续步骤。
+当前实现状态（2026-08-24）：关闭自动补帧且诊断到弱区时，系统会在训练前写入 `state.json` / `project.json` 的 `needsSupplement`，将项目状态显示为“等待补充素材”，并停止正常流水线；已释放的任务不会以“暂停中”形式占用 FFmpeg、COLMAP 或训练资源。开启自动补帧时，系统会写入完整代理分析和 `logs/adaptive-bridge-plan.json`：每个弱区最多两张，合计不超过初选帧的 25%，并排除已选帧、确认场景切换和缺少基本几何证据的候选。若首轮注册率低于 80%，会最多执行一次 `colmap-attempts/supplemented-1`：从原视频重新提取“原关键帧加桥接帧”的完整时间序列，以独立 frames、数据库和稀疏模型做特征、顺序匹配和 Ceres Mapper。只有新 attempt 注册率至少 80%、未失败且注册张数超过原 attempt 时才提升它；否则保留原帧、原数据库和原模型，日志明确记录未采用原因。
+
+2026-09-04 增量实现：补充素材通过低成本验证后，可在 `needsSupplement` 卡片中生成持久化 `supplemented-<n>` 计划；“开始补充 SfM 验证”会把原关键帧复制到该 attempt 的独立 `frames/`，将已通过的照片或视频抽取结果加入同一目录，并在独立数据库与稀疏目录运行特征提取、顺序匹配和 Ceres Mapper。执行过程复用主界面的可取消事件与任务日志，写入 `supplement-media.json` 和 `supplement-reconstruction-report.json`；本阶段只验证 SfM，不训练、不替换原 PLY，后续训练/质量提升另行验收。
 
 无论自适应是否最终回退，代理扫描成功后都必须保留 `logs/adaptive-proxy-analysis.json` 和 `logs/adaptive-proxy-diagnostics.json`。后者记录实际候选/入选数量、各门禁阈值、满足完整几何门禁的帧数、分别低于内点/网格覆盖/三视图轨迹阈值的计数、确认场景切换数和三项指标中位数。回退日志必须指向该文件，便于基于真实素材标定阈值，不能仅显示“可靠关键帧不足”。
 
