@@ -52,10 +52,11 @@ pub fn package_colmap_dataset(frames: &Path, model: &Path, output: &Path) -> Res
         .compression_method(zip::CompressionMethod::Deflated);
     for entry in std::fs::read_dir(frames)? {
         let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("jpg"))
-        {
+        if path.extension().is_some_and(|e| {
+            e.eq_ignore_ascii_case("jpg")
+                || e.eq_ignore_ascii_case("jpeg")
+                || e.eq_ignore_ascii_case("png")
+        }) {
             let name = path.file_name().unwrap().to_string_lossy();
             zip.start_file(format!("images/{name}"), options)
                 .map_err(|e| SplatError::Process(e.to_string()))?;

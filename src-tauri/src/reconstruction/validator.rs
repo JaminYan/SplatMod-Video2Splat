@@ -12,7 +12,7 @@ pub const GOOD_REGISTERED_RATIO: f64 = 0.80;
 /// 注册率 >= 50% 视为可接受（低于该值判定为失败）。
 pub const WARNING_REGISTERED_RATIO: f64 = 0.50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReconstructionQuality {
     Good,
@@ -20,7 +20,7 @@ pub enum ReconstructionQuality {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconstructionReport {
     pub quality: ReconstructionQuality,
@@ -61,7 +61,7 @@ impl ReconstructionValidator {
                 )));
             }
         }
-        let input_images = count_jpegs(frames_dir)?;
+        let input_images = count_images(frames_dir)?;
         let registered_images = read_colmap_count(&images)?;
         let points_3d = read_colmap_count(&points)?;
         if input_images == 0 || registered_images == 0 || points_3d == 0 {
@@ -94,19 +94,22 @@ impl ReconstructionValidator {
     }
 }
 
-fn count_jpegs(directory: &Path) -> Result<u64> {
+fn count_images(directory: &Path) -> Result<u64> {
     let mut count = 0u64;
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
-        {
+        if path.extension().is_some_and(is_supported_image_extension) {
             count += 1;
         }
     }
     Ok(count)
+}
+
+fn is_supported_image_extension(extension: &std::ffi::OsStr) -> bool {
+    extension.eq_ignore_ascii_case("jpg")
+        || extension.eq_ignore_ascii_case("jpeg")
+        || extension.eq_ignore_ascii_case("png")
 }
 
 /// COLMAP 二进制模型文件头部即记录数量（u64 小端）。
@@ -213,6 +216,19 @@ mod tests {
         assert_eq!(report.input_images, 10);
         assert_eq!(report.registered_images, 9);
         assert_eq!(report.points_3d, 5);
+    }
+
+    #[test]
+    fn counts_png_supplemental_images_in_registration_ratio() {
+        let temp = tempfile::tempdir().unwrap();
+        let frames = temp.path().join("frames");
+        let model = temp.path().join("model");
+        write_jpegs(&frames, 2);
+        std::fs::write(frames.join("frame_supplement.png"), [0u8; 4]).unwrap();
+        write_bin_model(&model, 2, 5);
+        let report = ReconstructionValidator::validate(&frames, &model).unwrap();
+        assert_eq!(report.input_images, 3);
+        assert!((report.registered_ratio - (2.0 / 3.0)).abs() < f64::EPSILON);
     }
 
     #[test]

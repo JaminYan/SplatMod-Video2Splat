@@ -4,13 +4,18 @@
 //! They are deliberately kept separate from the video workflow: inspecting an export must not
 //! invoke FFmpeg, feature extraction, matching or a mapper.
 
-use crate::error::{Result, SplatError};
+use crate::{
+    error::{Result, SplatError},
+    video::laplacian_variance,
+};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 const MINIMUM_INITIAL_POINTS: u64 = 100;
@@ -31,7 +36,35 @@ pub struct SplatcamImportReport {
     pub positive_depth_projection_ratio: f64,
     pub in_image_projection_ratio: f64,
     pub camera_trajectory_extent: f64,
+    pub image_quality: SplatcamImageQuality,
+    pub trajectory_coverage: SplatcamTrajectoryCoverage,
     pub geometry_gate: SplatcamGeometryGate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplatcamImageQuality {
+    pub sharpness_p10: f64,
+    pub sharpness_median: f64,
+    pub sharpness_p90: f64,
+    pub low_sharpness_ratio: f64,
+    pub clarity_gate: SplatcamClarityGate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplatcamClarityGate {
+    pub passed: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplatcamTrajectoryCoverage {
+    pub path_length: f64,
+    pub path_to_extent_ratio: f64,
+    pub median_step: f64,
+    pub p90_step: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,7 +99,7 @@ pub fn inspect_export(source: &Path) -> Result<SplatcamImportReport> {
     let model_dir = source.join("sparse").join("0");
     let cameras = parse_cameras(&model_dir.join("cameras.txt"))?;
     let poses = parse_poses(&model_dir.join("images.txt"))?;
-    let image_count = validate_images(&images_dir, &cameras, &poses)?;
+    let (image_count, image_quality) = validate_images(&images_dir, &cameras, &poses)?;
     let ply = parse_rgb_point_cloud(&model_dir.join("points3D.ply"))?;
     if ply.points.len() < MINIMUM_INITIAL_POINTS as usize {
         return Err(SplatError::Process(format!(
@@ -76,6 +109,7 @@ pub fn inspect_export(source: &Path) -> Result<SplatcamImportReport> {
     }
     let (positive_depth_projection_ratio, in_image_projection_ratio, camera_trajectory_extent) =
         projection_statistics(&cameras, &poses, &ply.points);
+    let trajectory_coverage = trajectory_coverage(&poses, camera_trajectory_extent);
     let geometry_gate = geometry_gate(
         positive_depth_projection_ratio,
         in_image_projection_ratio,
@@ -94,8 +128,62 @@ pub fn inspect_export(source: &Path) -> Result<SplatcamImportReport> {
         positive_depth_projection_ratio,
         in_image_projection_ratio,
         camera_trajectory_extent,
+        image_quality,
+        trajectory_coverage,
         geometry_gate,
     })
+}
+
+/// Returns a cheap source-tree fingerprint for short-lived preflight reuse.
+/// It hashes relative paths, sizes and modification times, avoiding a second read of large RGB
+/// and PLY payloads while still invalidating on normal export changes.
+pub fn source_fingerprint(source: &Path) -> Result<String> {
+    if !source.is_dir() {
+        return Err(missing(source));
+    }
+    let mut files = Vec::new();
+    collect_fingerprint_files(source, source, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = DefaultHasher::new();
+    for (relative, size, modified) in files {
+        relative.hash(&mut hasher);
+        size.hash(&mut hasher);
+        modified.hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn collect_fingerprint_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(String, u64, u128)>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_fingerprint_files(root, &path, files)?;
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |value| value.as_nanos());
+        files.push((
+            path.strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            metadata.len(),
+            modified,
+        ));
+    }
+    Ok(())
 }
 
 /// Creates a text COLMAP model in a new isolated directory. The exported PLY becomes
@@ -104,8 +192,8 @@ pub fn inspect_export(source: &Path) -> Result<SplatcamImportReport> {
 pub fn prepare_normalized_text_model(
     source: &Path,
     destination: &Path,
+    report: &SplatcamImportReport,
 ) -> Result<SplatcamImportReport> {
-    let report = inspect_export(source)?;
     if destination.exists() {
         return Err(SplatError::Process(format!(
             "Splatcam 标准化目录已存在，拒绝覆盖：{}",
@@ -136,7 +224,7 @@ pub fn prepare_normalized_text_model(
         return Err(error);
     }
     fs::rename(temporary, destination)?;
-    Ok(report)
+    Ok(report.clone())
 }
 
 /// Stages the supported export in the project without mutating the original. JPEGs and model
@@ -405,7 +493,7 @@ fn validate_images(
     images_dir: &Path,
     cameras: &HashMap<u64, Camera>,
     poses: &[Pose],
-) -> Result<u64> {
+) -> Result<(u64, SplatcamImageQuality)> {
     if !images_dir.is_dir() {
         return Err(missing(images_dir));
     }
@@ -429,6 +517,7 @@ fn validate_images(
             poses.len()
         )));
     }
+    let mut sharpness = Vec::with_capacity(poses.len());
     for pose in poses {
         let camera = cameras.get(&pose.camera_id).ok_or_else(|| {
             SplatError::Process(format!(
@@ -443,17 +532,83 @@ fn validate_images(
                 pose.name
             )));
         }
-        let (width, height) = image::image_dimensions(&path).map_err(|error| {
+        let image = image::open(&path).map_err(|error| {
             SplatError::Process(format!("RGB 无法解码 {}：{error}", path.display()))
         })?;
+        let (width, height) = (image.width(), image.height());
         if width != camera.width || height != camera.height {
             return Err(SplatError::Process(format!(
                 "RGB 尺寸与相机不一致 {}：{}x{}，预期 {}x{}",
                 pose.name, width, height, camera.width, camera.height
             )));
         }
+        sharpness.push(laplacian_variance(&image));
     }
-    Ok(disk.len() as u64)
+    Ok((disk.len() as u64, image_quality(sharpness)))
+}
+
+fn image_quality(mut sharpness: Vec<f64>) -> SplatcamImageQuality {
+    sharpness.retain(|value| value.is_finite());
+    sharpness.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let p10 = percentile(&sharpness, 0.10);
+    let median = percentile(&sharpness, 0.50);
+    let p90 = percentile(&sharpness, 0.90);
+    let low_threshold = median * 0.35;
+    let low_ratio = if sharpness.is_empty() || median <= 0.0 {
+        0.0
+    } else {
+        sharpness.iter().filter(|value| **value <= low_threshold).count() as f64
+            / sharpness.len() as f64
+    };
+    let passed = low_ratio <= 0.35;
+    SplatcamImageQuality {
+        sharpness_p10: p10,
+        sharpness_median: median,
+        sharpness_p90: p90,
+        low_sharpness_ratio: low_ratio,
+        clarity_gate: SplatcamClarityGate {
+            passed,
+            reason: (!passed).then(|| {
+                format!(
+                    "低清晰度帧比例 {:.1}% 超过 35%，可能存在运动模糊；该提示不阻断训练",
+                    low_ratio * 100.0
+                )
+            }),
+        },
+    }
+}
+
+fn percentile(values: &[f64], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f64 * fraction.clamp(0.0, 1.0)).round() as usize;
+    values[index]
+}
+
+fn trajectory_coverage(poses: &[Pose], extent: f64) -> SplatcamTrajectoryCoverage {
+    let mut centers = Vec::with_capacity(poses.len());
+    for pose in poses {
+        centers.push(camera_center(rotation_matrix(pose.q), pose.t));
+    }
+    let mut steps = centers
+        .windows(2)
+        .map(|pair| {
+            ((0..3)
+                .map(|axis| (pair[1][axis] - pair[0][axis]).powi(2))
+                .sum::<f64>())
+            .sqrt()
+        })
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    steps.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let path_length = steps.iter().sum::<f64>();
+    SplatcamTrajectoryCoverage {
+        path_length,
+        path_to_extent_ratio: if extent > 1e-9 { path_length / extent } else { 0.0 },
+        median_step: percentile(&steps, 0.50),
+        p90_step: percentile(&steps, 0.90),
+    }
 }
 
 struct RgbPointCloud {
@@ -796,7 +951,23 @@ mod tests {
         let report = inspect_export(temp.path()).unwrap();
         assert_eq!(report.image_count, 1);
         assert_eq!(report.point_count, 100);
+        assert!(report.image_quality.clarity_gate.passed);
+        assert_eq!(report.trajectory_coverage.path_length, 0.0);
         assert!(!report.geometry_gate.passed);
+    }
+    #[test]
+    fn clarity_gate_flags_a_large_low_sharpness_tail() {
+        let quality = image_quality(vec![1.0, 1.0, 0.1, 0.1]);
+        assert!(!quality.clarity_gate.passed);
+        assert_eq!(quality.low_sharpness_ratio, 0.5);
+    }
+    #[test]
+    fn source_fingerprint_changes_when_export_files_change() {
+        let temp = fixture();
+        let before = source_fingerprint(temp.path()).unwrap();
+        fs::write(temp.path().join("images/new.jpg"), b"changed").unwrap();
+        let after = source_fingerprint(temp.path()).unwrap();
+        assert_ne!(before, after);
     }
     #[test]
     fn rejects_missing_pose_image() {
@@ -823,7 +994,8 @@ mod tests {
     fn writes_trackless_points_text_without_inventing_observations() {
         let temp = fixture();
         let output = temp.path().join("normalized");
-        let report = prepare_normalized_text_model(temp.path(), &output).unwrap();
+        let report = inspect_export(temp.path()).unwrap();
+        let report = prepare_normalized_text_model(temp.path(), &output, &report).unwrap();
         assert_eq!(report.point_count, 100);
         let text = fs::read_to_string(output.join("points3D.txt")).unwrap();
         assert!(text.contains("1 0.000000000 0.000000000 1.000000000 255 0 0 0"));

@@ -28,6 +28,7 @@ pub fn run_app() {
             commands::get_supplement_original_preview,
             commands::prepare_supplement_reconstruction,
             commands::start_supplement_reconstruction,
+            commands::continue_supplement_reconstruction,
             commands::attach_supplemental_media,
             commands::attach_supplemental_media_batch,
             commands::detach_supplemental_media,

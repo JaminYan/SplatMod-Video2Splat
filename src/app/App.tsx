@@ -5,7 +5,7 @@ import {
   Zap, ZapOff,
 } from "lucide-react";
 import {
-  attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews, prepareSupplementReconstruction,
+  attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, continueSupplementReconstruction as continueSupplementReconstructionBackend, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews, prepareSupplementReconstruction,
   inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, startSupplementReconstruction, validateSupplementalMedia,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
@@ -19,9 +19,11 @@ import type {
   GsplatSplatCap,
   GsplatDensificationStrategy,
   TrainingBackend,
+  PhotometricMode,
   ProjectStatus,
   ProjectSummary,
   SupplementDiagnostics,
+  PipelineResult,
   SupplementReconstructionPlan,
   SupplementReconstructionResult,
   SupplementPreview,
@@ -57,6 +59,7 @@ const splatcamTrainingDetail = (
   trainingBackend: TrainingBackend | undefined,
   brushPreset: BrushTrainingPreset | undefined,
   gsplatCap: GsplatSplatCap | undefined,
+  photometricMode: PhotometricMode | undefined,
 ) => {
   const profile = splatcamTrainingProfiles[quality];
   if (trainingBackend === "brush" && brushPreset) {
@@ -66,7 +69,8 @@ const splatcamTrainingDetail = (
   }
   const cap = gsplatCap === "1m" ? 1_000_000 : gsplatCap === "2m" ? 2_000_000 : 4_000_000;
   const qualityCap = quality === "fast" ? 1_500_000 : quality === "balanced" ? 3_000_000 : 5_000_000;
-  return `${profile.iterations.toLocaleString()} 次迭代 · ${profile.resolution}px · gsplat 上限 ${Math.min(cap, qualityCap) / 10_000} 万 splat`;
+  const iterations = photometricMode === "wdr10k" ? 10_000 : profile.iterations;
+  return `${iterations.toLocaleString()} 次迭代 · ${profile.resolution}px · gsplat 上限 ${Math.min(cap, qualityCap) / 10_000} 万 splat`;
 };
 
 const stages = [
@@ -94,7 +98,7 @@ const trainingLabel = (project: ProjectSummary) => {
   if (project.trainingBackend === "brush") return `Brush ${project.brushTrainingPreset.toUpperCase()}`;
   const cap: Record<GsplatSplatCap, string> = { auto: "自动安全", "1m": "100 万", "2m": "200 万", "4m": "400 万" };
   const strategy = project.gsplatDensificationStrategy === "absgrad" ? "AbsGS" : "MCMC";
-  const module = project.photometricMode === "wdr" ? " · WD-R" : project.photometricMode === "ppisp" ? " · PPISP" : "";
+  const module = project.photometricMode === "wdr10k" ? " · WD-R 10k" : project.photometricMode === "wdr" ? " · WD-R 15k" : project.photometricMode === "ppisp" ? " · PPISP" : "";
   return `gsplat ${strategy} · Splat${cap[project.gsplatSplatCap]}${module}`;
 };
 const statusLabel: Record<ProjectStatus, string> = { running: "处理中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", needsSupplement: "等待补充素材" };
@@ -133,7 +137,7 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView, onSupplementChanged, onSupplementReconstruction }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void; onSupplementChanged: () => Promise<void>; onSupplementReconstruction: (projectId: string) => Promise<SupplementReconstructionResult> }) {
+const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, onView, onSupplementChanged, onSupplementReconstruction, onSupplementContinue }: { project: ProjectSummary; busy: boolean; opening: boolean; onDelete: (project: ProjectSummary) => void; onView: (project: ProjectSummary) => void; onSupplementChanged: () => Promise<void>; onSupplementReconstruction: (projectId: string) => Promise<SupplementReconstructionResult>; onSupplementContinue: (projectId: string) => Promise<PipelineResult> }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [supplementOpen, setSupplementOpen] = useState(false);
   const [supplementDiagnostics, setSupplementDiagnostics] = useState<SupplementDiagnostics | null>(null);
@@ -147,6 +151,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
   const [reconstructionPlan, setReconstructionPlan] = useState<SupplementReconstructionPlan | null>(null);
   const [supplementResult, setSupplementResult] = useState<SupplementReconstructionResult | null>(null);
   const [startingSupplementReconstruction, setStartingSupplementReconstruction] = useState(false);
+  const [continuingSupplement, setContinuingSupplement] = useState(false);
   const [preparingReconstruction, setPreparingReconstruction] = useState(false);
   const [originalPreview, setOriginalPreview] = useState<{ label: string; dataUrl: string } | null>(null);
   const [loadingOriginalPreview, setLoadingOriginalPreview] = useState(false);
@@ -168,6 +173,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       ]);
       setSupplementDiagnostics(diagnostics);
       setReconstructionPlan(diagnostics.reconstructionPlan);
+      setSupplementResult(diagnostics.reconstructionResult);
       setSupplementPreviews(previews);
     } catch (error) {
       setSupplementError(messageOf(error));
@@ -253,6 +259,17 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
       setStartingSupplementReconstruction(false);
     }
   };
+  const continueSupplement = async () => {
+    setSupplementError(null);
+    setContinuingSupplement(true);
+    try {
+      await onSupplementContinue(project.id);
+    } catch (error) {
+      setSupplementError(messageOf(error));
+    } finally {
+      setContinuingSupplement(false);
+    }
+  };
   const activeInterval = supplementDiagnostics?.weakIntervals[selectedWeakInterval];
   const activePreview = supplementPreviews.find((preview) => preview.weakIntervalIndex === selectedWeakInterval);
   const previewSlots = [
@@ -320,6 +337,7 @@ const ProjectRow = memo(function ProjectRow({ project, busy, opening, onDelete, 
         {reconstructionPlan && <div className="supplement-plan-confirmation"><strong>计划已保存：{reconstructionPlan.attemptId}</strong><span>{reconstructionPlan.originalFrameCount} 张原关键帧 · {reconstructionPlan.approvedMedia.length} 份已通过素材</span><small>下一步将使用独立帧目录、数据库和稀疏模型，不修改原 attempt。</small></div>}
         {reconstructionPlan && <button type="button" className="primary-action supplement-run-action" disabled={busy || startingSupplementReconstruction || supplementResult != null} onClick={() => void runSupplementReconstruction()}>{startingSupplementReconstruction ? <LoaderCircle className="spin" size={14} /> : <Play size={14} fill="currentColor" />}{startingSupplementReconstruction ? "正在运行补充 SfM" : supplementResult ? "补充 SfM 已完成" : "开始补充 SfM 验证"}</button>}
         {supplementResult && <div className="supplement-plan-confirmation"><strong>SfM 验证完成：{supplementResult.attemptId}</strong><span>注册 {supplementResult.registeredImages} / {supplementResult.inputImages} 张（{(supplementResult.registeredRatio * 100).toFixed(1)}%）· 三维点 {supplementResult.points3d.toLocaleString()}</span><small>证据：{supplementResult.reportPath}；当前尚未训练或替换原 PLY。</small></div>}
+        {reconstructionPlan && <button type="button" className="primary-action supplement-run-action" disabled={busy || startingSupplementReconstruction || continuingSupplement || supplementResult == null} onClick={() => void continueSupplement()}>{continuingSupplement ? <LoaderCircle className="spin" size={14} /> : <Play size={14} fill="currentColor" />}{continuingSupplement ? "正在继续训练" : supplementResult ? "采用补充 SfM 并继续训练" : "先完成补充 SfM 验证"}</button>}
         <p className="supplement-next">{reconstructionPlan ? "计划已保存；后续重建会在隔离目录中执行，原任务保持不变。" : "候补素材通过验证后，可生成隔离的补充重建计划；当前仍不会修改原任务。"}</p>
       </>}
     </section></div>}
@@ -388,7 +406,7 @@ function ColmapBackendBlock() {
   );
 }
 
-const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView, onSupplementChanged, onSupplementReconstruction }: {
+const ProjectList = memo(function ProjectList({ completed, waitingSupplement, active, failed, busy, openingProjectId, onDelete, onView, onSupplementChanged, onSupplementReconstruction, onSupplementContinue }: {
   completed: ProjectSummary[];
   waitingSupplement: ProjectSummary[];
   active: ProjectSummary[];
@@ -399,13 +417,14 @@ const ProjectList = memo(function ProjectList({ completed, waitingSupplement, ac
   onView: (project: ProjectSummary) => void;
   onSupplementChanged: () => Promise<void>;
   onSupplementReconstruction: (projectId: string) => Promise<SupplementReconstructionResult>;
+  onSupplementContinue: (projectId: string) => Promise<PipelineResult>;
 }) {
   return <>
     {completed.length === 0 && waitingSupplement.length === 0 && active.length === 0 && failed.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>没有符合筛选条件的任务</strong><p>切换上方筛选，或选择视频后开始生成。</p></div>}
-    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
-    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
-    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
-    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} />)}</div>}
+    {waitingSupplement.length > 0 && <div className="project-group waiting-supplement"><div className="group-heading"><span>等待补充</span><small>{waitingSupplement.length} 个任务</small></div>{waitingSupplement.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} onSupplementContinue={onSupplementContinue} />)}</div>}
+    {active.length > 0 && <div className="project-group"><div className="group-heading"><span>处理中</span><small>{active.length} 个任务</small></div>{active.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} onSupplementContinue={onSupplementContinue} />)}</div>}
+    {failed.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>失败 / 已取消</span><small>{failed.length} 个任务</small></div>{failed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} onSupplementContinue={onSupplementContinue} />)}</div>}
+    {completed.length > 0 && <div className="project-group completed-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={busy} opening={openingProjectId === project.id} onDelete={onDelete} onView={onView} onSupplementChanged={onSupplementChanged} onSupplementReconstruction={onSupplementReconstruction} onSupplementContinue={onSupplementContinue} />)}</div>}
   </>;
 });
 
@@ -600,9 +619,10 @@ function PhotometricModeBlock() {
  const options = [
   { value: "none" as const, title: "关闭（M0 基线）", hint: "使用标准 L1 + DSSIM，不增加附加模型成本。" },
   { value: "ppisp" as const, title: "PPISP（实验）", hint: "补偿曝光、白平衡、暗角与色调变化；单帧训练，PLY 不含 controller。" },
-  { value: "wdr" as const, title: "WD-R（实验）", hint: "VGG-16 Wasserstein 感知损失；3k/20% warm-up 后启用，单帧训练且明显更慢。" },
+  { value: "wdr" as const, title: "WD-R（15k）", hint: "VGG-16 Wasserstein 感知损失；15,000 步，单帧训练且明显更慢。" },
+  { value: "wdr10k" as const, title: "WD-R（10k）", hint: "同一 WD-R 损失；固定 10,000 步，预计比 15k 更快，适合质量/时间 A/B。" },
  ];
- return <div className="settings-block"><div className="settings-block-title">附加训练模块</div><p className="settings-block-hint">仅 gsplat 生效，PPISP 与 WD-R 互斥。WD-R 是感知实验，必须以固定素材、cap、seed 的 M0/MCMC 对照验收。</p><div className="backend-toggle" role="radiogroup" aria-label="附加训练模块">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
+ return <div className="settings-block"><div className="settings-block-title">附加训练模块</div><p className="settings-block-hint">仅 gsplat 生效，PPISP 与 WD-R 互斥。WD-R 10k 只改变步数，不改变损失参数。</p><div className="backend-toggle" role="radiogroup" aria-label="附加训练模块">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
 
 function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose: () => void; inputSource: InputSource }) {
@@ -653,6 +673,7 @@ export function App() {
   const [splatcamPath, setSplatcamPath] = useState<string | null>(null);
   const [splatcamReport, setSplatcamReport] = useState<SplatcamImportReport | null>(null);
   const [checkingSplatcam, setCheckingSplatcam] = useState(false);
+  const [splatcamCheckElapsedMs, setSplatcamCheckElapsedMs] = useState(0);
   const [projectFilter, setProjectFilter] = useState<ProjectFilter>("all");
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const filteredProjects = useMemo(() => store.projects.filter((project) => {
@@ -692,6 +713,13 @@ export function App() {
     const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [isRunning]);
+  useEffect(() => {
+    if (!checkingSplatcam) return;
+    const startedAt = Date.now();
+    setSplatcamCheckElapsedMs(0);
+    const timer = window.setInterval(() => setSplatcamCheckElapsedMs(Date.now() - startedAt), 250);
+    return () => window.clearInterval(timer);
+  }, [checkingSplatcam]);
   useEffect(() => {
     try { window.localStorage.setItem("ooo-splat-left-pane", leftPanePercent.toFixed(1)); } catch { /* optional preference */ }
   }, [leftPanePercent]);
@@ -789,6 +817,21 @@ export function App() {
       throw error;
     }
   }, [refreshProjects, store.beginRun, store.setError, store.setPhase]);
+  const continueSupplementReconstruction = useCallback(async (projectId: string): Promise<PipelineResult> => {
+    store.beginRun();
+    try {
+      const result = await continueSupplementReconstructionBackend(projectId);
+      store.setResult(result);
+      store.setPhase("completed");
+      try { await refreshProjects(); } catch { /* completed output remains on disk */ }
+      return result;
+    } catch (error) {
+      const message = messageOf(error);
+      store.setError(message);
+      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+      throw error;
+    }
+  }, [refreshProjects, store.beginRun, store.setError, store.setPhase, store.setResult]);
   const removeProject = useCallback(async (project: ProjectSummary) => {
     try {
       if (await confirmAndDeleteProject(project)) await refreshProjects();
@@ -860,10 +903,17 @@ export function App() {
               <FolderOpen size={18} /><span><strong>{splatcamPath ? basename(splatcamPath) : "选择包含 images 与 sparse/0 的目录"}</strong><small>{splatcamPath ?? "仅接受 RGB JPEG + COLMAP 文本模型 + RGB 点云"}</small></span><ChevronRight size={16} />
             </button>
             <button className="secondary-action splatcam-check" type="button" disabled={!splatcamPath || isRunning || checkingSplatcam} onClick={() => void inspectSplatcam()}>{checkingSplatcam ? <LoaderCircle className="spin" size={14} /> : <FileBox size={14} />}{checkingSplatcam ? "正在导入检查" : "仅导入检查"}</button>
+            {checkingSplatcam && <div className="splatcam-check-progress" role="status" aria-live="polite">
+              <div className="splatcam-check-progress-track"><span /></div>
+              <small>检查进行中 · 已用 {(splatcamCheckElapsedMs / 1000).toFixed(1)} 秒 · 正在读取 RGB、计算清晰度并检查相机轨迹</small>
+            </div>}
             {splatcamReport && <div className={splatcamReport.geometryGate.passed ? "splatcam-report passed" : "splatcam-report failed"}>
               <strong>{splatcamReport.geometryGate.passed ? "检查通过：可进入下一阶段标准化" : "检查未通过"}</strong>
               <span>{splatcamReport.imageCount} 张 RGB · {splatcamReport.poseCount} 个位姿 · {splatcamReport.pointCount.toLocaleString()} 个初始化点</span>
               <small>坐标：COLMAP world-to-camera · 正深度 {(splatcamReport.positiveDepthProjectionRatio * 100).toFixed(1)}% · 图像内 {(splatcamReport.inImageProjectionRatio * 100).toFixed(1)}%</small>
+              <small>清晰度 Laplacian p10/中位/p90：{splatcamReport.imageQuality.sharpnessP10.toFixed(1)} / {splatcamReport.imageQuality.sharpnessMedian.toFixed(1)} / {splatcamReport.imageQuality.sharpnessP90.toFixed(1)} · 低清帧 {(splatcamReport.imageQuality.lowSharpnessRatio * 100).toFixed(1)}%</small>
+              <small>相机路径：{splatcamReport.trajectoryCoverage.pathLength.toFixed(3)} · 范围 {splatcamReport.cameraTrajectoryExtent.toFixed(3)} · 路径/范围 {splatcamReport.trajectoryCoverage.pathToExtentRatio.toFixed(2)} · p90 间隔 {splatcamReport.trajectoryCoverage.p90Step.toFixed(3)}</small>
+              {!splatcamReport.imageQuality.clarityGate.passed && <small className="splatcam-quality-warning">输入质量提示：{splatcamReport.imageQuality.clarityGate.reason}</small>}
               {!splatcamReport.geometryGate.passed && <small>{splatcamReport.geometryGate.reason}</small>}
             </div>}
             <p className="field-note">当前先执行只读检查；标准化模型与训练接入完成前不会启动 FFmpeg、特征提取或相机重建。</p>
@@ -882,7 +932,7 @@ export function App() {
           {inputSource === "splatcam" && <p className="field-hint">直接使用导出的图片与相机位姿；不会进行视频分析、抽帧或关键帧筛选。</p>}
           <div className="quality-list" role="radiogroup">
             {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
-              <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{inputSource === "splatcam" ? splatcamTrainingDetail(quality.value, store.settings?.settings.trainingBackend, store.settings?.settings.brushTrainingPreset, store.settings?.settings.gsplatSplatCap) : quality.description}</small></span>
+              <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{inputSource === "splatcam" ? splatcamTrainingDetail(quality.value, store.settings?.settings.trainingBackend, store.settings?.settings.brushTrainingPreset, store.settings?.settings.gsplatSplatCap, store.settings?.settings.photometricMode) : quality.description}</small></span>
             </button>)}
             </div>
           </div>
@@ -946,7 +996,7 @@ export function App() {
           </div>
           <div className="archive-summary"><span><b>{store.projects.filter((project) => project.status === "completed").length}</b><small>已完成</small></span><span><b>{totalWaitingSupplement}</b><small>等待补充</small></span></div>
 
-          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} onSupplementChanged={refreshProjects} onSupplementReconstruction={runSupplementReconstruction} />
+          <ProjectList completed={completed} waitingSupplement={waitingSupplement} active={activeProjects} failed={failedProjects} busy={isRunning} openingProjectId={openingProjectId} onDelete={removeProject} onView={viewProject} onSupplementChanged={refreshProjects} onSupplementReconstruction={runSupplementReconstruction} onSupplementContinue={continueSupplementReconstruction} />
         </section>
       </section>
       </div>

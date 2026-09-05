@@ -269,7 +269,7 @@ pub struct SupplementReconstructionPlan {
     pub approved_media: Vec<SupplementalMedia>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplementReconstructionResult {
     pub attempt_id: String,

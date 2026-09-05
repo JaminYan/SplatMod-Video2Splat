@@ -150,6 +150,9 @@ export async function prepareSupplementReconstruction(projectId: string): Promis
 export async function startSupplementReconstruction(projectId: string): Promise<SupplementReconstructionResult> {
   return invoke("start_supplement_reconstruction", { projectId });
 }
+export async function continueSupplementReconstruction(projectId: string): Promise<PipelineResult> {
+  return invoke("continue_supplement_reconstruction", { projectId });
+}
 
 export async function attachSupplementalMedia(
   projectId: string,

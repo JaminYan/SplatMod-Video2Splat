@@ -34,6 +34,9 @@ pub enum PhotometricMode {
     /// Experimental WD-R perceptual objective. It is deliberately mutually
     /// exclusive with PPISP so A/B results have one changed variable.
     Wdr,
+    /// WD-R with a fixed 10,000-step budget for a faster quality comparison.
+    #[serde(rename = "wdr10k")]
+    Wdr10k,
 }
 
 /// Densification policy for experimental gsplat runs. MCMC remains the
@@ -240,10 +243,10 @@ async fn train_gsplat(
         "maxSplats": request.max_splats,
         // M2: stabilise the coarse static scene before MCMC adds new splats.
         "delayedDensificationRatio": 0.10,
-        "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp | PhotometricMode::Wdr => 1 },
+        "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp | PhotometricMode::Wdr | PhotometricMode::Wdr10k => 1 },
         // M1 is opt-in until it has passed the documented three-material gate.
-        "photometricMode": match request.photometric_mode { PhotometricMode::Ppisp => "ppisp", PhotometricMode::None | PhotometricMode::Wdr => "none" },
-        "perceptualMode": match request.photometric_mode { PhotometricMode::Wdr => "wdr", PhotometricMode::None | PhotometricMode::Ppisp => "none" },
+        "photometricMode": match request.photometric_mode { PhotometricMode::Ppisp => "ppisp", PhotometricMode::None | PhotometricMode::Wdr | PhotometricMode::Wdr10k => "none" },
+        "perceptualMode": match request.photometric_mode { PhotometricMode::Wdr | PhotometricMode::Wdr10k => "wdr", PhotometricMode::None | PhotometricMode::Ppisp => "none" },
         "ppispController": true,
         "ppispControllerDistillation": true,
         "canonicalExposure": "median",
@@ -325,7 +328,9 @@ fn prepare_standard_colmap_dataset_sync(
             let source = entry?.path();
             if !source.is_file()
                 || !source.extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg")
+                    ext.eq_ignore_ascii_case("jpg")
+                        || ext.eq_ignore_ascii_case("jpeg")
+                        || ext.eq_ignore_ascii_case("png")
                 })
             {
                 continue;
@@ -341,7 +346,7 @@ fn prepare_standard_colmap_dataset_sync(
             image_count += 1;
         }
         if image_count == 0 {
-            return Err(SplatError::Process("训练输入没有 JPEG 图像".into()));
+            return Err(SplatError::Process("训练输入没有支持的图像".into()));
         }
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             let source = sparse_model.join(name);
@@ -379,6 +384,10 @@ mod tests {
             .unwrap()
             .write_all(b"jpeg")
             .unwrap();
+        std::fs::File::create(frames.join("two.png"))
+            .unwrap()
+            .write_all(b"png")
+            .unwrap();
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             std::fs::File::create(model.join(name))
                 .unwrap()
@@ -390,6 +399,7 @@ mod tests {
             .await
             .unwrap();
         assert!(output.join("images/one.jpg").is_file());
+        assert!(output.join("images/two.png").is_file());
         assert!(output.join("sparse/0/cameras.bin").is_file());
     }
 

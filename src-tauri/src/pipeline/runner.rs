@@ -117,6 +117,8 @@ pub struct SupplementDiagnostics {
     pub supplemental_media: Vec<crate::pipeline::SupplementalMedia>,
     #[serde(default)]
     pub reconstruction_plan: Option<crate::pipeline::SupplementReconstructionPlan>,
+    #[serde(default)]
+    pub reconstruction_result: Option<crate::pipeline::SupplementReconstructionResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +170,31 @@ pub async fn read_supplement_diagnostics(project: &Path) -> Result<SupplementDia
     let metadata: ProjectMetadata =
         serde_json::from_slice(&tokio::fs::read(project.join("project.json")).await?)?;
     diagnostics.supplemental_media = metadata.supplemental_media;
-    diagnostics.reconstruction_plan = metadata.supplement_reconstruction_plan;
+    diagnostics.reconstruction_plan = metadata.supplement_reconstruction_plan.clone();
+    diagnostics.reconstruction_result = metadata.supplement_reconstruction_plan.and_then(|plan| {
+        let report_path = project
+            .join("work")
+            .join("colmap-attempts")
+            .join(&plan.attempt_id)
+            .join("supplement-reconstruction-report.json");
+        let value = std::fs::read(report_path.clone())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())?;
+        let report: ReconstructionReport = serde_json::from_value(value.clone()).ok()?;
+        Some(crate::pipeline::SupplementReconstructionResult {
+            attempt_id: plan.attempt_id,
+            original_frame_count: plan.original_frame_count,
+            supplemental_frame_count: value
+                .get("supplementalFrameCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+            report_path,
+        })
+    });
     Ok(diagnostics)
 }
 
@@ -565,6 +591,18 @@ impl PipelineRunner {
     fn colmap_executable(&self) -> &Path {
         self.engines
             .colmap_for(self.colmap_backend, self.cuda_colmap_flavor)
+    }
+    fn training_preset(&self, quality: Quality) -> crate::presets::QualityPreset {
+        let mut preset = match self.training_backend {
+            TrainingBackend::Brush => self.brush_training_preset.apply(quality.preset()),
+            TrainingBackend::Gsplat => quality.preset(),
+        };
+        if self.training_backend == TrainingBackend::Gsplat
+            && self.photometric_mode == crate::engines::training::PhotometricMode::Wdr10k
+        {
+            preset.brush_iterations = 10_000;
+        }
+        preset
     }
     pub async fn verify_pipeline_engines(&self) -> Result<()> {
         let statuses = self.engines.check_all().await;
@@ -1582,6 +1620,8 @@ impl PipelineRunner {
         plan: &crate::pipeline::SupplementReconstructionPlan,
     ) -> Result<crate::pipeline::SupplementReconstructionResult> {
         let metadata_path = project.join("project.json");
+        self.events
+            .set_task_log(project.join("logs").join("task.log"));
         let metadata: ProjectMetadata =
             serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
         if metadata.status != ProjectStatus::NeedsSupplement {
@@ -1614,9 +1654,6 @@ impl PipelineRunner {
             }
         }
         colmap::require_verified_cli(self.colmap_executable())?;
-        self.events
-            .set_task_log(project.join("logs").join("task.log"));
-
         let frames = attempt_root.join("frames");
         let ffmpeg_root = attempt_root.join("ffmpeg");
         tokio::fs::create_dir_all(&frames).await?;
@@ -1938,6 +1975,309 @@ impl PipelineRunner {
             report_path,
         })
     }
+
+    /// Accepts a validated supplemental attempt and runs the normal training/export tail.
+    /// Training is prepared from the isolated attempt first; the stable frames/COLMAP layout is
+    /// promoted only after a valid PLY exists.
+    pub async fn continue_supplement_reconstruction(
+        &self,
+        project: &Path,
+    ) -> Result<PipelineResult> {
+        let continuation_started = Instant::now();
+        let metadata_path = project.join("project.json");
+        self.events
+            .set_task_log(project.join("logs").join("task.log"));
+        let mut metadata: ProjectMetadata =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+        if metadata.status != ProjectStatus::NeedsSupplement {
+            return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+        }
+        let plan = metadata
+            .supplement_reconstruction_plan
+            .clone()
+            .ok_or_else(|| SplatError::Process("尚未准备补充重建计划".into()))?;
+        let attempt_root = project
+            .join("work")
+            .join("colmap-attempts")
+            .join(&plan.attempt_id);
+        supplement_attempt_number(&plan.attempt_id)?;
+        let attempt_frames = attempt_root.join("frames");
+        let attempt_sparse = attempt_root.join("incremental-ceres").join("sparse");
+        let report_path = attempt_root.join("supplement-reconstruction-report.json");
+        let report: ReconstructionReport = serde_json::from_slice(
+            &tokio::fs::read(&report_path)
+                .await
+                .map_err(|_| SplatError::Process("补充 SfM 尚未完成，缺少质量报告".into()))?,
+        )?;
+        if report.quality == ReconstructionQuality::Failed
+            || report.registered_ratio < crate::reconstruction::validator::GOOD_REGISTERED_RATIO
+        {
+            return Err(SplatError::Process(format!(
+                "补充 SfM 未达到训练门禁：注册 {}/{}（{:.1}%），要求至少 80%",
+                report.registered_images,
+                report.input_images,
+                report.registered_ratio * 100.0
+            )));
+        }
+        let (model, candidate_report) = best_sparse_model(&attempt_frames, &attempt_sparse)?;
+        if candidate_report.registered_images != report.registered_images
+            || candidate_report.input_images != report.input_images
+        {
+            return Err(SplatError::Process(
+                "补充 SfM 报告与稀疏模型不一致，请重新验证".into(),
+            ));
+        }
+        let manifest: Vec<SupplementManifestEntry> = serde_json::from_slice(
+            &tokio::fs::read(attempt_root.join("supplement-media.json")).await?,
+        )?;
+        let registered_names: HashSet<String> = ReconstructionValidator::registered_images(&model)?
+            .into_iter()
+            .map(|image| image.name)
+            .collect();
+        for media in &plan.approved_media {
+            if media.validation_status != crate::pipeline::SupplementalValidationStatus::Passed {
+                return Err(SplatError::Process(format!(
+                    "补充素材未通过最新验证，禁止进入训练：{}",
+                    media.path.display()
+                )));
+            }
+            let Some(entry) = manifest.iter().find(|entry| entry.source == media.path) else {
+                return Err(SplatError::Process(format!(
+                    "补充素材未写入 attempt 清单：{}",
+                    media.path.display()
+                )));
+            };
+            if !entry
+                .output_files
+                .iter()
+                .any(|name| registered_names.contains(name))
+            {
+                return Err(SplatError::Process(format!(
+                    "补充素材未注册，禁止进入训练：{}",
+                    media.path.display()
+                )));
+            }
+        }
+        let final_ply = project.join(format!(
+            "{}.ply",
+            metadata
+                .source_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("splat")
+        ));
+        if final_ply.exists() {
+            return Err(SplatError::Process(format!(
+                "正式 PLY 已存在，拒绝覆盖：{}",
+                final_ply.display()
+            )));
+        }
+        match self.training_backend {
+            TrainingBackend::Brush => brush::require_verified_cli(&self.engines.brush)?,
+            TrainingBackend::Gsplat => {
+                if !engines::training::gsplat_runtime_healthy(&self.engines.root).await {
+                    return Err(SplatError::UnsupportedEngine(
+                        "gsplat CUDA 运行时未通过健康检查；请改用 Brush。".into(),
+                    ));
+                }
+                colmap::require_verified_cli(self.colmap_executable())?;
+            }
+        }
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            1.0,
+            format!(
+                "补充 SfM 已通过训练门禁：注册 {}/{}；正在准备训练输入",
+                report.registered_images, report.input_images
+            ),
+        );
+        let paths = ProjectPaths {
+            project: project.to_path_buf(),
+            frames: project.join("frames"),
+            colmap: project.join("work").join("colmap"),
+            brush: project.join("work").join("brush"),
+            training_input: project.join("work").join("training-input"),
+            gsplat: project.join("work").join("gsplat"),
+            logs: project.join("logs"),
+            metadata: metadata_path.clone(),
+            state: project.join("state.json"),
+        };
+        let training_input = match self.training_backend {
+            TrainingBackend::Brush => {
+                training::prepare_standard_colmap_dataset(
+                    &paths.training_input,
+                    &attempt_frames,
+                    &model,
+                )
+                .await?;
+                paths.training_input.clone()
+            }
+            TrainingBackend::Gsplat => {
+                let undistorted = paths.gsplat.join("training-input-undistorted");
+                let temporary = paths.gsplat.join(".training-input-undistorted.tmp");
+                if temporary.exists() {
+                    tokio::fs::remove_dir_all(&temporary).await?;
+                }
+                colmap::undistort_images(
+                    self.colmap_executable(),
+                    &attempt_frames,
+                    &model,
+                    &temporary,
+                    paths.logs.join("colmap-supplement-undistort.log"),
+                    &self.process_manager,
+                )
+                .await?;
+                let sparse_model = normalize_undistorted_sparse_layout(&temporary).await?;
+                if !temporary.join("images").is_dir() || !sparse_model.join("cameras.bin").is_file()
+                {
+                    return Err(SplatError::Process(
+                        "补充素材去畸变输出不完整，已停止训练。".into(),
+                    ));
+                }
+                if undistorted.exists() {
+                    tokio::fs::remove_dir_all(&undistorted).await?;
+                }
+                tokio::fs::rename(&temporary, &undistorted).await?;
+                undistorted
+            }
+        };
+        let mut state: PipelineStateFile = match tokio::fs::read(&paths.state).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(_) => PipelineStateFile::created(metadata.quality),
+        };
+        state.training_input_complete = true;
+        state.reconstruction_complete = true;
+        state.needs_supplement = None;
+        state.supplement_reconstruction_plan = None;
+        state.colmap_execution.effective_backend = Some(self.colmap_backend);
+        state.colmap_execution.effective_ba_backend = Some("ceres-supplemented".into());
+        if let Some(frames) = state.frames.as_mut() {
+            frames.extracted_frames = Some(report.input_images);
+            frames.selected_frames = Some(report.input_images);
+        }
+        let preset = self.training_preset(metadata.quality);
+        self.events.stage(
+            PipelineStage::TrainingSplats,
+            0.0,
+            format!(
+                "{} · 0/{}",
+                if self.training_backend == TrainingBackend::Brush {
+                    "Brush"
+                } else {
+                    "gsplat CUDA"
+                },
+                preset.brush_iterations
+            ),
+        );
+        let engine = if self.training_backend == TrainingBackend::Brush {
+            PipelineEngine::Brush
+        } else {
+            PipelineEngine::Gsplat
+        };
+        let training_output = training::train(
+            self.training_backend,
+            &self.engines.brush,
+            &self.engines.root,
+            TrainingRequest {
+                dataset_root: training_input,
+                output_directory: match self.training_backend {
+                    TrainingBackend::Brush => paths.brush.clone(),
+                    TrainingBackend::Gsplat => paths.gsplat.clone(),
+                },
+                total_steps: preset.brush_iterations,
+                max_resolution: preset.brush_max_resolution,
+                max_splats: match self.training_backend {
+                    TrainingBackend::Brush => preset.brush_max_splats,
+                    TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
+                },
+                seed: 42,
+                photometric_mode: self.photometric_mode,
+                densification_strategy: self.gsplat_densification_strategy,
+                multi_view_densification_gate: self.multi_view_densification_gate,
+                floater_pruning: self.floater_pruning,
+                log_path: paths
+                    .logs
+                    .join(if self.training_backend == TrainingBackend::Brush {
+                        "brush-supplement.log"
+                    } else {
+                        "gsplat-supplement.log"
+                    }),
+            },
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::TrainingSplats,
+                engine,
+                Some(preset.brush_iterations as u64),
+                if self.training_backend == TrainingBackend::Brush {
+                    ObserverMode::Brush(paths.brush.clone())
+                } else {
+                    ObserverMode::Gsplat
+                },
+            )),
+        )
+        .await?;
+        self.events
+            .stage(PipelineStage::TrainingSplats, 1.0, "补充素材训练完成");
+        self.events
+            .stage(PipelineStage::Exporting, 0.0, "正在校验并发布补充素材 PLY");
+        let ply = inspect_gaussian_ply(&training_output.candidate_ply)?;
+        promote_supplemented_frames(
+            &paths.frames,
+            &attempt_frames,
+            &attempt_root.join("original-frames"),
+        )?;
+        let _stable_model =
+            promote_colmap_attempt(&attempt_root.join("database.db"), &model, &paths.colmap)?;
+        tokio::fs::rename(&training_output.candidate_ply, &final_ply).await?;
+        state.stage = PipelineStage::Completed;
+        state.brush_complete = self.training_backend == TrainingBackend::Brush;
+        state.supplemental_media = metadata.supplemental_media.clone();
+        metadata.status = ProjectStatus::Completed;
+        metadata.completed_at = Some(Utc::now());
+        metadata.duration_ms = Some(
+            metadata
+                .duration_ms
+                .unwrap_or(0)
+                .saturating_add(continuation_started.elapsed().as_millis() as u64),
+        );
+        metadata.needs_supplement = None;
+        metadata.supplement_reconstruction_plan = None;
+        metadata.colmap_execution.effective_backend = Some(self.colmap_backend);
+        metadata.colmap_execution.effective_ba_backend = Some("ceres-supplemented".into());
+        let output = ProjectOutput {
+            final_ply: final_ply.clone(),
+            file_size: ply.file_size,
+            splat_count: ply.splat_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+        };
+        metadata.output = Some(output.clone());
+        atomic_write_json(&paths.state, &state).await?;
+        atomic_write_json(&paths.metadata, &metadata).await?;
+        self.events
+            .stage(PipelineStage::Exporting, 1.0, "补充素材 PLY 已发布");
+        self.events
+            .stage(PipelineStage::Completed, 1.0, "补充素材任务完成");
+        let completed_at = metadata.completed_at.unwrap_or_else(Utc::now);
+        Ok(PipelineResult {
+            project_id: metadata.id.to_string(),
+            project_path: paths.project,
+            final_ply,
+            file_size: output.file_size,
+            splat_count: output.splat_count,
+            input_images: output.input_images,
+            registered_images: output.registered_images,
+            registered_ratio: output.registered_ratio,
+            points_3d: output.points_3d,
+            duration_ms: metadata.duration_ms.unwrap_or(0),
+            completed_at,
+            warning: None,
+            logs_directory: paths.logs,
+            colmap_backend: self.colmap_backend,
+        })
+    }
     /// Runs an already reconstructed Splatcam export. This intentionally bypasses all video
     /// probing/extraction, feature extraction, matching and mapper/CASPAR calls.
     pub async fn generate_splatcam(
@@ -1945,6 +2285,7 @@ impl PipelineRunner {
         source: &Path,
         quality: Quality,
         projects_root: &Path,
+        preflight: Option<splatcam::SplatcamImportReport>,
     ) -> Result<PipelineResult> {
         engines::require_cpu_colmap(&self.engines).await?;
         colmap::require_verified_cli(&self.engines.colmap)?;
@@ -1961,7 +2302,7 @@ impl PipelineRunner {
         metadata.input_source = InputSource::Splatcam;
         let started = Instant::now();
         let result = self
-            .run_splatcam_project(&project_manager, &paths, &mut metadata, quality)
+            .run_splatcam_project(&project_manager, &paths, &mut metadata, quality, preflight)
             .await;
         if let Err(error) = &result {
             metadata.status = if matches!(error, SplatError::Cancelled) {
@@ -2780,10 +3121,7 @@ impl PipelineRunner {
         metadata.timings.training_input_ms = phase_started.elapsed().as_millis() as u64;
         state.training_input_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
-        let preset = match self.training_backend {
-            TrainingBackend::Brush => self.brush_training_preset.apply(quality.preset()),
-            TrainingBackend::Gsplat => quality.preset(),
-        };
+        let preset = self.training_preset(quality);
         let engine = match self.training_backend {
             TrainingBackend::Brush => PipelineEngine::Brush,
             TrainingBackend::Gsplat => PipelineEngine::Gsplat,
@@ -2926,6 +3264,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         metadata: &mut ProjectMetadata,
         quality: Quality,
+        preflight: Option<splatcam::SplatcamImportReport>,
     ) -> Result<PipelineResult> {
         let total_started = Instant::now();
         let source = metadata.source_path.clone();
@@ -2942,12 +3281,17 @@ impl PipelineRunner {
         metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
         self.splatcam_import_step(0, 5, "正在验证 Splatcam RGB、相机、位姿与点云");
         tokio::fs::create_dir_all(&import_root).await?;
-        let report = tokio::task::spawn_blocking({
-            let source = source.clone();
-            move || splatcam::inspect_export(&source)
-        })
-        .await
-        .map_err(|error| SplatError::Process(format!("Splatcam 导入检查任务失败：{error}")))??;
+        let report = match preflight {
+            Some(report) => report,
+            None => tokio::task::spawn_blocking({
+                let source = source.clone();
+                move || splatcam::inspect_export(&source)
+            })
+            .await
+            .map_err(|error| {
+                SplatError::Process(format!("Splatcam 导入检查任务失败：{error}"))
+            })??,
+        };
         // Keep the full geometry metrics beside the normalized model. `project.json` deliberately
         // stores only the durable summary used by history, while this report is the diagnostic
         // artifact needed to audit an accepted or rejected source export.
@@ -2995,8 +3339,13 @@ impl PipelineRunner {
         self.splatcam_import_step(2, 5, "来源快照已保留；正在标准化 COLMAP 文本模型");
         let source_for_model = staged_source.clone();
         let text_destination = text_model.clone();
+        let report_for_model = report.clone();
         tokio::task::spawn_blocking(move || {
-            splatcam::prepare_normalized_text_model(&source_for_model, &text_destination)
+            splatcam::prepare_normalized_text_model(
+                &source_for_model,
+                &text_destination,
+                &report_for_model,
+            )
         })
         .await
         .map_err(|error| SplatError::Process(format!("Splatcam 文本模型标准化失败：{error}")))??;
@@ -3037,10 +3386,7 @@ impl PipelineRunner {
         state.training_input_complete = true;
         state.stage = PipelineStage::TrainingSplats;
         project_manager.write_state(&paths.state, &state).await?;
-        let preset = match self.training_backend {
-            TrainingBackend::Brush => self.brush_training_preset.apply(quality.preset()),
-            TrainingBackend::Gsplat => quality.preset(),
-        };
+        let preset = self.training_preset(quality);
         let engine = match self.training_backend {
             TrainingBackend::Brush => PipelineEngine::Brush,
             TrainingBackend::Gsplat => PipelineEngine::Gsplat,
@@ -4544,10 +4890,17 @@ async fn run_ceres_mapper(
     best_sparse_model(images, sparse)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SupplementManifestEntry {
+    source: PathBuf,
+    output_files: Vec<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MapperInitializationDiagnostic {
-    input_jpegs: u64,
+    input_images: u64,
     database_bytes: u64,
     mapper_log: PathBuf,
     failure_kind: &'static str,
@@ -4561,14 +4914,14 @@ async fn mapper_initialization_diagnostic(
     error: &SplatError,
 ) -> Result<MapperInitializationDiagnostic> {
     let mut entries = tokio::fs::read_dir(images).await?;
-    let mut input_jpegs = 0;
+    let mut input_images = 0;
     while let Some(entry) = entries.next_entry().await? {
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
-        {
-            input_jpegs += 1;
+        if entry.path().extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("png")
+        }) {
+            input_images += 1;
         }
     }
     let log_text = tokio::fs::read_to_string(log).await.unwrap_or_default();
@@ -4594,7 +4947,7 @@ async fn mapper_initialization_diagnostic(
         .unwrap_or(0);
     let _ = error;
     Ok(MapperInitializationDiagnostic {
-        input_jpegs,
+        input_images,
         database_bytes,
         mapper_log: log.to_path_buf(),
         failure_kind,

@@ -23,13 +23,24 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+const SPLATCAM_PREFLIGHT_TTL: Duration = Duration::from_secs(300);
+
+struct SplatcamPreflightCache {
+    source: PathBuf,
+    fingerprint: String,
+    checked_at: Instant,
+    report: crate::splatcam::SplatcamImportReport,
+}
+
 #[derive(Default)]
 pub struct PipelineController {
     active: Mutex<Option<Arc<PipelineRunner>>>,
+    splatcam_preflight: Mutex<Option<SplatcamPreflightCache>>,
 }
 impl PipelineController {
     /// Used by the native close handler. It deliberately checks the Rust-owned
@@ -45,6 +56,33 @@ impl PipelineController {
             runner.cancel().await;
         });
         true
+    }
+
+    async fn take_splatcam_preflight(
+        &self,
+        source: &Path,
+    ) -> Option<crate::splatcam::SplatcamImportReport> {
+        let fingerprint = tokio::task::spawn_blocking({
+            let source = source.to_path_buf();
+            move || crate::splatcam::source_fingerprint(&source)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok);
+        let mut cache = self.splatcam_preflight.lock().await;
+        let valid = fingerprint.as_ref().is_some_and(|fingerprint| {
+            cache.as_ref().is_some_and(|entry| {
+                entry.source == source
+                    && entry.fingerprint == *fingerprint
+                    && entry.checked_at.elapsed() <= SPLATCAM_PREFLIGHT_TTL
+            })
+        });
+        if valid {
+            cache.take().map(|entry| entry.report)
+        } else {
+            *cache = None;
+            None
+        }
     }
 }
 #[derive(Serialize)]
@@ -329,6 +367,73 @@ pub async fn start_supplement_reconstruction(
     }
     let result = runner
         .run_supplement_reconstruction(&project.project_path, &plan)
+        .await;
+    if let Err(error) = &result {
+        let stage = if matches!(error, SplatError::Cancelled) {
+            crate::pipeline::PipelineStage::Cancelled
+        } else {
+            crate::pipeline::PipelineStage::Failed
+        };
+        let _ = app.emit(
+            "pipeline-event",
+            crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()),
+        );
+    }
+    *state.active.lock().await = None;
+    result
+}
+
+#[tauri::command]
+pub async fn continue_supplement_reconstruction(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    project_id: String,
+) -> std::result::Result<PipelineResult, SplatError> {
+    let id = Uuid::parse_str(&project_id)
+        .map_err(|_| SplatError::Process("补充素材项目编号无效".into()))?;
+    let project = catalog::get_overview()
+        .await?
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该补充素材任务".into()))?;
+    if project.status != ProjectStatus::NeedsSupplement {
+        return Err(SplatError::Process("该项目不处于等待补充素材状态".into()));
+    }
+    let metadata: crate::pipeline::ProjectMetadata =
+        serde_json::from_slice(&tokio::fs::read(project.project_path.join("project.json")).await?)?;
+    if metadata.supplement_reconstruction_plan.is_none() {
+        return Err(SplatError::Process("尚未准备补充重建计划".into()));
+    }
+    let settings = catalog::load_settings().await?;
+    let emitter = app.clone();
+    let runner = Arc::new(PipelineRunner::new(
+        paths_for_app(&app),
+        settings.colmap_backend,
+        settings.cuda_colmap_flavor,
+        settings.mapper_ba_mode,
+        settings.ffmpeg_hw_accel,
+        metadata.brush_training_preset,
+        metadata.gsplat_splat_cap,
+        metadata.gsplat_densification_strategy,
+        settings.multi_view_densification_gate,
+        settings.floater_pruning,
+        metadata.photometric_mode,
+        metadata.training_backend,
+        true,
+        move |event| {
+            let _ = emitter.emit("pipeline-event", event);
+        },
+    ));
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() {
+            return Err(SplatError::Process("已有任务正在运行".into()));
+        }
+        *active = Some(runner.clone());
+    }
+    let result = runner
+        .continue_supplement_reconstruction(&project.project_path)
         .await;
     if let Err(error) = &result {
         let stage = if matches!(error, SplatError::Cancelled) {
@@ -925,12 +1030,27 @@ pub async fn download_colmap_cuda(app: tauri::AppHandle) -> Result<EngineStatus>
 /// convert a COLMAP model, or start any video/COLMAP process.
 #[tauri::command]
 pub async fn inspect_splatcam_import(
+    state: State<'_, PipelineController>,
     path: String,
 ) -> std::result::Result<crate::splatcam::SplatcamImportReport, SplatError> {
     let source = PathBuf::from(path);
-    tokio::task::spawn_blocking(move || crate::splatcam::inspect_export(&source))
-        .await
-        .map_err(|error| SplatError::Process(format!("Splatcam 导入检查任务失败：{error}")))?
+    let (fingerprint, report) = tokio::task::spawn_blocking({
+        let source = source.clone();
+        move || {
+            let fingerprint = crate::splatcam::source_fingerprint(&source)?;
+            let report = crate::splatcam::inspect_export(&source)?;
+            Ok::<_, SplatError>((fingerprint, report))
+        }
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("Splatcam 导入检查任务失败：{error}")))??;
+    *state.splatcam_preflight.lock().await = Some(SplatcamPreflightCache {
+        source,
+        fingerprint,
+        checked_at: Instant::now(),
+        report: report.clone(),
+    });
+    Ok(report)
 }
 
 #[tauri::command]
@@ -1012,6 +1132,7 @@ pub async fn start_splatcam_pipeline(
 ) -> std::result::Result<PipelineResult, SplatError> {
     let settings = catalog::load_settings().await?;
     let emitter = app.clone();
+    let source = PathBuf::from(path);
     let runner = Arc::new(PipelineRunner::new(
         paths_for_app(&app),
         settings.colmap_backend,
@@ -1037,11 +1158,13 @@ pub async fn start_splatcam_pipeline(
         }
         *active = Some(runner.clone());
     }
+    let preflight = state.take_splatcam_preflight(&source).await;
     let result = runner
         .generate_splatcam(
-            PathBuf::from(path).as_path(),
+            &source,
             quality,
             PathBuf::from(projects_root).as_path(),
+            preflight,
         )
         .await;
     if let Err(error) = &result {

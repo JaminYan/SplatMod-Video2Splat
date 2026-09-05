@@ -134,7 +134,12 @@ async fn execute(cli: Cli) -> Result<()> {
             let source = input.clone();
             let text_destination = text_model.clone();
             let report = tokio::task::spawn_blocking(move || {
-                ooo_splat::splatcam::prepare_normalized_text_model(&source, &text_destination)
+                let report = ooo_splat::splatcam::inspect_export(&source)?;
+                ooo_splat::splatcam::prepare_normalized_text_model(
+                    &source,
+                    &text_destination,
+                    &report,
+                )
             })
             .await
             .map_err(|error| SplatError::Process(format!("Splatcam 标准化任务失败：{error}")))??;

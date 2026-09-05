@@ -19,7 +19,7 @@ export type GsplatDensificationStrategy = "mcmc" | "absgrad";
 export type TrainingBackend = "brush" | "gsplat";
 export type InputSource = "video" | "splatcam";
 /** Mutually exclusive gsplat experimental module. WD-R keeps photometric mode off. */
-export type PhotometricMode = "none" | "ppisp" | "wdr";
+export type PhotometricMode = "none" | "ppisp" | "wdr" | "wdr10k";
 export interface EngineStatus {
   kind: EngineKind;
   path: string;
@@ -152,6 +152,7 @@ export interface SupplementDiagnostics {
   weakIntervals: SupplementWeakInterval[];
   supplementalMedia: SupplementalMedia[];
   reconstructionPlan: SupplementReconstructionPlan | null;
+  reconstructionResult: SupplementReconstructionResult | null;
 }
 export interface SupplementalMedia {
   path: string;
@@ -201,5 +202,18 @@ export interface SplatcamImportReport {
   positiveDepthProjectionRatio: number;
   inImageProjectionRatio: number;
   cameraTrajectoryExtent: number;
+  imageQuality: {
+    sharpnessP10: number;
+    sharpnessMedian: number;
+    sharpnessP90: number;
+    lowSharpnessRatio: number;
+    clarityGate: { passed: boolean; reason: string | null };
+  };
+  trajectoryCoverage: {
+    pathLength: number;
+    pathToExtentRatio: number;
+    medianStep: number;
+    p90Step: number;
+  };
   geometryGate: { passed: boolean; reason: string | null };
 }
