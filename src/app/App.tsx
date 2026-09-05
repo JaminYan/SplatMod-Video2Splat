@@ -620,7 +620,7 @@ function PhotometricModeBlock() {
   { value: "none" as const, title: "关闭（M0 基线）", hint: "使用标准 L1 + DSSIM，不增加附加模型成本。" },
   { value: "ppisp" as const, title: "PPISP（实验）", hint: "补偿曝光、白平衡、暗角与色调变化；单帧训练，PLY 不含 controller。" },
   { value: "wdr" as const, title: "WD-R（15k）", hint: "VGG-16 Wasserstein 感知损失；15,000 步，单帧训练且明显更慢。" },
-  { value: "wdr10k" as const, title: "WD-R（10k）", hint: "同一 WD-R 损失；固定 10,000 步，预计比 15k 更快，适合质量/时间 A/B。" },
+  { value: "wdr10k" as const, title: "WD-R（10k，推荐实验）", hint: "同一 WD-R 损失；固定 10,000 步。当前小桌、游戏桌实测质量优于无 WD-R，仍保持实验选项。" },
  ];
  return <div className="settings-block"><div className="settings-block-title">附加训练模块</div><p className="settings-block-hint">仅 gsplat 生效，PPISP 与 WD-R 互斥。WD-R 10k 只改变步数，不改变损失参数。</p><div className="backend-toggle" role="radiogroup" aria-label="附加训练模块">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setPhotometricMode(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }
