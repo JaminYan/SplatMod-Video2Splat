@@ -7,7 +7,7 @@ Windows 本地视频或已重建数据转 3D Gaussian Splatting 桌面应用。�
 ## 0.48 新增与完善
 
 - **自适应 SfM 抽帧**：均衡/精细档先用低分辨率代理分析背景运动，通过 FFmpeg `-stats_mux_pre` 保留输入帧索引 `ni` 与显示时间 `ti`，再精确抽取原图；索引缺失、时间戳异常或代理失败时自动回退到固定 2/4 FPS。
-- **质量闭环与可恢复诊断**：自适应结果会继续经过 COLMAP 注册率、稀疏点和模型解析检查；不足时支持定向补帧或进入 `needsSupplement`，不覆盖原始 attempt，取消后仍保留诊断日志和恢复上下文。
+- **质量闭环与可恢复诊断**：自适应结果会继续经过 COLMAP 注册率、稀疏点和模型解析检查；不足时支持定向补帧或进入 `needsSupplement`，不覆盖原始 attempt，取消后仍保留诊断日志和恢复上下文。补充 SfM 通过严格质量门禁后，可从隔离 attempt 继续进入标准训练与导出尾段。
 - **CASPAR/Ceres 明确分工**：COLMAP 4.1.1 的局部 BA 使用 Ceres，中大型任务尝试 CASPAR 全局 BA；CASPAR 启动、Mapper、模型解析或质量门禁失败时，在独立目录回退 Ceres并记录实际后端与原因。
 - **可切换工作流锁定**：任务开始后锁定 FFmpeg 解码模式、COLMAP CPU/CUDA/CASPAR 后端、Brush/gsplat 训练后端和质量预设，避免运行中改变输入或设备状态。
 - **进度与诊断增强**：界面区分总进度、当前阶段和阶段百分比；长时间无外部输出时显示心跳，详细 FFmpeg/COLMAP/训练日志写入项目目录，错误提示包含可执行的回退建议。
@@ -19,6 +19,7 @@ Windows 本地视频或已重建数据转 3D Gaussian Splatting 桌面应用。�
 - **弱区补充素材闭环**：对注册率不足的任务保留弱区诊断、前后锚点和有限尺寸 JPEG 预览；用户可将 MP4/MOV/JPG/JPEG/PNG 绑定到指定弱区，路径与绑定状态持久化，为后续定向补帧重建提供明确入口。
 - **历史任务筛选与诊断入口**：历史任务支持按全部、已完成、等待补充、失败/已取消筛选；等待补充的任务可查看诊断和弱区预览，不需要重新扫描大型 PLY。
 - **Gaussian 质量增强配置**：gsplat 设置新增 MCMC/AbsGS 增殖策略与 WD-R 感知训练选项；实验路径保留固定素材、seed、splat cap 和基线对照要求，不把实验开关描述为普遍质量保证。
+- **Splatcam 输入质量报告**：只读导入额外记录 Laplacian 清晰度 p10/中位/p90、低清晰度比例，以及相机路径长度、路径/范围比和相邻间隔；这些是采集提示，不会用未经校准的绝对阈值阻断训练。
 
 ## 相对原项目的升级
 
@@ -36,7 +37,8 @@ Windows 本地视频或已重建数据转 3D Gaussian Splatting 桌面应用。�
 | 历史任务 | 首屏仅读取项目元数据，不扫描大型 PLY；详情按需展开，保留查看 3D、资源管理器与删除操作。 |
 | 任务产物 | 项目目录采用 `YYYYMMDD_视频文件名`；最终 PLY 使用原视频文件名，例如 `20260822_walkthrough/walkthrough.ply`。 |
 | Splatcam 数据导入 | 复用已经完成的相机/位姿/点云；通过模型标准化生成 `cameras.bin`、`images.bin`、`points3D.bin`，不重复执行视频和 COLMAP 重建。 |
-| 弱区补充素材 | 对 `needsSupplement` 任务展示弱区前后锚点预览，支持绑定补充视频或照片并持久化校验待处理状态；当前完成的是安全绑定与诊断入口，不宣称已完成自动重建闭环。 |
+| 弱区补充素材 | 对 `needsSupplement` 任务展示弱区前后锚点预览，支持绑定补充视频或照片并持久化校验状态；补充素材可在隔离 attempt 中完成 SfM 验证，验收通过后继续训练，不覆盖原始 attempt。 |
+| Splatcam 质量与轨迹 | 导入报告提供相对清晰度分布和相机轨迹覆盖指标，帮助定位运动模糊、视角重叠不足等采集问题；当前仅提示，不替代 COLMAP 几何质量门禁。 |
 | 训练质量实验开关 | gsplat 可选择 MCMC 或 AbsGS，并可选择 M0、PPISP 或 WD-R；所有实验结果仍需同素材、同设备、同 seed 的 A/B 验收。 |
 
 ## 流程
@@ -72,6 +74,7 @@ COLMAP 注册率低于 50% 时任务停止；50%–80% 时继续完成，但会�
 5. 点击“开始生成”。左侧显示整体进度，任务日志在右侧历史/详情中查看。
 6. 完成后在历史任务中打开项目目录、点击“查看 3D”，或直接取得同名 PLY。
 7. 如果任务进入“等待补充素材”，在历史任务中打开诊断，查看弱区预览并为对应弱区绑定补充视频或照片；绑定后会保留为待校验素材，不会静默覆盖原始 attempt。
+   补充 SfM 验证通过后，可选择“采用补充 SfM 并继续训练”，系统会从隔离 attempt 生成训练输入并继续标准训练/导出。
 
 ### 导入 Splatcam 已重建数据
 
@@ -97,7 +100,7 @@ work/training-input/
 
 导入模式不会执行 FFprobe、FFmpeg、pHash/Laplacian、SIFT、匹配、Mapper 或 CASPAR。可以先选择“仅检查导入”，确认质量门禁通过后再选择 Brush 或 gsplat 训练。
 
-当前 0.48 支持的是 RGB 点云导出格式；`points3D.ply` 只是训练初始化点云，不是最终 Gaussian PLY。LiDAR 深度和 `transforms.json` 尚未作为本期必需输入，发现它们时会保留为后续扩展数据。
+当前 0.48 支持的是 RGB 点云导出格式；`points3D.ply` 只是训练初始化点云，不是最终 Gaussian PLY。LiDAR 深度和 `transforms.json` 尚未作为本期必需输入，发现它们时会保留为后续扩展数据；导入界面会展示当前 RGB/位姿质量与轨迹覆盖报告。
 
 ### Brush 训练预设
 
@@ -183,7 +186,7 @@ Splatcam 导入的详细数据契约、模型转换、坐标系门禁和测试�
 
 - CUDA 是默认偏好，不是必需条件。实际的 COLMAP 加速效果取决于显卡、驱动与 COLMAP 参数；CPU/no-CUDA 可作为回退。
 - Brush 是默认训练后端；gsplat CUDA 为实验功能。相同画质档不承诺生成相同数量的 splat，也不能凭单次训练宣称速度或质量更优。
-- Splatcam 导入当前要求标准 COLMAP 文本相机/位姿和 RGB 点云；如果导出缺少 `cameras.txt`、`images.txt` 或 `points3D.ply`，不会自动猜测坐标系或回退到视频流程。
+- Splatcam 导入当前要求标准 COLMAP 文本相机/位姿和 RGB 点云；如果导出缺少 `cameras.txt`、`images.txt` 或 `points3D.ply`，不会自动猜测坐标系或回退到视频流程。清晰度与轨迹报告用于提示采集风险，不替代模型解析、注册率和投影覆盖门禁。
 - 当前 Splatcam PLY 只有 XYZ/RGB 属性，不能直接作为最终 Gaussian PLY；最终输出仍必须由 Brush/gsplat 训练并通过 Gaussian 属性校验。
 - `images.txt` 的位姿按 COLMAP world-to-camera 解释，不直接套用 NeRF/OpenGL 的 camera-to-world 转换。真实深度单位、`transforms.json` 轴向转换和深度监督训练属于后续扩展。
 - CUDA 与 CPU 的 COLMAP 尝试目录彼此隔离。仅 CUDA/驱动/显存等运行时故障才会自动切换到独立 CPU 尝试；素材质量问题不会被误判为回退条件。CUDA 且筛选后保留至少 151 帧时，Mapper 会先尝试 CASPAR GPU BA；启动、Mapper、模型解析或注册率低于 50% 时，会在独立目录回退 Ceres，并把实际 BA 后端与原因写入项目记录。CASPAR 仍是实验路径，尚未完成 631 帧真实样本的性能/质量验收。
