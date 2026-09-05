@@ -862,7 +862,7 @@ export function App() {
         <div className="brand-lockup">
           <span className="brand-mark"><Aperture size={17} /></span>
           <span className="brand-name">OOO<span>Splat</span></span>
-          <span className="version-tag">LOCAL / 0.48 · MOD By Jamin</span>
+          <span className="version-tag">LOCAL / 0.49 · MOD By Jamin</span>
         </div>
         <div className="engine-summary">
           <span className={missingEngines.length ? "status-light warning" : "status-light"} />
