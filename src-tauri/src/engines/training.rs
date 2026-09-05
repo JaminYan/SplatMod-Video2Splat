@@ -47,6 +47,8 @@ pub enum GsplatDensificationStrategy {
     #[default]
     Mcmc,
     Absgrad,
+    /// Run the validated short MCMC/gate3 pre-screen, then continue the winner.
+    Auto,
 }
 
 impl GsplatDensificationStrategy {
@@ -54,6 +56,7 @@ impl GsplatDensificationStrategy {
         match self {
             Self::Mcmc => "mcmc",
             Self::Absgrad => "absgrad",
+            Self::Auto => "auto",
         }
     }
 }
@@ -103,6 +106,16 @@ fn resolve_gsplat_root(engines_root: &Path) -> Option<PathBuf> {
         .ancestors()
         .map(|ancestor| ancestor.join("engines").join("gsplat"))
         .find(|candidate| candidate.is_dir())
+}
+
+/// PowerShell 5.1 does not reliably populate `$PSScriptRoot` when `-File`
+/// receives a Windows extended-length (`\\?\\`) path from `Command`.
+/// Passing the ordinary absolute form keeps both dev and packaged launches
+/// equivalent.
+fn powershell_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().into_owned();
+    text.strip_prefix(r"\\?\")
+        .map_or(path, PathBuf::from)
 }
 
 /// Keeps only monotonic, bounded progress events. Invalid JSONL and late/stale
@@ -224,16 +237,17 @@ async fn train_gsplat(
         ));
     }
     tokio::fs::create_dir_all(&request.output_directory).await?;
-    let candidate = request.output_directory.join("final.ply.tmp");
-    if candidate.is_file() {
-        tokio::fs::remove_file(&candidate).await?;
+    let manual_candidate = request.output_directory.join("final.ply.tmp");
+    if manual_candidate.is_file() {
+        tokio::fs::remove_file(&manual_candidate).await?;
     }
     let config_path = request.output_directory.join("request.json");
+    let log_display = request.log_path.display().to_string();
     let config = serde_json::json!({
         "schemaVersion": 1,
         "dataDir": request.dataset_root,
         "resultDir": request.output_directory,
-        "outputPly": candidate,
+        "outputPly": manual_candidate,
         "strategy": request.densification_strategy.config_name(),
         "multiViewDensificationGate": request.multi_view_densification_gate,
         "floaterPruning": request.floater_pruning,
@@ -256,23 +270,64 @@ async fn train_gsplat(
     });
     tokio::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).await?;
     let started = std::time::Instant::now();
+    let (executable, args, candidate, log_path) =
+        if request.densification_strategy == GsplatDensificationStrategy::Auto {
+            let script = engines_root
+                .parent()
+                .map(|parent| parent.join("scripts/run-gsplat-autoselect.ps1"))
+                .filter(|path| path.is_file())
+                .ok_or_else(|| {
+                    SplatError::UnsupportedEngine(
+                        "gsplat 自动预筛脚本未安装；请改用 MCMC 或 Brush。".into(),
+                    )
+                })?;
+            let selected = request
+                .output_directory
+                .join("auto-select/selected/final.ply");
+            (
+                PathBuf::from("powershell.exe"),
+                vec![
+                    OsString::from("-NoProfile"),
+                    OsString::from("-ExecutionPolicy"),
+                    OsString::from("Bypass"),
+                    OsString::from("-File"),
+                    powershell_path(script).into(),
+                    OsString::from("-RequestPath"),
+                    config_path.clone().into(),
+                    OsString::from("-OutputRoot"),
+                    request.output_directory.join("auto-select").into(),
+                    OsString::from("-GsplatRoot"),
+                    powershell_path(gsplat_root.clone()).into(),
+                ],
+                selected,
+                request.log_path,
+            )
+        } else {
+            (
+                python,
+                vec![
+                    adapter.into(),
+                    OsString::from("--config"),
+                    config_path.clone().into(),
+                ],
+                manual_candidate,
+                request.log_path,
+            )
+        };
     let output = manager
         .run(ProcessSpec {
-            executable: python,
-            args: vec![
-                adapter.into(),
-                OsString::from("--config"),
-                config_path.into(),
-            ],
+            executable,
+            args,
             working_directory: Some(request.output_directory.clone()),
-            log_path: Some(request.log_path),
+            log_path: Some(log_path),
             observer,
         })
         .await?;
     if !output.success {
         return Err(SplatError::Process(format!(
-            "gsplat adapter 退出码 {:?}",
-            output.exit_code
+            "gsplat adapter 退出码 {:?}；详见 {}",
+            output.exit_code,
+            log_display
         )));
     }
     if !candidate.is_file() {
@@ -281,7 +336,18 @@ async fn train_gsplat(
             candidate.display()
         )));
     }
-    let (_, peak_vram_mb, reported_splats) = parse_gsplat_events(&output.stdout);
+    let event_text = if request.densification_strategy == GsplatDensificationStrategy::Auto {
+        tokio::fs::read_to_string(
+            request
+                .output_directory
+                .join("auto-select/selected/adapter.log"),
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        output.stdout.clone()
+    };
+    let (_, peak_vram_mb, reported_splats) = parse_gsplat_events(&event_text);
     Ok(TrainingOutput {
         candidate_ply: candidate,
         backend: TrainingBackend::Gsplat,

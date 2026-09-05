@@ -15,7 +15,7 @@ export type FfmpegHwAccel = "off" | "auto" | "d3d11va" | "cuda";
 export type BrushTrainingPreset = "a" | "b" | "c";
 export type GsplatSplatCap = "auto" | "1m" | "2m" | "4m";
 /** Experimental gsplat densification policy; MCMC remains the stable default. */
-export type GsplatDensificationStrategy = "mcmc" | "absgrad";
+export type GsplatDensificationStrategy = "mcmc" | "absgrad" | "auto";
 export type TrainingBackend = "brush" | "gsplat";
 export type InputSource = "video" | "splatcam";
 /** Mutually exclusive gsplat experimental module. WD-R keeps photometric mode off. */

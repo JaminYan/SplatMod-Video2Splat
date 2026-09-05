@@ -8,6 +8,7 @@ use crate::{
     error::{Result, SplatError},
     video::laplacian_variance,
 };
+use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
@@ -517,33 +518,35 @@ fn validate_images(
             poses.len()
         )));
     }
-    let mut sharpness = Vec::with_capacity(poses.len());
-    for pose in poses {
-        let camera = cameras.get(&pose.camera_id).ok_or_else(|| {
-            SplatError::Process(format!(
-                "图像 {} 引用了不存在的相机 {}",
-                pose.name, pose.camera_id
-            ))
-        })?;
-        let path = images_dir.join(&pose.name);
-        if !disk.contains(&pose.name) {
-            return Err(SplatError::Process(format!(
-                "缺少位姿对应 RGB：{}",
-                pose.name
-            )));
-        }
-        let image = image::open(&path).map_err(|error| {
-            SplatError::Process(format!("RGB 无法解码 {}：{error}", path.display()))
-        })?;
-        let (width, height) = (image.width(), image.height());
-        if width != camera.width || height != camera.height {
-            return Err(SplatError::Process(format!(
-                "RGB 尺寸与相机不一致 {}：{}x{}，预期 {}x{}",
-                pose.name, width, height, camera.width, camera.height
-            )));
-        }
-        sharpness.push(laplacian_variance(&image));
-    }
+    let sharpness = poses
+        .par_iter()
+        .map(|pose| -> Result<f64> {
+            let camera = cameras.get(&pose.camera_id).ok_or_else(|| {
+                SplatError::Process(format!(
+                    "图像 {} 引用了不存在的相机 {}",
+                    pose.name, pose.camera_id
+                ))
+            })?;
+            let path = images_dir.join(&pose.name);
+            if !disk.contains(&pose.name) {
+                return Err(SplatError::Process(format!(
+                    "缺少位姿对应 RGB：{}",
+                    pose.name
+                )));
+            }
+            let image = image::open(&path).map_err(|error| {
+                SplatError::Process(format!("RGB 无法解码 {}：{error}", path.display()))
+            })?;
+            let (width, height) = (image.width(), image.height());
+            if width != camera.width || height != camera.height {
+                return Err(SplatError::Process(format!(
+                    "RGB 尺寸与相机不一致 {}：{}x{}，预期 {}x{}",
+                    pose.name, width, height, camera.width, camera.height
+                )));
+            }
+            Ok(laplacian_variance(&image))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok((disk.len() as u64, image_quality(sharpness)))
 }
 

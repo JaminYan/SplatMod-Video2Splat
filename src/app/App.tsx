@@ -97,7 +97,7 @@ const qualityLabel = (quality: Quality) => qualities.find((item) => item.value =
 const trainingLabel = (project: ProjectSummary) => {
   if (project.trainingBackend === "brush") return `Brush ${project.brushTrainingPreset.toUpperCase()}`;
   const cap: Record<GsplatSplatCap, string> = { auto: "自动安全", "1m": "100 万", "2m": "200 万", "4m": "400 万" };
-  const strategy = project.gsplatDensificationStrategy === "absgrad" ? "AbsGS" : "MCMC";
+  const strategy = project.gsplatDensificationStrategy === "absgrad" ? "AbsGS" : project.gsplatDensificationStrategy === "auto" ? "自动预筛" : "MCMC";
   const module = project.photometricMode === "wdr10k" ? " · WD-R 10k" : project.photometricMode === "wdr" ? " · WD-R 15k" : project.photometricMode === "ppisp" ? " · PPISP" : "";
   return `gsplat ${strategy} · Splat${cap[project.gsplatSplatCap]}${module}`;
 };
@@ -591,6 +591,7 @@ function GsplatDensificationStrategyBlock() {
   const options: Array<{ value: GsplatDensificationStrategy; title: string; hint: string }> = [
     { value: "mcmc", title: "MCMC（默认，已验证）", hint: "稳定的采样与增殖路径；适合正式任务。" },
     { value: "absgrad", title: "AbsGS（实验 A/B）", hint: "按绝对屏幕梯度增殖；须和 MCMC 固定同素材、质量档、上限及 seed 对照。" },
+    { value: "auto", title: "自动预筛（实验）", hint: "同一任务短跑 MCMC 与三视角门控，按 PSNR、SSIM、L1、模型大小和显存门槛自动选择，再续训到目标步数。" },
   ];
   return <div className="settings-block"><div className="settings-block-title">gsplat 增殖策略</div><p className="settings-block-hint">仅 gsplat 生效。AbsGS 不会改变默认策略；首轮对照请关闭 PPISP，以保证只比较增殖策略。</p><div className="backend-toggle" role="radiogroup" aria-label="gsplat 增殖策略">{options.map((option) => <button key={option.value} type="button" role="radio" aria-checked={current === option.value} className={current === option.value ? "backend-option selected" : "backend-option"} title={option.hint} disabled={store.phase === "running"} onClick={() => void store.setGsplatDensificationStrategy(option.value)}><span className="backend-text"><strong>{option.title}</strong><small>{option.hint}</small></span></button>)}</div></div>;
 }

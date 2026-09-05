@@ -1,6 +1,6 @@
 [package]
 name = "ooo-splat"
-version = "0.48.0"
+version = "0.49.0"
 description = "Local video-to-Gaussian-Splatting pipeline for Windows"
 authors = ["ooolabdev"]
 license = "Apache-2.0"

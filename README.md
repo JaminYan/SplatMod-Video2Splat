@@ -1,10 +1,17 @@
-# SplatMod-Video2Splat 0.48
+# SplatMod-Video2Splat 0.49
 
 Windows 本地视频或已重建数据转 3D Gaussian Splatting 桌面应用。输入视频时，应用在本机完成抽帧、COLMAP 稀疏重建与训练；输入 Splatcam 导出时，可直接复用 RGB、相机、位姿和点云，跳过视频抽帧、画面筛选和 COLMAP 重建，最终生成标准 Gaussian PLY。默认训练后端为 Brush；gsplat CUDA 是通过运行时健康检查后才可选的实验后端。
 
 > MOD By Jamin。项目基于 [ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat) 的桌面流水线继续演进；不会上传视频或训练数据。代码仓库：[JaminYan/SplatMod-Video2Splat](https://github.com/JaminYan/SplatMod-Video2Splat)。
 
-## 0.48 新增与完善
+## 0.49 新增与完善
+
+- **补充 SfM 可续接主流程**：隔离 attempt 通过注册率、稀疏点和模型解析门禁后，可直接生成标准 `training-input`，继续 Brush/gsplat 训练与导出；原始 attempt、报告和日志保持不变。
+- **Splatcam 导入诊断增强**：导入报告增加 RGB 清晰度分布和相机轨迹覆盖指标，用于发现运动模糊、路径过短或视角重叠不足；这些指标只做采集提示，不替代几何质量门禁。
+- **gsplat 策略评估脚本**：新增只读历史策略评分、短程 policy sweep 和共享 warmup 自动选择脚本；它们输出可审计 JSON，不会自动改写默认训练策略。
+- **实验结论边界明确**：WD-R 10k 在部分素材上有质量收益但耗时约增加 2.8–3.7 倍，因此标记为推荐实验；多视图新增点门禁的 A/B 结果不稳定，默认保持关闭。
+
+## 0.48 历史新增与完善
 
 - **自适应 SfM 抽帧**：均衡/精细档先用低分辨率代理分析背景运动，通过 FFmpeg `-stats_mux_pre` 保留输入帧索引 `ni` 与显示时间 `ti`，再精确抽取原图；索引缺失、时间戳异常或代理失败时自动回退到固定 2/4 FPS。
 - **质量闭环与可恢复诊断**：自适应结果会继续经过 COLMAP 注册率、稀疏点和模型解析检查；不足时支持定向补帧或进入 `needsSupplement`，不覆盖原始 attempt，取消后仍保留诊断日志和恢复上下文。补充 SfM 通过严格质量门禁后，可从隔离 attempt 继续进入标准训练与导出尾段。
@@ -100,7 +107,7 @@ work/training-input/
 
 导入模式不会执行 FFprobe、FFmpeg、pHash/Laplacian、SIFT、匹配、Mapper 或 CASPAR。可以先选择“仅检查导入”，确认质量门禁通过后再选择 Brush 或 gsplat 训练。
 
-当前 0.48 支持的是 RGB 点云导出格式；`points3D.ply` 只是训练初始化点云，不是最终 Gaussian PLY。LiDAR 深度和 `transforms.json` 尚未作为本期必需输入，发现它们时会保留为后续扩展数据；导入界面会展示当前 RGB/位姿质量与轨迹覆盖报告。
+当前 0.49 支持的是 RGB 点云导出格式；`points3D.ply` 只是训练初始化点云，不是最终 Gaussian PLY。LiDAR 深度和 `transforms.json` 尚未作为本期必需输入，发现它们时会保留为后续扩展数据；导入界面会展示当前 RGB/位姿质量与轨迹覆盖报告。
 
 ### Brush 训练预设
 

@@ -3279,7 +3279,16 @@ impl PipelineRunner {
         metadata.brush_training_preset = self.brush_training_preset;
         metadata.gsplat_splat_cap = self.gsplat_splat_cap;
         metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
-        self.splatcam_import_step(0, 5, "正在验证 Splatcam RGB、相机、位姿与点云");
+        let reusing_preflight = preflight.is_some();
+        self.splatcam_import_step(
+            0,
+            5,
+            if reusing_preflight {
+                "已复用导入检查结果，正在保留来源快照"
+            } else {
+                "正在验证 Splatcam RGB、相机、位姿与点云"
+            },
+        );
         tokio::fs::create_dir_all(&import_root).await?;
         let report = match preflight {
             Some(report) => report,

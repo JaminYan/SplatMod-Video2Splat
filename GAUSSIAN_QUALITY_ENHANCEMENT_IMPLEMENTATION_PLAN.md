@@ -1449,6 +1449,60 @@ Splatcam 只读导入检查现复用既有 Laplacian 方差实现，写入 `impo
 
 新增 `scripts/score-gsplat-policies.ps1`，扫描已有项目目录中的 `project.json`、`validation-metrics.json`、`floater-diagnostics.json` 和 gsplat 日志，按素材分组输出候选策略、质量/资源综合分数和当前推荐。脚本只读、不修改设置、不替代固定轨迹复核；历史运行配置不完全一致时，推荐仅作为排序线索。已在 Windows PowerShell 5.1 与现有 Splatcam 运行目录上通过自检。
 
+### 20A.55 训练 checkpoint/resume 基础（已接入，默认关闭）
+
+`engines/gsplat/adapter/train_adapter.py` 现支持显式配置 `checkpointStep` + `checkpointPath` 保存训练状态，以及 `resumeCheckpoint` 从该状态继续。checkpoint 可落在增密前或增密后，保存 Gaussian 参数、Adam/均值学习率调度器、策略状态、多视角 bitset、PPISP 状态、CPU/CUDA/NumPy 随机状态，并写出同名 JSON 元数据。resume 会按 checkpoint 的参数形状重建 ParameterDict/optimizer；增密后的 checkpoint 只允许同策略恢复，避免把已经不同的轨迹伪装成公平 A/B。另加 `stopAfterCheckpoint` 和 `multiViewMinSupport`，可在预筛步数干净停止，并区分 gate2/gate3。
+
+新增 `scripts/run-gsplat-policy-sweep.ps1`：从一份 request 先生成共享 warmup checkpoint，再自动运行 `mcmc`、`gate2`、`gate3` 分支，并写出 `policy-sweep.json`。新增 `scripts/run-gsplat-autoselect.ps1`：共享 warmup 后只把 MCMC/gate3 跑到预筛步数，按固定质量/体积/显存门槛选中分支，再从预筛 checkpoint 继续到目标步数。两者当前只在 adapter/脚本层启用，桌面默认请求不传这些字段，因此既不改变 Brush 默认，也不改变现有 gsplat 训练；自动选择仍需保留摘要和固定验证帧复核。
+
+本轮仅完成代码级验证：bundled Python 可编译 adapter，Windows PowerShell 5.1 解析 sweep 脚本；真实素材运行需在能读取 Splatcam 输入目录的本机 PowerShell 中执行，不能把沙箱对 `A:\tmp` 的访问失败当作训练失败。
+
+### 20A.56 游戏桌自动策略 sweep 首次实测（`20260905_gamedesk policy-sweep`）
+
+使用 `20260905_gamedesk 3` 原始输入、seed 42、15,000 步，从同一个第 1,000 步 checkpoint 分支运行标准 MCMC、gate2（最小 2 视角）和 gate3（最小 3 视角）。第一次运行发现 PowerShell 5.1 的 UTF-8 BOM 与 adapter 的无 BOM JSON 读取不兼容，已修正脚本并成功重跑；随后又修正了 CUDA RNG 状态恢复的 CPU 类型转换。
+
+结果如下：
+
+| 分支 | PSNR | SSIM | L1 | 最终 splat | 训练耗时 | 峰值显存 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MCMC | 18.5820 | 0.728679 | 0.084473 | 741,854 | 312.1 s | 2,171 MB |
+| gate2 | 18.4429 | 0.725589 | 0.085738 | 742,794 | 312.4 s | 2,166 MB |
+| gate3 | 18.3877 | 0.727346 | 0.085068 | 947,321 | 349.9 s | 2,557 MB |
+
+本素材上 MCMC 在三项质量指标均最好；gate2 几乎没有资源收益，gate3 反而增加约 27.7% 模型体积、约 12.1% 训练时间和约 386 MB 峰值显存，同时 PSNR 下降 `0.1943 dB`。因此多视角门控首版不应进入默认策略，自动 sweep 目前只负责减少重复实验并保留候选证据，不自动切换后端或预设。完整产物在 `A:\tmp\Splatcam\20260905_gamedesk policy-sweep`，摘要为 `policy-sweep.json`。
+
+### 20A.57 小桌自动策略 sweep 第二轮（`20260905_small_desk policy-sweep`）
+
+使用 `20260905_small_desk 2` 的标准 MCMC request，保持 35 张输入、seed 42、15,000 步、1M cap、无 WD-R，从同一第 1,000 步 checkpoint 运行三分支。结果为：MCMC `18.9156/0.692023/0.077381`（PSNR/SSIM/L1）、417,733 splat、286.1 s、1,614 MB；gate2 `18.6580/0.689834/0.079872`、418,097 splat、288.9 s、1,619 MB；gate3 `19.0805/0.693531/0.075884`、418,082 splat、288.7 s、1,618 MB。
+
+本素材 gate3 相对 MCMC 提升 PSNR `0.1649 dB`、SSIM `0.001508`、L1 改善 `0.001497`，模型体积仅增加约 `0.08%`，耗时增加 `2.6 s`、显存增加 `4 MB`；gate2 则明确变差。该结果满足“质量提升且资源近似不变”的候选门槛，但与游戏桌结果相反，不能直接设为默认。下一轮只需在椅子素材上比较 MCMC 与 gate3；若椅子也通过，才考虑把 gate3 做成质量档的可选策略，否则继续保持 MCMC 默认。完整产物在 `A:\tmp\Splatcam\20260905_small_desk policy-sweep`。
+
+### 20A.58 椅子自动策略 sweep 第三轮（`20260905_chair policy-sweep`）
+
+使用 `20260905_chair 2` 严格控制 request，保持 50 张输入、seed 42、15,000 步、1M cap、无 WD-R，只比较 MCMC 与 gate3。MCMC 为 PSNR/SSIM/L1 `21.8262/0.782293/0.058945`、最终 920,386 splat、385.0 s、2,651 MB；gate3 为 `21.9634/0.783917/0.057066`、798,741 splat、378.4 s、2,483 MB。
+
+gate3 相对 MCMC 提升 PSNR `0.1372 dB`、SSIM `0.001624`、L1 改善 `0.001879`，模型减少约 `13.2%`，耗时减少 `6.6 s`，峰值显存减少 `168 MB`。结合小桌 gate3 的正向结果和游戏桌 gate3 的负向结果，三素材结论是**素材相关**：gate3 适合当前椅子/小桌这类输入，但不适合直接作为所有素材默认。下一步不再继续扩大 gate3 全局实验，而是设计“短 warmup 质量预筛 + gate3/MCMC 自动选择”的明确回退门槛；Brush 默认保持不变。
+
+### 20A.59 自动预筛与续训验证（`20260906_small_desk autoselect`）
+
+新增 `scripts/run-gsplat-autoselect.ps1`，固定门槛为 gate3 相对 MCMC 至少提升 PSNR `0.05 dB`、SSIM `0.001`、L1 不变差，且 splat/显存增幅分别不超过 `5%/10%`。真实 small_desk 测试完成了 warmup `1000` -> 两个候选预筛到 `5000` -> 选择分支继续到 `15000` 的完整流程。预筛 MCMC 为 `19.2492/0.711738/0.073735`，gate3 为 `19.2574/0.712661/0.074553`；gate3 虽 PSNR略高，但 SSIM 未达 `0.001` 且 L1 变差，因此自动回退 MCMC。最终 `selected` 请求确认使用 MCMC，完整输出 PSNR/SSIM/L1 为 `18.9177/0.685278/0.077212`。
+
+该次还验证了增密后参数形状恢复和 optimizer/checkpoint 续训路径。最终 splat 数受 CUDA 随机性影响达到约 `969,517`，与历史完整 MCMC 运行的数量不同；这属于非 bitwise deterministic 的运行差异，不能单独视为恢复错误。
+
+### 20A.60 自动策略接入应用（2026-09-06）
+
+`GsplatDensificationStrategy` 新增持久化的 `auto` 值。设置页仅在 gsplat 后端下显示“自动预筛（实验）”；Brush 默认、MCMC 和 AbsGS 的现有路径不变。选择该值后，Rust 训练入口调用随应用资源打包的 `scripts/run-gsplat-autoselect.ps1`，完成共享 warmup、MCMC/gate3 预筛和胜者续训，再把 `auto-select/selected/final.ply` 交给现有 PLY 校验与发布流程。旧设置通过 serde 默认仍为 MCMC。
+
+该接入依赖 PowerShell 和已通过 CUDA 健康检查的 gsplat 运行时；预筛阶段仍保留脚本的完整审计目录和阈值，不改变 Brush 默认，也不把 gate3 固化为全局默认。当前自动分支的实时进度仍以外层任务心跳为主，下一步若需要细粒度阶段进度，应让脚本转发每个 adapter JSONL，而不是另写一套进度协议。
+
+### 20A.61 自动预筛运行时路径修复（2026-09-06）
+
+首次从桌面开发构建选择 `auto` 时，任务 `20260905_bar 2` 在训练开始即退出。`logs/gsplat.log` 记录的根因是脚本位于 `src-tauri/target/debug/scripts`，旧逻辑从 `$PSScriptRoot` 推导 `$repoRoot`，因此无法找到 gsplat Python，尚未进入 CUDA 训练。Rust 现在把已经通过健康检查的 `engines\\gsplat` 根目录显式传给脚本；脚本仍兼容独立命令行调用，并在未提供参数时才回退到自身路径推导。该失败不是 CUDA 或素材质量结论。
+
+### 20A.62 自动预筛扩展路径兼容修复（2026-09-06）
+
+桌面构建的 PowerShell 入口可能收到 Windows 扩展路径 `\\?\\A:\\...`；PowerShell 5.1 会将其误判为无效盘符，训练尚未启动即返回退出码 `1`。Rust 调用端和 `run-gsplat-autoselect.ps1` 现在都会清理该前缀；扩展路径回归测试已能继续到请求文件读取阶段。源码 `cargo check`、67 个 Rust 单元测试、TypeScript 构建和 PowerShell 解析检查均通过。实际 CUDA 训练仍需在重启后的开发构建中复验，旧任务日志不能当作修复后的通过证据。
+
 ## 21. 尚未解决的问题
 
 后续真实素材验收仍需确认：

@@ -229,15 +229,20 @@ async fn drain_stream(
         None => return Ok(String::new()),
     };
     let mut reader = BufReader::new(&mut stream);
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
     let mut collected = String::new();
     loop {
         buffer.clear();
-        let read = reader.read_line(&mut buffer).await?;
+        // Windows PowerShell and native engines may use the active code page
+        // (or UTF-16) for diagnostics. Do not fail the whole task because a
+        // non-UTF-8 byte appeared in a child-process stream.
+        let read = reader.read_until(b'\n', &mut buffer).await?;
         if read == 0 {
             break;
         }
-        let trimmed = buffer.trim_end_matches(['\n', '\r']);
+        let trimmed = String::from_utf8_lossy(&buffer)
+            .trim_end_matches(['\n', '\r'])
+            .to_owned();
         if let Some(log) = log_file.as_ref() {
             let mut guard = log.lock().await;
             let _ = guard.write_all(trimmed.as_bytes()).await;
@@ -246,10 +251,10 @@ async fn drain_stream(
         if let Some(obs) = observer.as_ref() {
             (obs)(ProcessUpdate::Line {
                 stream: kind,
-                line: trimmed.to_owned(),
+                line: trimmed.clone(),
             });
         }
-        collected.push_str(trimmed);
+        collected.push_str(&trimmed);
         collected.push('\n');
     }
     Ok(collected)
