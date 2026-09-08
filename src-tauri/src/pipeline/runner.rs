@@ -3568,10 +3568,19 @@ impl PipelineRunner {
             initial_unit,
         )));
         let ffmpeg_state = Arc::new(std::sync::Mutex::new(FfmpegProgressState::default()));
+        let gsplat_last_step = Arc::new(std::sync::Mutex::new(0_u64));
         Arc::new(move |update| match update {
             ProcessUpdate::Line { stream, line } => {
                 let mut ffmpeg_state = ffmpeg_state.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(progress) = parse_progress(&line, &mode, total, &mut ffmpeg_state) {
+                    if matches!(&mode, ObserverMode::Gsplat) {
+                        let mut last_step =
+                            gsplat_last_step.lock().unwrap_or_else(|p| p.into_inner());
+                        if progress.2 < *last_step {
+                            return;
+                        }
+                        *last_step = progress.2;
+                    }
                     *stage_progress.lock().unwrap_or_else(|p| p.into_inner()) =
                         (progress.0, Some(progress.2), progress.3, progress.4.clone());
                     events.send(
@@ -3633,6 +3642,9 @@ impl PipelineRunner {
                         format!("Brush · {current}/{total}")
                     }
                     (PipelineEngine::Brush, _, _) => format!("Brush · {} 秒", elapsed_ms / 1000),
+                    (PipelineEngine::Gsplat, Some(current), Some(total)) => {
+                        format!("gsplat · {current}/{total}")
+                    }
                     _ => format!("运行中 · {} 秒", elapsed_ms / 1000),
                 };
                 events.send(

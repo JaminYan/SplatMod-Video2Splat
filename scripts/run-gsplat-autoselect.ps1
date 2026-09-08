@@ -34,9 +34,50 @@ function Write-Json($Object, [string]$Path) {
 }
 
 function Invoke-Adapter([string]$ConfigPath, [string]$LogPath) {
-    & $python $adapter --config $ConfigPath *> $LogPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "gsplat adapter failed for $ConfigPath (exit $LASTEXITCODE)"
+    $parent = Split-Path -Parent $LogPath
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    if (Test-Path -LiteralPath $LogPath) { Clear-Content -LiteralPath $LogPath }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $python
+    $startInfo.Arguments = '"{0}" --config "{1}"' -f $adapter, $ConfigPath
+    $startInfo.WorkingDirectory = $GsplatRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "failed to start gsplat adapter" }
+    $stdoutTask = $process.StandardOutput.ReadLineAsync()
+    $stderrTask = $process.StandardError.ReadLineAsync()
+    while ($true) {
+        $drained = $false
+        foreach ($stream in @('stdout', 'stderr')) {
+            $task = if ($stream -eq 'stdout') { $stdoutTask } else { $stderrTask }
+            if ($null -ne $task -and $task.IsCompleted) {
+                $line = $task.Result
+                if ($stream -eq 'stdout') { $stdoutTask = $null } else { $stderrTask = $null }
+                if ($null -ne $line) {
+                    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+                    [Console]::Out.WriteLine($line)
+                    $next = if ($stream -eq 'stdout') {
+                        $process.StandardOutput.ReadLineAsync()
+                    } else {
+                        $process.StandardError.ReadLineAsync()
+                    }
+                    if ($stream -eq 'stdout') { $stdoutTask = $next } else { $stderrTask = $next }
+                }
+                $drained = $true
+            }
+        }
+        if ($process.HasExited -and $null -eq $stdoutTask -and $null -eq $stderrTask) { break }
+        if (-not $drained) { Start-Sleep -Milliseconds 10 }
+    }
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $process.Dispose()
+    if ($exitCode -ne 0) {
+        throw "gsplat adapter failed for $ConfigPath (exit $exitCode)"
     }
 }
 
@@ -67,6 +108,7 @@ function Read-RunMetrics([string]$Directory, [string]$LogPath, [bool]$Checkpoint
         splats = $eventSplats
         logicalSplats = $eventLogicalSplats
         peakVramMb = if ($null -ne $eventPeakVram) { $eventPeakVram } elseif (@($peak).Count -gt 0) { [int]@($peak)[0].value } else { $null }
+        bestValidationStep = if ($null -ne $metrics -and $null -ne $metrics.PSObject.Properties['bestValidationStep']) { [int]$metrics.bestValidationStep } else { $null }
         outputPly = Join-Path $Directory 'final.ply'
     }
 }
@@ -167,6 +209,7 @@ Set-RequestProperty $final 'checkpointStep' 0
 Set-RequestProperty $final 'checkpointPath' $null
 Set-RequestProperty $final 'stopAfterCheckpoint' $false
 Set-RequestProperty $final 'resumeCheckpoint' $selected.checkpoint
+Set-RequestProperty $final 'exportBestValidation' $true
 $finalConfig = Join-Path $finalDir 'request.json'
 $finalLog = Join-Path $finalDir 'adapter.log'
 Write-Json $final $finalConfig
