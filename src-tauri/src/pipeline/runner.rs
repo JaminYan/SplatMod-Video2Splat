@@ -10,6 +10,7 @@ use crate::{
             extract_uniform_frames,
         },
         ffprobe::probe_video,
+        insta360::{is_insv, prepare_video as prepare_insta360_video},
         training::{self, TrainingBackend, TrainingRequest},
         ColmapBackend, CudaColmapFlavor, EngineKind, EnginePaths, FfmpegHwAccel,
     },
@@ -2383,13 +2384,34 @@ impl PipelineRunner {
         metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
         metadata.photometric_mode = self.photometric_mode;
         let total_started = Instant::now();
-        let prepared = self
-            .prepare_frames(
+        let source_input = if is_insv(&metadata.source_path) {
+            self.events.stage(
+                PipelineStage::ExtractingFrames,
+                0.0,
+                "正在调用 Insta360 MediaSDK 拼接并转换透视视频",
+            );
+            let work_dir = paths.project.join("work").join("insta360");
+            let prepared = prepare_insta360_video(
                 &metadata.source_path,
-                quality,
-                &paths.frames,
-                Some(&paths.logs),
+                &work_dir,
+                &self.engines.ffmpeg,
+                self.ffmpeg_hw_accel,
+                &self.process_manager,
+                Some(paths.logs.join("insta360-mediasdk.log")),
+                Some(paths.logs.join("insta360-perspective-ffmpeg.log")),
             )
+            .await?;
+            self.events.stage(
+                PipelineStage::ExtractingFrames,
+                1.0,
+                "Insta360 拼接与透视转换完成",
+            );
+            prepared
+        } else {
+            metadata.source_path.clone()
+        };
+        let prepared = self
+            .prepare_frames(&source_input, quality, &paths.frames, Some(&paths.logs))
             .await?;
         metadata.timings.probe_ms = prepared.probe_ms;
         metadata.timings.extract_ms = prepared.extract_ms;

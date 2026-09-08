@@ -3,6 +3,7 @@ pub mod colmap;
 pub mod ffmpeg;
 pub mod ffprobe;
 pub mod health;
+pub mod insta360;
 pub mod training;
 
 pub use colmap::MapperBaMode;

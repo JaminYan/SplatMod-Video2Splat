@@ -117,6 +117,7 @@ pub async fn get_settings(app: tauri::AppHandle) -> Result<EffectiveSettings> {
     let _ = statuses; // not used directly; statuses are pulled on demand.
     let selected_backend = settings.colmap_backend;
     let gsplat_available = engines::training::gsplat_runtime_healthy(&paths.root).await;
+    let insta360 = engines::insta360::sdk_status(settings.insta360_sdk_dir.as_deref());
     Ok(EffectiveSettings {
         projects_root: settings.projects_root.clone(),
         settings,
@@ -127,7 +128,17 @@ pub async fn get_settings(app: tauri::AppHandle) -> Result<EffectiveSettings> {
         cuda_colmap: cuda,
         caspar_colmap: caspar,
         gsplat_available,
+        insta360,
     })
+}
+#[tauri::command]
+pub async fn set_insta360_sdk_dir(path: String) -> Result<AppSettings> {
+    let path = if path.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    };
+    catalog::save_insta360_sdk_dir(path).await
 }
 #[tauri::command]
 pub async fn probe_and_plan(

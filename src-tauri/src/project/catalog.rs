@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-const CURRENT_SETTINGS_SCHEMA: u32 = 11;
+const CURRENT_SETTINGS_SCHEMA: u32 = 12;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -45,6 +45,8 @@ pub struct AppSettings {
     pub floater_pruning: bool,
     #[serde(default)]
     pub photometric_mode: PhotometricMode,
+    #[serde(default)]
+    pub insta360_sdk_dir: Option<PathBuf>,
 }
 impl Default for AppSettings {
     fn default() -> Self {
@@ -62,6 +64,7 @@ impl Default for AppSettings {
             multi_view_densification_gate: false,
             floater_pruning: false,
             photometric_mode: PhotometricMode::None,
+            insta360_sdk_dir: None,
         }
     }
 }
@@ -75,6 +78,7 @@ pub struct EffectiveSettings {
     pub cuda_colmap: Option<EngineStatus>,
     pub caspar_colmap: Option<EngineStatus>,
     pub gsplat_available: bool,
+    pub insta360: crate::engines::insta360::Insta360SdkStatus,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +158,9 @@ pub async fn load_settings() -> Result<AppSettings> {
                     // A user can still explicitly select gsplat again afterwards.
                     value.training_backend = TrainingBackend::Brush;
                 }
+                if let Some(path) = value.insta360_sdk_dir.as_ref() {
+                    std::env::set_var("OOOSPLAT_INSTA360_SDK_DIR", path);
+                }
                 return Ok(value);
             }
             // Older files: schema_version=1 has only projects_root; schema_version=2 has the
@@ -187,6 +194,7 @@ pub async fn load_settings() -> Result<AppSettings> {
                         multi_view_densification_gate: false,
                         floater_pruning: false,
                         photometric_mode: PhotometricMode::None,
+                        insta360_sdk_dir: None,
                     });
                 }
             }
@@ -206,6 +214,7 @@ pub async fn load_settings() -> Result<AppSettings> {
         multi_view_densification_gate: false,
         floater_pruning: false,
         photometric_mode: PhotometricMode::None,
+        insta360_sdk_dir: None,
     })
 }
 pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
@@ -295,6 +304,16 @@ pub async fn save_floater_pruning(enabled: bool) -> Result<AppSettings> {
 pub async fn save_photometric_mode(mode: PhotometricMode) -> Result<AppSettings> {
     let mut settings = load_settings().await?;
     settings.photometric_mode = mode;
+    persist(&settings).await?;
+    Ok(settings)
+}
+pub async fn save_insta360_sdk_dir(path: Option<PathBuf>) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.insta360_sdk_dir = path.clone();
+    match path {
+        Some(path) => std::env::set_var("OOOSPLAT_INSTA360_SDK_DIR", path),
+        None => std::env::remove_var("OOOSPLAT_INSTA360_SDK_DIR"),
+    }
     persist(&settings).await?;
     Ok(settings)
 }

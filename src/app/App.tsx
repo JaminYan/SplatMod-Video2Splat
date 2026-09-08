@@ -6,7 +6,7 @@ import {
 } from "lucide-react";
 import {
   attachSupplementalMediaBatch, cancelPipeline, checkEngines, confirmAndDeleteProject, continueSupplementReconstruction as continueSupplementReconstructionBackend, detachSupplementalMedia, getProjectOverview, getSettings, getSupplementDiagnostics, getSupplementOriginalPreview, getSupplementPreviews, prepareSupplementReconstruction,
-  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, startSupplementReconstruction, validateSupplementalMedia,
+  inspectSplatcamImport, onPipelineEvent, openProjectViewer, probeAndPlan, revealProject, selectInsta360SdkDirectory, selectProjectsRoot, selectSplatcamDirectory, selectSupplementalMedia, selectVideo, startSupplementReconstruction, validateSupplementalMedia,
   setProjectsRoot, startPipeline, startSplatcamPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
@@ -540,6 +540,27 @@ function FfmpegHwAccelBlock() {
   );
 }
 
+function Insta360SdkBlock() {
+  const store = useAppStore();
+  const settings = store.settings;
+  if (!settings) return <p className="settings-empty">正在读取设置…</p>;
+  const status = settings.insta360;
+  const choose = async () => {
+    const selected = await selectInsta360SdkDirectory(settings.settings.insta360SdkDir ?? undefined);
+    if (selected) await store.setInsta360SdkDir(selected);
+  };
+  return <div className="settings-block">
+    <div className="settings-block-title">Insta360 MediaSDK</div>
+    <p className="settings-block-hint">仅处理 .insv；普通 MP4/MOV 不依赖此 SDK。SDK 不随 OOOSplat 分发。</p>
+    <div className="settings-row">
+      <span className={`backend-badge ${status.ready ? "ok" : "warn"}`}>{status.ready ? "就绪" : "未就绪"}</span>
+      <small>{status.detail}</small>
+      <button className="secondary-action" type="button" disabled={store.phase === "running"} onClick={() => void choose()}><FolderOpen size={14} />选择 SDK 目录</button>
+    </div>
+    {status.path && <code className="settings-cli-hint">{status.path}</code>}
+  </div>;
+}
+
 function BrushTrainingPresetBlock({ inputSource }: { inputSource: InputSource }) {
   const store = useAppStore();
   const settings = store.settings;
@@ -640,6 +661,7 @@ function SettingsDrawer({ open, onClose, inputSource }: { open: boolean; onClose
           <ColmapBackendBlock />
           <CudaColmapFlavorBlock />
           <FfmpegHwAccelBlock />
+          <Insta360SdkBlock />
         </>}
         <TrainingBackendBlock />
         <GsplatSplatCapBlock />

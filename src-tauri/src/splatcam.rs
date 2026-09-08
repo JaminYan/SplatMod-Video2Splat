@@ -560,7 +560,10 @@ fn image_quality(mut sharpness: Vec<f64>) -> SplatcamImageQuality {
     let low_ratio = if sharpness.is_empty() || median <= 0.0 {
         0.0
     } else {
-        sharpness.iter().filter(|value| **value <= low_threshold).count() as f64
+        sharpness
+            .iter()
+            .filter(|value| **value <= low_threshold)
+            .count() as f64
             / sharpness.len() as f64
     };
     let passed = low_ratio <= 0.35;
@@ -608,7 +611,11 @@ fn trajectory_coverage(poses: &[Pose], extent: f64) -> SplatcamTrajectoryCoverag
     let path_length = steps.iter().sum::<f64>();
     SplatcamTrajectoryCoverage {
         path_length,
-        path_to_extent_ratio: if extent > 1e-9 { path_length / extent } else { 0.0 },
+        path_to_extent_ratio: if extent > 1e-9 {
+            path_length / extent
+        } else {
+            0.0
+        },
         median_step: percentile(&steps, 0.50),
         p90_step: percentile(&steps, 0.90),
     }

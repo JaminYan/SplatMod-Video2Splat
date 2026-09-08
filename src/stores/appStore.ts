@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import {
   downloadColmapCuda,
+  getSettings as getSettingsInvoke,
   setColmapBackend as setColmapBackendInvoke,
   setCudaColmapFlavor as setCudaColmapFlavorInvoke,
   setMapperBaMode as setMapperBaModeInvoke,
@@ -12,6 +13,7 @@ import {
   setFloaterPruning as setFloaterPruningInvoke,
   setTrainingBackend as setTrainingBackendInvoke,
   setPhotometricMode as setPhotometricModeInvoke,
+  setInsta360SdkDir as setInsta360SdkDirInvoke,
 } from "../lib/backend";
 import type {
   ColmapBackend,
@@ -72,6 +74,7 @@ interface AppState {
   setFloaterPruning: (enabled: boolean) => Promise<void>;
   setTrainingBackend: (backend: TrainingBackend) => Promise<void>;
   setPhotometricMode: (mode: PhotometricMode) => Promise<void>;
+  setInsta360SdkDir: (path: string) => Promise<void>;
   downloadCudaColmap: () => Promise<void>;
   clearSettingsNotice: () => void;
   setPhase: (phase: RunPhase) => void;
@@ -211,6 +214,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!settings || settings.settings.photometricMode === mode) return;
     const next = await setPhotometricModeInvoke(mode);
     set({ settings: { ...settings, settings: next }, settingsNotice: mode === "ppisp" ? "PPISP 实验模式已开启；训练将使用单帧批次。" : mode === "wdr" ? "WD-R 15k 实验已开启；训练使用单帧批次与 VGG-16 感知损失，耗时会明显增加。" : mode === "wdr10k" ? "WD-R 10k 实验已开启；训练固定 10,000 步，适合更快的质量对照。" : "附加训练模块已关闭，使用 M0 基线。" });
+  },
+  setInsta360SdkDir: async (path) => {
+    try {
+      await setInsta360SdkDirInvoke(path);
+      const refreshed = await getSettingsInvoke();
+      set({ settings: refreshed, settingsNotice: path ? "Insta360 MediaSDK 路径已保存。" : "Insta360 MediaSDK 路径已清除。" });
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : String(error), settingsNotice: "保存 Insta360 MediaSDK 路径失败。" });
+    }
   },
   setTrainingBackend: async (backend) => {
     const { settings } = get();

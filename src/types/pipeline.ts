@@ -46,6 +46,15 @@ export interface AppSettingsLike {
   multiViewDensificationGate: boolean;
   floaterPruning: boolean;
   photometricMode: PhotometricMode;
+  insta360SdkDir: string | null;
+}
+export interface Insta360SdkStatus {
+  configured: boolean;
+  path: string | null;
+  executable: string | null;
+  modelsPresent: boolean;
+  ready: boolean;
+  detail: string;
 }
 export interface EffectiveSettings {
   settings: AppSettingsLike;
@@ -55,6 +64,7 @@ export interface EffectiveSettings {
   cudaColmap: EngineStatus | null;
   casparColmap: EngineStatus | null;
   gsplatAvailable: boolean;
+  insta360: Insta360SdkStatus;
 }
 export interface VideoInfo {
   duration: number;

@@ -26,6 +26,70 @@ OOOSplat 当前只能把普通 `mp4` / `mov` 经 FFprobe/FFmpeg 抽成 JPEG，�
 
 来源：[官方 Media SDK API 文档](https://insta360develop.github.io/Insta360-Developer_Docs/en/x/desktop/media/)、[官方旧版 C++ README](https://github.com/Insta360Develop/Desktop-MediaSDK-Cpp)。后者已明确说明内容将迁移至在线文档，因此以在线文档为准。
 
+## M0 实测结果（本机 SDK 与素材）
+
+| 检查项 | 结果 |
+| --- | --- |
+| SDK 包 | `A:\SDK\Insta\MediaSDK`，`MediaSDKTest.exe` 报告版本 `3.1.5`；models、`MediaSDK.dll`、CUDA/OpenCV 运行时均在包内 |
+| 测试素材 | `A:\tmp\insta\VID_20260830_124955_00_057.insv`（1.65 GB）；SDK 元数据识别为 Insta360 X6 |
+| 原始轨道 | 虽然文件系统中只有一个 `.insv`，SDK 识别它内含 2 路 3840×3840 / 29.97 FPS HEVC 视频流和 1 路音频。因此配对规则必须由 SDK/素材元数据确认，不能仅依据文件数量推断。 |
+| 指定帧导出 | 运行 `MediaSDKTest -image_sequence_dir ... -export_frame_index 0-30-60 -output_size 1920x960` 成功，生成 `0.jpg`、`30.jpg`、`60.jpg`，进度为 33%/66%/100%，总耗时 1.918 秒。输出确为 1920×960、`yuvj420p` 的 2:1 equirect JPEG。 |
+| GPU 运行 | SDK 实际选中 NVIDIA RTX 5090 D v2 的 CUDA HEVC 硬解；Vulkan 初始化成功。 |
+| 透视投影 | 项目自带 FFmpeg 8.1 对导出的 `0.jpg` 执行 `v360=input=equirect:output=flat:w=1280:h=960:h_fov=100:v_fov=75:yaw=0:pitch=0` 成功，生成正常的 1280×960 rectilinear JPEG。`output=perspective` 在此版本会得到圆形投影，因此实现必须使用 `output=flat`。 |
+
+证据保存在 `A:\project\splat\.tmp\insta-m0-20260908-01`（三个全景样帧、一个正常透视样帧、一个用于排错的圆形投影样帧及 SDK 日志）。这是 SDK/投影可用性证据，不是 COLMAP 或训练质量通过的证据。
+
+## M1 当前实现
+
+已加入最小导入桥接：
+
+- 文件选择器现在接受 `.insv`；
+- Rust 通过 `OOOSPLAT_INSTA360_SDK_DIR` 定位 SDK 根目录（也接受直接指向 `MediaSDKTest.exe`）；
+- 官方 `MediaSDKTest.exe` 输出临时 3840×1920 equirect MP4；
+- 项目自带 FFmpeg 用 `v360 ... output=flat` 转成固定 1920×1440、100°×75° 单视角视频，然后复用现有 FFprobe、抽帧、COLMAP、训练链路；
+- 所有中间文件和日志放在项目 `work/insta360` 与 `logs/`，已存在的残留输出不会被覆盖。
+
+运行前设置（PowerShell）：
+
+```powershell
+$env:OOOSPLAT_INSTA360_SDK_DIR = 'A:\SDK\Insta\MediaSDK'
+```
+
+M1 有意保留两个边界：它会先生成完整临时 MP4（存储/耗时较高），并只生成一个固定视角；只有完成真实 COLMAP 注册率、稀疏点、重投影和训练对比后，才升级为 SDK 指定帧导出和多视角投影。
+
+本机完整桥接实测也已通过：该素材输出 104.14 秒、3121 帧、29.97 FPS 的 3840×1920 equirect H.264；FFmpeg 以约 11.4× 实时速度转为 104.14 秒、3121 帧、1920×1440 的透视 MPEG-4。该结果只证明预处理链路和时间轴完整，不代表 SfM 质量已通过。
+
+## M2 实测结果（单视角 COLMAP）
+
+使用上述 104.14 秒透视视频，以快速档抽取 104 张 JPEG，运行 CUDA SIFT、10 帧顺序匹配和增量 Mapper：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 输入图像 | 104 |
+| 注册图像 | 102（98.08%） |
+| 稀疏点 | 26,960 |
+| 平均轨迹长度 | 4.21 |
+| 平均每图观测数 | 1,112 |
+| 平均重投影误差 | 1.146 px |
+
+证据目录为 `A:\project\splat\.tmp\insta-m2-colmap-20260908-01`，包含抽取帧、COLMAP 数据库、feature/matching/mapper 日志、二进制模型和文本模型。该结果超过当前 80% 注册门槛，说明固定单视角已足以进入后续产品化验证；多视角全景轨道暂不增加。
+
+## M3 当前产品化状态
+
+M3 已将 SDK 路径接入应用设置，但仍保持 sidecar/SDK 的最小边界：
+
+- `AppSettings` 新增持久化的 `insta360SdkDir`，设置 schema 从 11 升至 12；
+- `get_settings` 返回 `insta360` 健康状态：是否配置、可执行文件、models 是否存在以及可读提示；
+- 设置面板新增“选择 SDK 目录”，选择 `A:\SDK\Insta\MediaSDK` 后无需每次手动设置环境变量；
+- `OOOSPLAT_INSTA360_SDK_DIR` 仍作为兼容入口；普通 `mp4` / `mov` 不依赖 SDK，只有选择 `.insv` 时才会严格要求 SDK 可用；
+- SDK、DLL、models 没有复制进仓库或安装器。当前实现调用 SDK 包自带的 `MediaSDKTest.exe`，后续只有在需要精确选帧或更细粒度取消/进度时才拆出专用 sidecar。
+
+M3 校验：Rust library tests `68 passed`，TypeScript 增量构建通过，`git diff --check` 通过。该校验覆盖编译与设置链路，不等同于重新运行完整 Insta360/COLMAP 性能基准。
+
+### M3.1 运行后修复（2026-09-08）
+
+一次真实任务中，gsplat 训练、验证和 `final.ply` 导出均已完成，但自动预筛脚本最后读取中文 `review-manifest.json` 时由 Windows PowerShell 5.1 按 ANSI 解码 UTF-8 无 BOM 文件，`ConvertFrom-Json` 因此失败并将整个发布阶段报告为退出码 1。`scripts/run-gsplat-autoselect.ps1` 的 `Read-Json` 已改为 `[IO.File]::ReadAllText(..., [Text.Encoding]::UTF8)`；用同一份 manifest 在 Windows PowerShell 5.1 下解析通过，脚本语法检查也通过。该问题与 Insta360 拼接、COLMAP 或 gsplat CUDA 训练本身无关。
+
 ## 与现有项目的实际边界
 
 | 当前位置 | 当前假设 | Insta360 接入所需变化 |
@@ -92,4 +156,4 @@ OOOSplat 当前只能把普通 `mp4` / `mov` 经 FFprobe/FFmpeg 抽成 JPEG，�
 
 ## 本次检查边界
 
-本次未安装、未复制、未调用任何 Insta360 SDK，也未修改现有源代码。已只读确认本机 GPU/驱动、现有 FFmpeg `v360` 能力和当前导入管线；工作区原有的 `scripts/run-gsplat-autoselect.ps1`、`src-tauri/src/pipeline/runner.rs`、`src-tauri/src/video/mod.rs` 改动保持未触碰。
+本次使用了用户提供的本机 SDK 与样本完成 M0–M2 实测，并修改了最小导入、设置和状态报告代码；没有复制 SDK、models 或 DLL。工作区原有的 `scripts/run-gsplat-autoselect.ps1` 改动保持未触碰。

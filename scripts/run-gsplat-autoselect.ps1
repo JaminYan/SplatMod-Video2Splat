@@ -23,7 +23,7 @@ function Set-RequestProperty($Object, [string]$Name, $Value) {
 }
 
 function Read-Json([string]$Path) {
-    Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 }
 
 function Write-Json($Object, [string]$Path) {
@@ -84,6 +84,8 @@ function Invoke-Adapter([string]$ConfigPath, [string]$LogPath) {
 function Read-RunMetrics([string]$Directory, [string]$LogPath, [bool]$CheckpointOnly) {
     $metricsPath = Join-Path $Directory 'logs\quality\validation-metrics.json'
     $metrics = if (Test-Path -LiteralPath $metricsPath) { Read-Json $metricsPath } else { $null }
+    $reviewPath = Join-Path $Directory 'logs\quality\review-manifest.json'
+    $review = if (Test-Path -LiteralPath $reviewPath) { Read-Json $reviewPath } else { $null }
     $events = @(
         foreach ($line in Get-Content -LiteralPath $LogPath) {
             try { $line | ConvertFrom-Json } catch { }
@@ -109,6 +111,10 @@ function Read-RunMetrics([string]$Directory, [string]$LogPath, [bool]$Checkpoint
         logicalSplats = $eventLogicalSplats
         peakVramMb = if ($null -ne $eventPeakVram) { $eventPeakVram } elseif (@($peak).Count -gt 0) { [int]@($peak)[0].value } else { $null }
         bestValidationStep = if ($null -ne $metrics -and $null -ne $metrics.PSObject.Properties['bestValidationStep']) { [int]$metrics.bestValidationStep } else { $null }
+        reviewPsnr = if ($null -ne $review -and $null -ne $review.metrics) { [double]$review.metrics.psnr } else { $null }
+        reviewSsim = if ($null -ne $review -and $null -ne $review.metrics) { [double](1.0 - $review.metrics.dssim) } else { $null }
+        reviewL1 = if ($null -ne $review -and $null -ne $review.metrics) { [double]$review.metrics.l1 } else { $null }
+        reviewFrames = if ($null -ne $review -and $null -ne $review.frames) { @($review.frames | ForEach-Object { [int]$_.index }) } else { @() }
         outputPly = Join-Path $Directory 'final.ply'
     }
 }

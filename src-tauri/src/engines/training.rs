@@ -114,8 +114,7 @@ fn resolve_gsplat_root(engines_root: &Path) -> Option<PathBuf> {
 /// equivalent.
 fn powershell_path(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy().into_owned();
-    text.strip_prefix(r"\\?\")
-        .map_or(path, PathBuf::from)
+    text.strip_prefix(r"\\?\").map_or(path, PathBuf::from)
 }
 
 /// Keeps only monotonic, bounded progress events. Invalid JSONL and late/stale
@@ -326,8 +325,7 @@ async fn train_gsplat(
     if !output.success {
         return Err(SplatError::Process(format!(
             "gsplat adapter 退出码 {:?}；详见 {}",
-            output.exit_code,
-            log_display
+            output.exit_code, log_display
         )));
     }
     if !candidate.is_file() {

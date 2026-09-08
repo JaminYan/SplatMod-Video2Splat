@@ -36,7 +36,7 @@ export async function selectVideo(): Promise<string | null> {
   const selected = await open({
     multiple: false,
     directory: false,
-    filters: [{ name: "视频", extensions: ["mp4", "mov"] }],
+    filters: [{ name: "视频", extensions: ["mp4", "mov", "insv"] }],
   });
   return typeof selected === "string" ? selected : null;
 }
@@ -62,6 +62,16 @@ export async function setColmapBackend(backend: ColmapBackend): Promise<AppSetti
 
 export async function setFfmpegHwAccel(mode: FfmpegHwAccel): Promise<AppSettingsLike> {
   return invoke("set_ffmpeg_hw_accel", { mode }) as Promise<AppSettingsLike>;
+}
+
+export async function selectInsta360SdkDirectory(current?: string): Promise<string | null> {
+  if (!inTauri()) return null;
+  const selected = await open({ multiple: false, directory: true, defaultPath: current || undefined });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function setInsta360SdkDir(path: string): Promise<AppSettingsLike> {
+  return invoke("set_insta360_sdk_dir", { path }) as Promise<AppSettingsLike>;
 }
 
 export async function selectSupplementalMedia(): Promise<string[]> {

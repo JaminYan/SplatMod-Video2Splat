@@ -723,3 +723,78 @@ pub async fn extract_uniform_frames(
     }
     Ok(count)
 }
+
+/// Convert an equirectangular video into one fixed rectilinear view before SfM.
+/// `flat` is FFmpeg's perspective/rectilinear projection; `perspective` is a
+/// different projection in the bundled build and produces a circular image.
+pub async fn convert_equirectangular_video(
+    executable: &Path,
+    input: &Path,
+    output: &Path,
+    hw_accel: FfmpegHwAccel,
+    log_path: Option<PathBuf>,
+    process_manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    if !input.is_file() {
+        return Err(SplatError::InvalidPath(input.to_path_buf()));
+    }
+    if output.exists() {
+        return Err(SplatError::Process(format!(
+            "全景投影输出已存在，拒绝覆盖：{}",
+            output.display()
+        )));
+    }
+    if let Some(parent) = output.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut args = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-nostdin"),
+        OsString::from("-nostats"),
+        OsString::from("-y"),
+    ];
+    match hw_accel {
+        FfmpegHwAccel::Off => {}
+        FfmpegHwAccel::Auto => args.extend([OsString::from("-hwaccel"), OsString::from("auto")]),
+        FfmpegHwAccel::D3d11va => {
+            args.extend([OsString::from("-hwaccel"), OsString::from("d3d11va")])
+        }
+        FfmpegHwAccel::Cuda => args.extend([OsString::from("-hwaccel"), OsString::from("cuda")]),
+    }
+    args.extend([
+        OsString::from("-i"),
+        input.as_os_str().to_owned(),
+        OsString::from("-vf"),
+        OsString::from(
+            "v360=input=equirect:output=flat:w=1920:h=1440:h_fov=100:v_fov=75:yaw=0:pitch=0",
+        ),
+        OsString::from("-an"),
+        OsString::from("-c:v"),
+        OsString::from("mpeg4"),
+        OsString::from("-q:v"),
+        OsString::from("3"),
+        OsString::from("-progress"),
+        OsString::from("pipe:1"),
+        output.as_os_str().to_owned(),
+    ]);
+    let result = process_manager
+        .run(ProcessSpec {
+            executable: executable.to_path_buf(),
+            args,
+            working_directory: output.parent().map(Path::to_path_buf),
+            log_path,
+            observer,
+        })
+        .await?;
+    if !result.success {
+        return Err(SplatError::Process(format!(
+            "FFmpeg 全景投影退出码 {:?}",
+            result.exit_code
+        )));
+    }
+    if !output.is_file() {
+        return Err(SplatError::Process("FFmpeg 未输出全景透视视频".into()));
+    }
+    Ok(())
+}

@@ -45,6 +45,7 @@ pub fn run_app() {
             commands::set_multi_view_densification_gate,
             commands::set_floater_pruning,
             commands::set_photometric_mode,
+            commands::set_insta360_sdk_dir,
             commands::inspect_splatcam_import,
             commands::download_colmap_cuda,
             commands::open_project_viewer,
