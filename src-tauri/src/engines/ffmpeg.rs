@@ -736,8 +736,42 @@ pub async fn convert_equirectangular_video(
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<()> {
+    convert_equirectangular_video_views(
+        executable,
+        input,
+        output,
+        &[0],
+        0.0,
+        hw_accel,
+        log_path,
+        process_manager,
+        observer,
+    )
+    .await
+}
+
+/// Project one equirectangular stream into fixed horizontal views and emit
+/// them round-robin at 4x the source frame rate. Keeping each source instant
+/// adjacent makes sequential COLMAP matching see overlap between views.
+pub async fn convert_equirectangular_video_views(
+    executable: &Path,
+    input: &Path,
+    output: &Path,
+    yaws: &[i32],
+    output_fps: f64,
+    hw_accel: FfmpegHwAccel,
+    log_path: Option<PathBuf>,
+    process_manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
     if !input.is_file() {
         return Err(SplatError::InvalidPath(input.to_path_buf()));
+    }
+    if yaws.is_empty() {
+        return Err(SplatError::Process("全景投影至少需要一个水平视角".into()));
+    }
+    if yaws.len() > 1 && (!output_fps.is_finite() || output_fps <= 0.0) {
+        return Err(SplatError::Process("多视角全景投影 FPS 无效".into()));
     }
     if output.exists() {
         return Err(SplatError::Process(format!(
@@ -762,13 +796,51 @@ pub async fn convert_equirectangular_video(
         }
         FfmpegHwAccel::Cuda => args.extend([OsString::from("-hwaccel"), OsString::from("cuda")]),
     }
+    args.extend([OsString::from("-i"), input.as_os_str().to_owned()]);
+    if yaws.len() == 1 {
+        args.extend([
+            OsString::from("-vf"),
+            OsString::from(format!(
+                "v360=input=equirect:output=flat:w=1920:h=1440:h_fov=100:v_fov=75:yaw={}:pitch=0",
+                yaws[0]
+            )),
+        ]);
+    } else {
+        let output_fps = format!("{output_fps:.6}");
+        let labels = (0..yaws.len())
+            .map(|index| format!("[p{index}]"))
+            .collect::<String>();
+        let branches = yaws
+            .iter()
+            .enumerate()
+            .map(|(index, yaw)| {
+                format!(
+                    "[p{index}]v360=input=equirect:output=flat:w=1920:h=1440:h_fov=100:v_fov=75:yaw={yaw}:pitch=0,settb=AVTB,setpts=PTS+{}*1000000/{output_fps}[v{index}]",
+                    index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let inputs = (0..yaws.len())
+            .map(|index| format!("[v{index}]"))
+            .collect::<String>();
+        args.extend([
+            OsString::from("-filter_complex"),
+            OsString::from(format!(
+                "split={}{};{};{}interleave={},settb=AVTB,setpts=N*1000000/{output_fps},settb=1/60000[out]",
+                yaws.len(),
+                labels,
+                branches,
+                inputs,
+                yaws.len()
+            )),
+            OsString::from("-map"),
+            OsString::from("[out]"),
+            OsString::from("-r"),
+            OsString::from(output_fps),
+        ]);
+    }
     args.extend([
-        OsString::from("-i"),
-        input.as_os_str().to_owned(),
-        OsString::from("-vf"),
-        OsString::from(
-            "v360=input=equirect:output=flat:w=1920:h=1440:h_fov=100:v_fov=75:yaw=0:pitch=0",
-        ),
         OsString::from("-an"),
         OsString::from("-c:v"),
         OsString::from("mpeg4"),

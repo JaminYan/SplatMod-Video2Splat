@@ -68,6 +68,11 @@ pub struct TrainingRequest {
     pub total_steps: u32,
     pub max_resolution: u32,
     pub max_splats: u32,
+    pub panorama: bool,
+    pub panorama_view_count: u32,
+    pub native_fisheye: bool,
+    pub initial_points_ply: Option<PathBuf>,
+    pub mcmc_min_opacity: f32,
     pub seed: u64,
     pub photometric_mode: PhotometricMode,
     pub densification_strategy: GsplatDensificationStrategy,
@@ -254,6 +259,11 @@ async fn train_gsplat(
         "maxSteps": request.total_steps,
         "maxResolution": request.max_resolution,
         "maxSplats": request.max_splats,
+        "panorama": request.panorama,
+        "panoramaViewCount": request.panorama_view_count,
+        "nativeFisheye": request.native_fisheye,
+        "initialPointsPly": request.initial_points_ply,
+        "mcmcMinOpacity": request.mcmc_min_opacity,
         // M2: stabilise the coarse static scene before MCMC adds new splats.
         "delayedDensificationRatio": 0.10,
         "batchSize": match request.photometric_mode { PhotometricMode::None => 4, PhotometricMode::Ppisp | PhotometricMode::Wdr | PhotometricMode::Wdr10k => 1 },
@@ -387,28 +397,7 @@ fn prepare_standard_colmap_dataset_sync(
     let build = || -> Result<()> {
         std::fs::create_dir_all(&image_destination)?;
         std::fs::create_dir_all(&model_destination)?;
-        let mut image_count = 0_u64;
-        for entry in std::fs::read_dir(frames)? {
-            let source = entry?.path();
-            if !source.is_file()
-                || !source.extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("jpg")
-                        || ext.eq_ignore_ascii_case("jpeg")
-                        || ext.eq_ignore_ascii_case("png")
-                })
-            {
-                continue;
-            }
-            let target = image_destination.join(
-                source
-                    .file_name()
-                    .ok_or_else(|| SplatError::InvalidPath(source.clone()))?,
-            );
-            if std::fs::hard_link(&source, &target).is_err() {
-                std::fs::copy(&source, &target)?;
-            }
-            image_count += 1;
-        }
+        let image_count = copy_images_recursive(frames, frames, &image_destination)?;
         if image_count == 0 {
             return Err(SplatError::Process("训练输入没有支持的图像".into()));
         }
@@ -432,6 +421,36 @@ fn prepare_standard_colmap_dataset_sync(
     Ok(())
 }
 
+fn copy_images_recursive(source_root: &Path, source: &Path, destination_root: &Path) -> Result<u64> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(source)? {
+        let source = entry?.path();
+        if source.is_dir() {
+            count += copy_images_recursive(source_root, &source, destination_root)?;
+            continue;
+        }
+        if !source.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("png")
+        }) {
+            continue;
+        }
+        let relative = source
+            .strip_prefix(source_root)
+            .map_err(|_| SplatError::InvalidPath(source.clone()))?;
+        let target = destination_root.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::hard_link(&source, &target).is_err() {
+            std::fs::copy(&source, &target)?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +471,11 @@ mod tests {
             .unwrap()
             .write_all(b"png")
             .unwrap();
+        std::fs::create_dir_all(frames.join("rig1/camera1")).unwrap();
+        std::fs::File::create(frames.join("rig1/camera1/frame.jpg"))
+            .unwrap()
+            .write_all(b"jpeg")
+            .unwrap();
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             std::fs::File::create(model.join(name))
                 .unwrap()
@@ -464,6 +488,7 @@ mod tests {
             .unwrap();
         assert!(output.join("images/one.jpg").is_file());
         assert!(output.join("images/two.png").is_file());
+        assert!(output.join("images/rig1/camera1/frame.jpg").is_file());
         assert!(output.join("sparse/0/cameras.bin").is_file());
     }
 

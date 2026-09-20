@@ -21,6 +21,7 @@ pub enum ColmapComputeMode {
 #[derive(Debug, Clone, Copy)]
 pub struct ColmapFeatureOptions {
     pub compute: ColmapComputeMode,
+    pub rig: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +39,7 @@ pub enum IncrementalBaBackend {
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalMapperOptions {
     pub ba_backend: IncrementalBaBackend,
+    pub rig: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,15 +183,31 @@ fn feature_extractor_args(
         database.into(),
         "--image_path".into(),
         images.into(),
-        "--ImageReader.camera_model".into(),
-        "SIMPLE_RADIAL".into(),
-        "--ImageReader.single_camera".into(),
-        "1".into(),
         "--FeatureExtraction.type".into(),
         "SIFT".into(),
         "--FeatureExtraction.use_gpu".into(),
         options.compute.use_gpu().into(),
     ];
+    if options.rig {
+        args.extend([
+            "--ImageReader.single_camera_per_folder".into(),
+            "1".into(),
+            "--ImageReader.camera_model".into(),
+            "OPENCV_FISHEYE".into(),
+            // Insta360's 3840px circular fisheye has an ~1200-1300px focal
+            // prior. COLMAP's generic 1.2*width prior is far too narrow and
+            // prevents the bootstrap mapper from registering the sequence.
+            "--ImageReader.default_focal_length_factor".into(),
+            "0.34".into(),
+        ]);
+    } else {
+        args.extend([
+            "--ImageReader.camera_model".into(),
+            "SIMPLE_RADIAL".into(),
+            "--ImageReader.single_camera".into(),
+            "1".into(),
+        ]);
+    }
     if let Some(index) = options.compute.gpu_index() {
         args.extend([
             "--FeatureExtraction.gpu_index".into(),
@@ -218,6 +236,65 @@ pub async fn match_sequential(
     .await
 }
 
+pub async fn match_exhaustive(
+    executable: &Path,
+    database: &Path,
+    options: ColmapMatchingOptions,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        exhaustive_matcher_args(database, options),
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+pub async fn configure_rig(
+    executable: &Path,
+    database: &Path,
+    rig_config: &Path,
+    input_model: Option<&Path>,
+    output_model: Option<&Path>,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    if let Some(output_model) = output_model {
+        tokio::fs::create_dir_all(output_model).await?;
+    }
+    run_colmap(
+        executable,
+        vec![
+            "rig_configurator".into(),
+            "--database_path".into(),
+            database.into(),
+            "--rig_config_path".into(),
+            rig_config.into(),
+        ]
+        .into_iter()
+        .chain(input_model.into_iter().flat_map(|path| [
+            OsString::from("--input_path"),
+            path.as_os_str().to_owned(),
+        ]))
+        .chain(output_model.into_iter().flat_map(|path| [
+            OsString::from("--output_path"),
+            path.as_os_str().to_owned(),
+        ]))
+        .collect(),
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 fn sequential_matcher_args(database: &Path, options: ColmapMatchingOptions) -> Vec<OsString> {
     let mut args = vec![
         "sequential_matcher".into(),
@@ -229,6 +306,25 @@ fn sequential_matcher_args(database: &Path, options: ColmapMatchingOptions) -> V
         options.compute.use_gpu().into(),
         "--SequentialMatching.overlap".into(),
         options.overlap.to_string().into(),
+    ];
+    if let Some(index) = options.compute.gpu_index() {
+        args.extend([
+            "--FeatureMatching.gpu_index".into(),
+            index.to_string().into(),
+        ]);
+    }
+    args
+}
+
+fn exhaustive_matcher_args(database: &Path, options: ColmapMatchingOptions) -> Vec<OsString> {
+    let mut args = vec![
+        "exhaustive_matcher".into(),
+        "--database_path".into(),
+        database.into(),
+        "--FeatureMatching.type".into(),
+        "SIFT_BRUTEFORCE".into(),
+        "--FeatureMatching.use_gpu".into(),
+        options.compute.use_gpu().into(),
     ];
     if let Some(index) = options.compute.gpu_index() {
         args.extend([
@@ -261,6 +357,34 @@ pub async fn map(
     .await
 }
 
+pub async fn bundle_adjust_rig(
+    executable: &Path,
+    input: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    tokio::fs::create_dir_all(output).await?;
+    run_colmap(
+        executable,
+        vec![
+            "bundle_adjuster".into(),
+            "--input_path".into(),
+            input.into(),
+            "--output_path".into(),
+            output.into(),
+            "--BundleAdjustment.refine_sensor_from_rig".into(),
+            "0".into(),
+        ],
+        input,
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 /// Produces a pinhole COLMAP training layout whose images and cameras share
 /// the same undistorted projection contract. The caller owns promotion of the
 /// completed directory so original frames and sparse reconstruction stay intact.
@@ -269,12 +393,11 @@ pub async fn undistort_images(
     images: &Path,
     model: &Path,
     output: &Path,
+    max_image_size: Option<u32>,
     log: PathBuf,
     manager: &ProcessManager,
 ) -> Result<()> {
-    run_colmap(
-        executable,
-        vec![
+    let mut args = vec![
             "image_undistorter".into(),
             "--image_path".into(),
             images.into(),
@@ -284,11 +407,90 @@ pub async fn undistort_images(
             output.into(),
             "--output_type".into(),
             "COLMAP".into(),
-        ],
+        ];
+    if let Some(max_image_size) = max_image_size {
+        args.extend(["--max_image_size".into(), max_image_size.to_string().into()]);
+    }
+    run_colmap(
+        executable,
+        args,
         images,
         log,
         manager,
         None,
+    )
+    .await
+}
+
+/// Limits COLMAP's automatically selected source views for each PatchMatch
+/// reference view. `image_undistorter` writes this value into the workspace
+/// config rather than exposing it as a `patch_match_stereo` CLI option.
+pub async fn limit_patch_match_sources(workspace: &Path, max_sources: u32) -> Result<usize> {
+    let config = workspace.join("stereo").join("patch-match.cfg");
+    let contents = tokio::fs::read_to_string(&config).await?;
+    let needle = "__auto__, 20";
+    let replacement = format!("__auto__, {max_sources}");
+    let replaced = contents.matches(needle).count();
+    if replaced > 0 {
+        tokio::fs::write(&config, contents.replace(needle, &replacement)).await?;
+    }
+    Ok(replaced)
+}
+
+pub async fn patch_match_stereo(
+    executable: &Path,
+    workspace: &Path,
+    num_iterations: u32,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        vec![
+            "patch_match_stereo".into(),
+            "--workspace_path".into(),
+            workspace.into(),
+            "--workspace_format".into(),
+            "COLMAP".into(),
+            "--PatchMatchStereo.geom_consistency".into(),
+            "true".into(),
+            "--PatchMatchStereo.num_iterations".into(),
+            num_iterations.to_string().into(),
+        ],
+        workspace,
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+pub async fn stereo_fusion(
+    executable: &Path,
+    workspace: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        vec![
+            "stereo_fusion".into(),
+            "--workspace_path".into(),
+            workspace.into(),
+            "--workspace_format".into(),
+            "COLMAP".into(),
+            "--input_type".into(),
+            "geometric".into(),
+            "--output_path".into(),
+            output.into(),
+        ],
+        workspace,
+        log,
+        manager,
+        observer,
     )
     .await
 }
@@ -304,6 +506,7 @@ mod tests {
             Path::new("images"),
             ColmapFeatureOptions {
                 compute: ColmapComputeMode::Cpu,
+                rig: false,
             },
         );
         let matching = sequential_matcher_args(
@@ -341,7 +544,7 @@ mod tests {
         let feature = feature_extractor_args(
             Path::new("db"),
             Path::new("images"),
-            ColmapFeatureOptions { compute },
+            ColmapFeatureOptions { compute, rig: false },
         );
         let matching = sequential_matcher_args(
             Path::new("db"),
@@ -379,6 +582,47 @@ mod tests {
     }
 
     #[test]
+    fn rig_arguments_use_per_folder_fisheye_cameras_and_fixed_sensor_pose() {
+        let feature = feature_extractor_args(
+            Path::new("db"),
+            Path::new("images"),
+            ColmapFeatureOptions {
+                compute: ColmapComputeMode::Cpu,
+                rig: true,
+            },
+        );
+        let mapper = mapper_args(
+            Path::new("db"),
+            Path::new("images"),
+            Path::new("output"),
+            IncrementalMapperOptions {
+                ba_backend: IncrementalBaBackend::Ceres,
+                rig: true,
+            },
+        );
+        let feature = feature
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        let mapper = mapper
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(feature
+            .windows(2)
+            .any(|pair| pair == ["--ImageReader.single_camera_per_folder", "1"]));
+        assert!(feature
+            .windows(2)
+            .any(|pair| pair == ["--ImageReader.camera_model", "OPENCV_FISHEYE"]));
+        assert!(feature
+            .windows(2)
+            .any(|pair| pair == ["--ImageReader.default_focal_length_factor", "0.34"]));
+        assert!(mapper
+            .windows(2)
+            .any(|pair| pair == ["--Mapper.ba_refine_sensor_from_rig", "0"]));
+    }
+
+    #[test]
     fn mapper_arguments_select_the_requested_bundle_adjustment_backend() {
         let ceres = mapper_args(
             Path::new("db"),
@@ -386,6 +630,7 @@ mod tests {
             Path::new("output"),
             IncrementalMapperOptions {
                 ba_backend: IncrementalBaBackend::Ceres,
+                rig: false,
             },
         );
         let caspar = mapper_args(
@@ -394,6 +639,7 @@ mod tests {
             Path::new("output"),
             IncrementalMapperOptions {
                 ba_backend: IncrementalBaBackend::Caspar { gpu_index: -1 },
+                rig: false,
             },
         );
         let ceres = ceres
@@ -451,6 +697,12 @@ fn mapper_args(
             "--Mapper.ba_gpu_index".into(),
             gpu_index.to_string().into(),
         ]),
+    }
+    if options.rig {
+        args.extend([
+            "--Mapper.ba_refine_sensor_from_rig".into(),
+            "0".into(),
+        ]);
     }
     args
 }

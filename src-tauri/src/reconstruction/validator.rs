@@ -96,11 +96,15 @@ impl ReconstructionValidator {
 
 fn count_images(directory: &Path) -> Result<u64> {
     let mut count = 0u64;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(is_supported_image_extension) {
-            count += 1;
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(is_supported_image_extension) {
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -229,6 +233,19 @@ mod tests {
         let report = ReconstructionValidator::validate(&frames, &model).unwrap();
         assert_eq!(report.input_images, 3);
         assert!((report.registered_ratio - (2.0 / 3.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn counts_rig_images_in_nested_camera_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let frames = temp.path().join("frames");
+        let model = temp.path().join("model");
+        write_jpegs(&frames.join("rig1/camera1"), 2);
+        write_jpegs(&frames.join("rig1/camera2"), 2);
+        write_bin_model(&model, 4, 5);
+        let report = ReconstructionValidator::validate(&frames, &model).unwrap();
+        assert_eq!(report.input_images, 4);
+        assert_eq!(report.quality, ReconstructionQuality::Good);
     }
 
     #[test]

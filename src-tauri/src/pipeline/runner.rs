@@ -10,7 +10,10 @@ use crate::{
             extract_uniform_frames,
         },
         ffprobe::probe_video,
-        insta360::{is_insv, prepare_video as prepare_insta360_video},
+        insta360::{
+            is_insv, prepare_rig_dataset as prepare_insta360_rig_dataset,
+            prepare_video as prepare_insta360_video, Insta360RigDataset, PANORAMA_VIEW_COUNT,
+        },
         training::{self, TrainingBackend, TrainingRequest},
         ColmapBackend, CudaColmapFlavor, EngineKind, EnginePaths, FfmpegHwAccel,
     },
@@ -34,7 +37,8 @@ use crate::{
         adaptive_plan, analyze_prepared_proxy_images_with_progress, passes_proxy_geometry,
         prepare_proxy_tracking_pyramids_with_progress, proxy_analysis_worker_count,
         select_adaptive_frames, select_useful_frames_parallel_with_progress, AdaptiveFrameProfile,
-        FramePlan, FrameSelectionReport, FrameSelectionStrategy, ProxyFrame, SelectedSourceFrame,
+        FramePlan, FrameSelectionReport, FrameSelectionStrategy, FrameSelectionStrategyKind,
+        ProxyFrame, SelectedSourceFrame,
         SelectionReason, SourceFrameTimestamp, UniformRatioFrameSelection, VideoInfo,
     },
 };
@@ -84,6 +88,7 @@ pub struct PreparedFrames {
     pub adaptive_planning_ms: u64,
     pub selected_extraction_ms: u64,
     pub adaptive_fallback_reason: Option<String>,
+    pub rig: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -593,17 +598,42 @@ impl PipelineRunner {
         self.engines
             .colmap_for(self.colmap_backend, self.cuda_colmap_flavor)
     }
-    fn training_preset(&self, quality: Quality) -> crate::presets::QualityPreset {
+    fn training_preset(&self, quality: Quality, panorama: bool) -> crate::presets::QualityPreset {
         let mut preset = match self.training_backend {
             TrainingBackend::Brush => self.brush_training_preset.apply(quality.preset()),
             TrainingBackend::Gsplat => quality.preset(),
         };
+        if panorama {
+            match quality {
+                Quality::Standard => {
+                    // Keep MVS above the training target, while using the
+                    // cheaper 1536px gsplat training path for balanced quality.
+                    preset.brush_max_resolution = 1536;
+                    preset.brush_iterations = preset.brush_iterations.max(20_000);
+                }
+                Quality::High => {
+                    preset.brush_max_resolution = 2560;
+                    preset.brush_iterations = preset.brush_iterations.max(30_000);
+                }
+                Quality::Draft => {}
+            }
+        }
         if self.training_backend == TrainingBackend::Gsplat
             && self.photometric_mode == crate::engines::training::PhotometricMode::Wdr10k
         {
             preset.brush_iterations = 10_000;
         }
         preset
+    }
+    fn gsplat_splat_limit(&self, preset: &crate::presets::QualityPreset, panorama: bool) -> u32 {
+        panorama_gsplat_limit(self.gsplat_splat_cap, preset.brush_max_splats, panorama)
+    }
+    fn gsplat_mcmc_min_opacity(
+        &self,
+        preset: &crate::presets::QualityPreset,
+        panorama: bool,
+    ) -> f32 {
+        gsplat_mcmc_min_opacity_for(preset.brush_max_splats, panorama)
     }
     pub async fn verify_pipeline_engines(&self) -> Result<()> {
         let statuses = self.engines.check_all().await;
@@ -644,10 +674,56 @@ impl PipelineRunner {
             ))
         }
     }
+
+    fn prepared_rig_frames(dataset: &Insta360RigDataset) -> PreparedFrames {
+        let total_images = dataset.frame_count.saturating_mul(2);
+        let video = VideoInfo {
+            path: dataset.images_dir.clone(),
+            duration: dataset.duration,
+            fps: dataset.sample_fps,
+            width: dataset.width,
+            height: dataset.height,
+            frame_count: dataset.frame_count,
+            container: "insv-rig".into(),
+            video_codec: Some("hevc".into()),
+            pixel_format: Some("yuv420p10le".into()),
+            rotation: 0,
+        };
+        PreparedFrames {
+            video,
+            plan: FramePlan {
+                sampling_fps: dataset.sample_fps,
+                estimated_frames: dataset.frame_count,
+                source_fps: dataset.sample_fps,
+                source_duration: dataset.duration,
+                strategy: FrameSelectionStrategyKind::UniformRatio,
+                anchor_fps: Some(dataset.sample_fps),
+                analysis_fps: None,
+                effective_fps: Some(dataset.sample_fps),
+                proxy_candidates: None,
+            },
+            extracted_frames: total_images,
+            selection: FrameSelectionReport {
+                candidates: total_images,
+                retained: total_images,
+                removed_near_duplicates: 0,
+            },
+            probe_ms: 0,
+            extract_ms: 0,
+            select_ms: 0,
+            frame_analysis_ms: 0,
+            adaptive_planning_ms: 0,
+            selected_extraction_ms: 0,
+            adaptive_fallback_reason: None,
+            rig: true,
+        }
+    }
+
     pub async fn prepare_frames(
         &self,
         input: &Path,
         quality: Quality,
+        panorama: bool,
         output: &Path,
         logs: Option<&Path>,
     ) -> Result<PreparedFrames> {
@@ -670,6 +746,14 @@ impl PipelineRunner {
             ),
         );
         let mut plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        if panorama {
+            let sampling_fps = panorama_sampling_fps(quality, video.fps);
+            plan.sampling_fps = sampling_fps;
+            plan.estimated_frames =
+                (video.duration.max(0.0) * sampling_fps).round().max(1.0) as u64;
+            plan.anchor_fps = Some(sampling_fps);
+            plan.effective_fps = Some(sampling_fps);
+        }
         let mut adaptive_selected = None;
         let mut adaptive_proxy_frames = None;
         let mut adaptive_proxy_samples = None;
@@ -685,82 +769,83 @@ impl PipelineRunner {
         let mut proxy_grid_analysis_ms = 0;
         let mut adaptive_planning_ms = 0;
         let mut selected_extraction_ms = 0;
-        if let Some(profile) = AdaptiveFrameProfile::for_quality(quality, video.fps) {
-            adaptive_profile = Some(profile);
-            self.events.stage(
-                PipelineStage::PlanningFrames,
-                0.0,
-                "正在规划自适应 SfM 关键帧",
-            );
-            let planning_started = Instant::now();
-            let estimated_proxy_frames =
-                (video.duration * profile.analysis_fps).ceil().max(1.0) as u64;
-            let project = output
-                .parent()
-                .ok_or_else(|| SplatError::Process("无法定位自适应抽帧工作目录".into()))?;
-            let proxy_dir = project.join("work").join("adaptive-proxy").join("frames");
-            let proxy_work = project.join("work").join("adaptive-proxy");
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                0.0,
-                format!(
-                    "正在以 {:.1} FPS 提取低分辨率代理画面并同步映射 PTS",
-                    profile.analysis_fps
-                ),
-            );
-            let proxy_result = extract_proxy_frames(
-                &self.engines.ffmpeg,
-                input,
-                &proxy_dir,
-                &proxy_work,
-                video.width,
-                video.height,
-                profile.analysis_fps,
-                logs.map(|path| path.join("ffmpeg-adaptive-proxy.log")),
-                &self.process_manager,
-                Some(self.process_observer(
+        if !panorama {
+            if let Some(profile) = AdaptiveFrameProfile::for_quality(quality, video.fps) {
+                adaptive_profile = Some(profile);
+                self.events.stage(
+                    PipelineStage::PlanningFrames,
+                    0.0,
+                    "正在规划自适应 SfM 关键帧",
+                );
+                let planning_started = Instant::now();
+                let estimated_proxy_frames =
+                    (video.duration * profile.analysis_fps).ceil().max(1.0) as u64;
+                let project = output
+                    .parent()
+                    .ok_or_else(|| SplatError::Process("无法定位自适应抽帧工作目录".into()))?;
+                let proxy_dir = project.join("work").join("adaptive-proxy").join("frames");
+                let proxy_work = project.join("work").join("adaptive-proxy");
+                self.events.stage(
                     PipelineStage::ExtractingFrames,
-                    PipelineEngine::Ffmpeg,
-                    Some(estimated_proxy_frames),
-                    ObserverMode::Ffmpeg,
-                )),
-            )
-            .await;
-            match proxy_result {
-                Ok(report) => {
-                    let proxy_candidate_samples = report.frames.clone();
-                    self.events.stage(PipelineStage::ExtractingFrames, 1.0, format!("高速代理抽帧完成：{} 帧（已同步映射源 PTS，缓存上限 {} 帧 / {:.1} GiB）", report.frames.len(), report.buffered_frame_limit, report.memory_budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0));
-                    self.events.send(
-                        PipelineStage::SelectingFrames,
-                        Some(PipelineEngine::System),
-                        EventKind::Progress,
-                        EventLevel::Info,
-                        Some(0.0),
-                        false,
-                        format!("正在分析 {} 个代理画面的背景运动", report.frames.len()),
-                        Some(0),
-                        Some(report.frames.len() as u64),
-                        Some("帧"),
-                    );
-                    let analysis_started = Instant::now();
-                    let proxy_directory = proxy_dir.clone();
-                    let proxy_source_frames = report.frames.clone();
-                    let analysis_events = self.events.clone();
-                    let analysis_workers = proxy_analysis_worker_count();
-                    proxy_analysis_workers = Some(analysis_workers);
-                    self.events.send(
-                        PipelineStage::SelectingFrames,
-                        Some(PipelineEngine::System),
-                        EventKind::Log,
-                        EventLevel::Info,
-                        Some(0.0),
-                        false,
-                        format!("CPU 代理网格分析：{analysis_workers} 个工作线程"),
-                        Some(analysis_workers as u64),
-                        Some(analysis_workers as u64),
-                        Some("线程"),
-                    );
-                    let analysis = tokio::task::spawn_blocking(move || {
+                    0.0,
+                    format!(
+                        "正在以 {:.1} FPS 提取低分辨率代理画面并同步映射 PTS",
+                        profile.analysis_fps
+                    ),
+                );
+                let proxy_result = extract_proxy_frames(
+                    &self.engines.ffmpeg,
+                    input,
+                    &proxy_dir,
+                    &proxy_work,
+                    video.width,
+                    video.height,
+                    profile.analysis_fps,
+                    logs.map(|path| path.join("ffmpeg-adaptive-proxy.log")),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::ExtractingFrames,
+                        PipelineEngine::Ffmpeg,
+                        Some(estimated_proxy_frames),
+                        ObserverMode::Ffmpeg,
+                    )),
+                )
+                .await;
+                match proxy_result {
+                    Ok(report) => {
+                        let proxy_candidate_samples = report.frames.clone();
+                        self.events.stage(PipelineStage::ExtractingFrames, 1.0, format!("高速代理抽帧完成：{} 帧（已同步映射源 PTS，缓存上限 {} 帧 / {:.1} GiB）", report.frames.len(), report.buffered_frame_limit, report.memory_budget_bytes as f64 / 1024.0 / 1024.0 / 1024.0));
+                        self.events.send(
+                            PipelineStage::SelectingFrames,
+                            Some(PipelineEngine::System),
+                            EventKind::Progress,
+                            EventLevel::Info,
+                            Some(0.0),
+                            false,
+                            format!("正在分析 {} 个代理画面的背景运动", report.frames.len()),
+                            Some(0),
+                            Some(report.frames.len() as u64),
+                            Some("帧"),
+                        );
+                        let analysis_started = Instant::now();
+                        let proxy_directory = proxy_dir.clone();
+                        let proxy_source_frames = report.frames.clone();
+                        let analysis_events = self.events.clone();
+                        let analysis_workers = proxy_analysis_worker_count();
+                        proxy_analysis_workers = Some(analysis_workers);
+                        self.events.send(
+                            PipelineStage::SelectingFrames,
+                            Some(PipelineEngine::System),
+                            EventKind::Log,
+                            EventLevel::Info,
+                            Some(0.0),
+                            false,
+                            format!("CPU 代理网格分析：{analysis_workers} 个工作线程"),
+                            Some(analysis_workers as u64),
+                            Some(analysis_workers as u64),
+                            Some("线程"),
+                        );
+                        let analysis = tokio::task::spawn_blocking(move || {
                         let proxy_decode_started = Instant::now();
                         let mut paths = std::fs::read_dir(proxy_directory)?.filter_map(|entry| entry.ok().map(|entry| entry.path()))
                             .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))).collect::<Vec<_>>();
@@ -790,26 +875,26 @@ impl PipelineRunner {
                         }))?;
                         Ok::<_, SplatError>((proxy_frames, proxy_jpeg_decode_ms, proxy_tracking_prepare_ms, grid_analysis_started.elapsed().as_millis() as u64))
                     }).await.map_err(|error| SplatError::Process(format!("代理分析任务异常结束：{error}")))?;
-                    frame_analysis_ms = analysis_started.elapsed().as_millis() as u64;
-                    match analysis {
-                        Ok((
-                            proxy_frames,
-                            jpeg_decode_ms,
-                            tracking_prepare_ms,
-                            grid_analysis_ms,
-                        )) => {
-                            proxy_jpeg_decode_ms = jpeg_decode_ms;
-                            proxy_tracking_prepare_ms = tracking_prepare_ms;
-                            proxy_grid_analysis_ms = grid_analysis_ms;
-                            let proxy_count = proxy_frames.len();
-                            let analysis_seconds = proxy_grid_analysis_ms as f64 / 1_000.0;
-                            let pair_count = proxy_count.saturating_sub(1) as u64;
-                            let pairs_per_second = if analysis_seconds > 0.0 {
-                                pair_count as f64 / analysis_seconds
-                            } else {
-                                0.0
-                            };
-                            self.events.send(
+                        frame_analysis_ms = analysis_started.elapsed().as_millis() as u64;
+                        match analysis {
+                            Ok((
+                                proxy_frames,
+                                jpeg_decode_ms,
+                                tracking_prepare_ms,
+                                grid_analysis_ms,
+                            )) => {
+                                proxy_jpeg_decode_ms = jpeg_decode_ms;
+                                proxy_tracking_prepare_ms = tracking_prepare_ms;
+                                proxy_grid_analysis_ms = grid_analysis_ms;
+                                let proxy_count = proxy_frames.len();
+                                let analysis_seconds = proxy_grid_analysis_ms as f64 / 1_000.0;
+                                let pair_count = proxy_count.saturating_sub(1) as u64;
+                                let pairs_per_second = if analysis_seconds > 0.0 {
+                                    pair_count as f64 / analysis_seconds
+                                } else {
+                                    0.0
+                                };
+                                self.events.send(
                                 PipelineStage::SelectingFrames,
                                 Some(PipelineEngine::System),
                                 EventKind::Log,
@@ -823,47 +908,22 @@ impl PipelineRunner {
                                 Some(pair_count),
                                 Some("帧对"),
                             );
-                            // 精细档以覆盖预算而不是“能否凑够一个初始化对”作为
-                            // 自适应成功条件。20% 的锚点预算保留了明显的压缩空间，
-                            // 同时避免 20 秒素材只有 9 张图就进入训练。
-                            let minimum_selected = match quality {
-                                Quality::High => {
-                                    ((video.duration * profile.anchor_fps * 0.20).ceil() as usize)
-                                        .clamp(12, 32)
-                                }
-                                _ => 3,
-                            };
-                            let mut selection_profile = profile;
-                            let mut selection_tier = "strict";
-                            let mut selected =
-                                select_adaptive_frames(&proxy_frames, selection_profile);
-                            adaptive_attempts.push(AdaptiveAttemptRecord {
-                                name: "strict".into(),
-                                input_frames: selected.len() as u64,
-                                registered_images: None,
-                                registered_ratio: None,
-                                accepted: selected.len() >= minimum_selected,
-                                detail: format!(
-                                    "代理选帧 {} / {}",
-                                    selected.len(),
-                                    minimum_selected
-                                ),
-                            });
-                            // 精细档的采样密度（8 FPS、80 ms、较小目标位移）不应
-                            // 与更严的代理观测门槛绑定。代理只负责筛候选；当 strict
-                            // 无法形成可初始化序列时，逐级放宽底线，再由真实 COLMAP
-                            // 质量验收裁决，避免把可重建视频直接误退回固定 FPS。
-                            if quality == Quality::High && selected.len() < minimum_selected {
-                                selection_profile.min_textured_cells = 14;
-                                selection_profile.min_matched_cells = 9;
-                                selection_profile.min_inliers_floor = 7;
-                                selection_profile.min_inlier_ratio = 0.45;
-                                selection_profile.min_three_view_floor = 3;
-                                selection_profile.min_three_view_ratio = 0.35;
-                                selected = select_adaptive_frames(&proxy_frames, selection_profile);
-                                selection_tier = "relaxed";
+                                // 精细档以覆盖预算而不是“能否凑够一个初始化对”作为
+                                // 自适应成功条件。20% 的锚点预算保留了明显的压缩空间，
+                                // 同时避免 20 秒素材只有 9 张图就进入训练。
+                                let minimum_selected = match quality {
+                                    Quality::High => ((video.duration * profile.anchor_fps * 0.20)
+                                        .ceil()
+                                        as usize)
+                                        .clamp(12, 32),
+                                    _ => 3,
+                                };
+                                let mut selection_profile = profile;
+                                let mut selection_tier = "strict";
+                                let mut selected =
+                                    select_adaptive_frames(&proxy_frames, selection_profile);
                                 adaptive_attempts.push(AdaptiveAttemptRecord {
-                                    name: "relaxed".into(),
+                                    name: "strict".into(),
                                     input_frames: selected.len() as u64,
                                     registered_images: None,
                                     registered_ratio: None,
@@ -874,248 +934,285 @@ impl PipelineRunner {
                                         minimum_selected
                                     ),
                                 });
-                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.9), false,
+                                // 精细档的采样密度（8 FPS、80 ms、较小目标位移）不应
+                                // 与更严的代理观测门槛绑定。代理只负责筛候选；当 strict
+                                // 无法形成可初始化序列时，逐级放宽底线，再由真实 COLMAP
+                                // 质量验收裁决，避免把可重建视频直接误退回固定 FPS。
+                                if quality == Quality::High && selected.len() < minimum_selected {
+                                    selection_profile.min_textured_cells = 14;
+                                    selection_profile.min_matched_cells = 9;
+                                    selection_profile.min_inliers_floor = 7;
+                                    selection_profile.min_inlier_ratio = 0.45;
+                                    selection_profile.min_three_view_floor = 3;
+                                    selection_profile.min_three_view_ratio = 0.35;
+                                    selected =
+                                        select_adaptive_frames(&proxy_frames, selection_profile);
+                                    selection_tier = "relaxed";
+                                    adaptive_attempts.push(AdaptiveAttemptRecord {
+                                        name: "relaxed".into(),
+                                        input_frames: selected.len() as u64,
+                                        registered_images: None,
+                                        registered_ratio: None,
+                                        accepted: selected.len() >= minimum_selected,
+                                        detail: format!(
+                                            "代理选帧 {} / {}",
+                                            selected.len(),
+                                            minimum_selected
+                                        ),
+                                    });
+                                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.9), false,
                                     format!("精细代理 strict 未达到覆盖预算，切换 relaxed 最低可观测门：{} / {} 个关键帧", selected.len(), minimum_selected),
                                     Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
-                            }
-                            if quality == Quality::High && selected.len() < minimum_selected {
-                                // 保持精细时间密度，只采用经均衡档验证的可观测底线。
-                                selection_profile.min_textured_cells = 12;
-                                selection_profile.min_matched_cells = 8;
-                                selection_profile.min_inliers_floor = 6;
-                                selection_profile.min_inlier_ratio = 0.45;
-                                selection_profile.min_three_view_floor = 3;
-                                selection_profile.min_three_view_ratio = 0.35;
-                                selected = select_adaptive_frames(&proxy_frames, selection_profile);
-                                selection_tier = "minimumObservable";
-                                adaptive_attempts.push(AdaptiveAttemptRecord {
-                                    name: "minimumObservable".into(),
-                                    input_frames: selected.len() as u64,
-                                    registered_images: None,
-                                    registered_ratio: None,
-                                    accepted: selected.len() >= minimum_selected,
-                                    detail: format!(
-                                        "代理选帧 {} / {}",
-                                        selected.len(),
-                                        minimum_selected
-                                    ),
-                                });
-                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.95), false,
+                                }
+                                if quality == Quality::High && selected.len() < minimum_selected {
+                                    // 保持精细时间密度，只采用经均衡档验证的可观测底线。
+                                    selection_profile.min_textured_cells = 12;
+                                    selection_profile.min_matched_cells = 8;
+                                    selection_profile.min_inliers_floor = 6;
+                                    selection_profile.min_inlier_ratio = 0.45;
+                                    selection_profile.min_three_view_floor = 3;
+                                    selection_profile.min_three_view_ratio = 0.35;
+                                    selected =
+                                        select_adaptive_frames(&proxy_frames, selection_profile);
+                                    selection_tier = "minimumObservable";
+                                    adaptive_attempts.push(AdaptiveAttemptRecord {
+                                        name: "minimumObservable".into(),
+                                        input_frames: selected.len() as u64,
+                                        registered_images: None,
+                                        registered_ratio: None,
+                                        accepted: selected.len() >= minimum_selected,
+                                        detail: format!(
+                                            "代理选帧 {} / {}",
+                                            selected.len(),
+                                            minimum_selected
+                                        ),
+                                    });
+                                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Warning, Some(0.95), false,
                                     format!("精细代理 relaxed 未达到覆盖预算，切换 minimum-observable 门：{} / {} 个关键帧", selected.len(), minimum_selected),
                                     Some(selected.len() as u64), Some(minimum_selected as u64), Some("帧"));
-                            }
-                            adaptive_profile = Some(selection_profile);
-                            adaptive_selection_tier = Some(selection_tier);
-                            adaptive_selection_target = Some(minimum_selected);
-                            adaptive_proxy_frames = Some(proxy_frames.clone());
-                            adaptive_proxy_samples = Some(report.frames.clone());
-                            if selected.len() >= minimum_selected {
-                                let mut adaptive = adaptive_plan(&video, quality)
-                                    .expect("profile exists for adaptive quality");
-                                adaptive.proxy_candidates = Some(proxy_count as u64);
-                                adaptive.effective_fps =
-                                    Some(selected.len() as f64 / video.duration.max(0.001));
-                                adaptive.estimated_frames = selected.len() as u64;
-                                plan = adaptive;
-                                adaptive_selected = Some(selected);
-                                self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(1.0), false,
-                                    format!("自适应规划完成（{selection_tier}）：{} 个代理候选 → {} 个关键帧", proxy_count, plan.estimated_frames), Some(proxy_count as u64), Some(proxy_count as u64), Some("帧"));
-                            } else if quality == Quality::High
-                                && selected.len() >= (minimum_selected * 9 + 9) / 10
-                            {
-                                // 接近预算时不凭代理分数猜测：在独立目录做一次廉价
-                                // Ceres 验证。它既不使用正式 frames，也不会覆盖随后
-                                // 的固定回退；只有真实注册质量通过才允许采用这些帧。
-                                let validation_root =
-                                    project.join("work").join("adaptive-near-budget-validation");
-                                let validation_frames = validation_root.join("frames");
-                                let validation_database = validation_root.join("database.db");
-                                let validation_sparse = validation_root.join("sparse");
-                                tokio::fs::create_dir_all(&validation_root).await?;
-                                self.events.stage(PipelineStage::SelectingFrames, 0.96,
-                                    format!("精细自适应接近覆盖预算（{} / {}），正在执行隔离 COLMAP 验证", selected.len(), minimum_selected));
-                                let validation = async {
-                                    extract_selected_proxy_frames(
-                                        &self.engines.ffmpeg,
-                                        input,
-                                        &validation_frames,
-                                        &validation_root.join("ffmpeg"),
-                                        &selected,
-                                        &proxy_candidate_samples,
-                                        profile.analysis_fps,
-                                        self.ffmpeg_hw_accel,
-                                        logs.map(|path| {
-                                            path.join("ffmpeg-adaptive-near-budget-validation.log")
-                                        }),
-                                        &self.process_manager,
-                                        Some(self.process_observer(
-                                            PipelineStage::SelectingFrames,
-                                            PipelineEngine::Ffmpeg,
-                                            Some(selected.len() as u64),
-                                            ObserverMode::FfmpegSelected {
-                                                source_duration_seconds: video.duration,
-                                            },
-                                        )),
-                                    )
-                                    .await?;
-                                    let validation_backend = self.colmap_backend;
-                                    let validation_compute = match validation_backend {
-                                        ColmapBackend::Cpu => ColmapComputeMode::Cpu,
-                                        ColmapBackend::Cuda => {
-                                            ColmapComputeMode::Cuda { gpu_index: -1 }
-                                        }
-                                    };
-                                    let validation_exe = self.colmap_executable().to_path_buf();
-                                    let validation_log = validation_root.join("colmap.log");
-                                    colmap::extract_features(
-                                        &validation_exe,
-                                        &validation_database,
-                                        &validation_frames,
-                                        ColmapFeatureOptions {
-                                            compute: validation_compute,
-                                        },
-                                        validation_log.clone(),
-                                        &self.process_manager,
-                                        Some(self.process_observer(
-                                            PipelineStage::SelectingFrames,
-                                            PipelineEngine::Colmap,
-                                            Some(selected.len() as u64),
-                                            ObserverMode::BracketProgress,
-                                        )),
-                                    )
-                                    .await?;
-                                    colmap::match_sequential(
-                                        &validation_exe,
-                                        &validation_database,
-                                        ColmapMatchingOptions {
-                                            compute: validation_compute,
-                                            overlap: 10,
-                                        },
-                                        validation_log.clone(),
-                                        &self.process_manager,
-                                        Some(self.process_observer(
-                                            PipelineStage::SelectingFrames,
-                                            PipelineEngine::Colmap,
-                                            Some(selected.len() as u64),
-                                            ObserverMode::BracketProgress,
-                                        )),
-                                    )
-                                    .await?;
-                                    run_ceres_mapper(
-                                        &validation_exe,
-                                        &validation_database,
-                                        &validation_frames,
-                                        &validation_sparse,
-                                        validation_log,
-                                        &self.process_manager,
-                                        Some(self.process_observer(
-                                            PipelineStage::SelectingFrames,
-                                            PipelineEngine::Colmap,
-                                            Some(selected.len() as u64),
-                                            ObserverMode::Mapper,
-                                        )),
-                                    )
-                                    .await
                                 }
-                                .await;
-                                match validation {
-                                    Ok((_, report))
-                                        if report.quality != ReconstructionQuality::Failed
-                                            && report.registered_ratio >= 0.80
-                                            && report.registered_images * 4
-                                                >= selected.len() as u64 * 3 =>
-                                    {
-                                        adaptive_attempts.push(AdaptiveAttemptRecord {
-                                            name: "nearBudgetValidation".into(),
-                                            input_frames: selected.len() as u64,
-                                            registered_images: Some(report.registered_images),
-                                            registered_ratio: Some(report.registered_ratio),
-                                            accepted: true,
-                                            detail: "隔离 Ceres 验证通过".into(),
-                                        });
-                                        let mut adaptive = adaptive_plan(&video, quality)
-                                            .expect("profile exists for adaptive quality");
-                                        adaptive.proxy_candidates = Some(proxy_count as u64);
-                                        adaptive.effective_fps =
-                                            Some(selected.len() as f64 / video.duration.max(0.001));
-                                        adaptive.estimated_frames = selected.len() as u64;
-                                        plan = adaptive;
-                                        adaptive_selected = Some(selected);
-                                        adaptive_selection_tier = Some("nearBudgetValidated");
-                                        self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(1.0), false,
+                                adaptive_profile = Some(selection_profile);
+                                adaptive_selection_tier = Some(selection_tier);
+                                adaptive_selection_target = Some(minimum_selected);
+                                adaptive_proxy_frames = Some(proxy_frames.clone());
+                                adaptive_proxy_samples = Some(report.frames.clone());
+                                if selected.len() >= minimum_selected {
+                                    let mut adaptive = adaptive_plan(&video, quality)
+                                        .expect("profile exists for adaptive quality");
+                                    adaptive.proxy_candidates = Some(proxy_count as u64);
+                                    adaptive.effective_fps =
+                                        Some(selected.len() as f64 / video.duration.max(0.001));
+                                    adaptive.estimated_frames = selected.len() as u64;
+                                    plan = adaptive;
+                                    adaptive_selected = Some(selected);
+                                    self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Progress, EventLevel::Info, Some(1.0), false,
+                                    format!("自适应规划完成（{selection_tier}）：{} 个代理候选 → {} 个关键帧", proxy_count, plan.estimated_frames), Some(proxy_count as u64), Some(proxy_count as u64), Some("帧"));
+                                } else if quality == Quality::High
+                                    && selected.len() >= (minimum_selected * 9 + 9) / 10
+                                {
+                                    // 接近预算时不凭代理分数猜测：在独立目录做一次廉价
+                                    // Ceres 验证。它既不使用正式 frames，也不会覆盖随后
+                                    // 的固定回退；只有真实注册质量通过才允许采用这些帧。
+                                    let validation_root = project
+                                        .join("work")
+                                        .join("adaptive-near-budget-validation");
+                                    let validation_frames = validation_root.join("frames");
+                                    let validation_database = validation_root.join("database.db");
+                                    let validation_sparse = validation_root.join("sparse");
+                                    tokio::fs::create_dir_all(&validation_root).await?;
+                                    self.events.stage(PipelineStage::SelectingFrames, 0.96,
+                                    format!("精细自适应接近覆盖预算（{} / {}），正在执行隔离 COLMAP 验证", selected.len(), minimum_selected));
+                                    let validation = async {
+                                        extract_selected_proxy_frames(
+                                            &self.engines.ffmpeg,
+                                            input,
+                                            &validation_frames,
+                                            &validation_root.join("ffmpeg"),
+                                            &selected,
+                                            &proxy_candidate_samples,
+                                            profile.analysis_fps,
+                                            self.ffmpeg_hw_accel,
+                                            logs.map(|path| {
+                                                path.join(
+                                                    "ffmpeg-adaptive-near-budget-validation.log",
+                                                )
+                                            }),
+                                            &self.process_manager,
+                                            Some(self.process_observer(
+                                                PipelineStage::SelectingFrames,
+                                                PipelineEngine::Ffmpeg,
+                                                Some(selected.len() as u64),
+                                                ObserverMode::FfmpegSelected {
+                                                    source_duration_seconds: video.duration,
+                                                },
+                                            )),
+                                        )
+                                        .await?;
+                                        let validation_backend = self.colmap_backend;
+                                        let validation_compute = match validation_backend {
+                                            ColmapBackend::Cpu => ColmapComputeMode::Cpu,
+                                            ColmapBackend::Cuda => {
+                                                ColmapComputeMode::Cuda { gpu_index: -1 }
+                                            }
+                                        };
+                                        let validation_exe = self.colmap_executable().to_path_buf();
+                                        let validation_log = validation_root.join("colmap.log");
+                                        colmap::extract_features(
+                                            &validation_exe,
+                                            &validation_database,
+                                            &validation_frames,
+                                            ColmapFeatureOptions {
+                                                compute: validation_compute,
+                                                rig: false,
+                                            },
+                                            validation_log.clone(),
+                                            &self.process_manager,
+                                            Some(self.process_observer(
+                                                PipelineStage::SelectingFrames,
+                                                PipelineEngine::Colmap,
+                                                Some(selected.len() as u64),
+                                                ObserverMode::BracketProgress,
+                                            )),
+                                        )
+                                        .await?;
+                                        colmap::match_sequential(
+                                            &validation_exe,
+                                            &validation_database,
+                                            ColmapMatchingOptions {
+                                                compute: validation_compute,
+                                                overlap: 10,
+                                            },
+                                            validation_log.clone(),
+                                            &self.process_manager,
+                                            Some(self.process_observer(
+                                                PipelineStage::SelectingFrames,
+                                                PipelineEngine::Colmap,
+                                                Some(selected.len() as u64),
+                                                ObserverMode::BracketProgress,
+                                            )),
+                                        )
+                                        .await?;
+                                        run_ceres_mapper(
+                                            &validation_exe,
+                                            &validation_database,
+                                            &validation_frames,
+                                            &validation_sparse,
+                                            validation_log,
+                                            &self.process_manager,
+                                            Some(self.process_observer(
+                                                PipelineStage::SelectingFrames,
+                                                PipelineEngine::Colmap,
+                                                Some(selected.len() as u64),
+                                                ObserverMode::Mapper,
+                                            )),
+                                        )
+                                        .await
+                                    }
+                                    .await;
+                                    match validation {
+                                        Ok((_, report))
+                                            if report.quality != ReconstructionQuality::Failed
+                                                && report.registered_ratio >= 0.80
+                                                && report.registered_images * 4
+                                                    >= selected.len() as u64 * 3 =>
+                                        {
+                                            adaptive_attempts.push(AdaptiveAttemptRecord {
+                                                name: "nearBudgetValidation".into(),
+                                                input_frames: selected.len() as u64,
+                                                registered_images: Some(report.registered_images),
+                                                registered_ratio: Some(report.registered_ratio),
+                                                accepted: true,
+                                                detail: "隔离 Ceres 验证通过".into(),
+                                            });
+                                            let mut adaptive = adaptive_plan(&video, quality)
+                                                .expect("profile exists for adaptive quality");
+                                            adaptive.proxy_candidates = Some(proxy_count as u64);
+                                            adaptive.effective_fps = Some(
+                                                selected.len() as f64 / video.duration.max(0.001),
+                                            );
+                                            adaptive.estimated_frames = selected.len() as u64;
+                                            plan = adaptive;
+                                            adaptive_selected = Some(selected);
+                                            adaptive_selection_tier = Some("nearBudgetValidated");
+                                            self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log, EventLevel::Info, Some(1.0), false,
                                             format!("隔离 COLMAP 验证通过：注册 {}/{}（{:.1}%），采用接近预算的精细自适应帧",
                                                 report.registered_images, report.input_images, report.registered_ratio * 100.0),
                                             Some(report.registered_images), Some(report.input_images), Some("帧"));
-                                    }
-                                    Ok((validation_model, report)) => {
-                                        adaptive_attempts.push(AdaptiveAttemptRecord {
-                                            name: "nearBudgetValidation".into(),
-                                            input_frames: selected.len() as u64,
-                                            registered_images: Some(report.registered_images),
-                                            registered_ratio: Some(report.registered_ratio),
-                                            accepted: false,
-                                            detail: "隔离 Ceres 验证未达到接受门槛".into(),
-                                        });
-                                        let planned = match logs {
-                                            Some(log_directory) => {
-                                                match write_near_budget_validation_diagnostics(
-                                                    log_directory,
-                                                    &validation_model,
-                                                    &selected,
-                                                    &proxy_frames,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(count) => count,
-                                                    Err(error) => {
-                                                        self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log,
+                                        }
+                                        Ok((validation_model, report)) => {
+                                            adaptive_attempts.push(AdaptiveAttemptRecord {
+                                                name: "nearBudgetValidation".into(),
+                                                input_frames: selected.len() as u64,
+                                                registered_images: Some(report.registered_images),
+                                                registered_ratio: Some(report.registered_ratio),
+                                                accepted: false,
+                                                detail: "隔离 Ceres 验证未达到接受门槛".into(),
+                                            });
+                                            let planned = match logs {
+                                                Some(log_directory) => {
+                                                    match write_near_budget_validation_diagnostics(
+                                                        log_directory,
+                                                        &validation_model,
+                                                        &selected,
+                                                        &proxy_frames,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(count) => count,
+                                                        Err(error) => {
+                                                            self.events.send(PipelineStage::SelectingFrames, Some(PipelineEngine::System), EventKind::Log,
                                                         EventLevel::Warning, Some(1.0), false,
                                                         format!("无法写入近预算验证弱区诊断：{error}"), None, None, None);
-                                                        0
+                                                            0
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            None => 0,
-                                        };
-                                        let repair = if planned > 0 {
-                                            let log_directory = logs
-                                                .expect("planned bridge diagnostics require logs");
-                                            let bridge_plan =
-                                                read_near_budget_bridge_plan(log_directory).await?;
-                                            let mut repair_selection = selected.clone();
-                                            for bridge in bridge_plan.planned_frames {
-                                                if !repair_selection.iter().any(|frame| {
-                                                    frame.source_index == bridge.source_index
-                                                }) {
-                                                    repair_selection.push(SelectedSourceFrame {
-                                                        source_index: bridge.source_index,
-                                                        pts_seconds: bridge.pts_seconds,
-                                                        reason: SelectionReason::Bridge,
-                                                        motion: 0.0,
-                                                        inliers: bridge.inliers,
-                                                        grid_coverage: bridge.grid_coverage,
-                                                        sharpness: bridge.sharpness,
-                                                    });
+                                                None => 0,
+                                            };
+                                            let repair = if planned > 0 {
+                                                let log_directory = logs.expect(
+                                                    "planned bridge diagnostics require logs",
+                                                );
+                                                let bridge_plan =
+                                                    read_near_budget_bridge_plan(log_directory)
+                                                        .await?;
+                                                let mut repair_selection = selected.clone();
+                                                for bridge in bridge_plan.planned_frames {
+                                                    if !repair_selection.iter().any(|frame| {
+                                                        frame.source_index == bridge.source_index
+                                                    }) {
+                                                        repair_selection.push(
+                                                            SelectedSourceFrame {
+                                                                source_index: bridge.source_index,
+                                                                pts_seconds: bridge.pts_seconds,
+                                                                reason: SelectionReason::Bridge,
+                                                                motion: 0.0,
+                                                                inliers: bridge.inliers,
+                                                                grid_coverage: bridge.grid_coverage,
+                                                                sharpness: bridge.sharpness,
+                                                            },
+                                                        );
+                                                    }
                                                 }
-                                            }
-                                            repair_selection
-                                                .sort_by_key(|frame| frame.source_index);
-                                            let repair_root = project
-                                                .join("work")
-                                                .join("adaptive-near-budget-bridge-repair");
-                                            let repair_frames = repair_root.join("frames");
-                                            let repair_database = repair_root.join("database.db");
-                                            let repair_sparse = repair_root.join("sparse");
-                                            tokio::fs::create_dir_all(&repair_root).await?;
-                                            self.events.stage(
-                                                PipelineStage::SelectingFrames,
-                                                0.97,
-                                                format!(
-                                                    "近预算桥接 repair：正在验证 {} 张关键帧",
-                                                    repair_selection.len()
-                                                ),
-                                            );
-                                            let repair_result = async {
+                                                repair_selection
+                                                    .sort_by_key(|frame| frame.source_index);
+                                                let repair_root = project
+                                                    .join("work")
+                                                    .join("adaptive-near-budget-bridge-repair");
+                                                let repair_frames = repair_root.join("frames");
+                                                let repair_database =
+                                                    repair_root.join("database.db");
+                                                let repair_sparse = repair_root.join("sparse");
+                                                tokio::fs::create_dir_all(&repair_root).await?;
+                                                self.events.stage(
+                                                    PipelineStage::SelectingFrames,
+                                                    0.97,
+                                                    format!(
+                                                        "近预算桥接 repair：正在验证 {} 张关键帧",
+                                                        repair_selection.len()
+                                                    ),
+                                                );
+                                                let repair_result = async {
                                                 extract_selected_proxy_frames(&self.engines.ffmpeg, input, &repair_frames, &repair_root.join("ffmpeg"),
                                                     &repair_selection, &proxy_candidate_samples, profile.analysis_fps, self.ffmpeg_hw_accel,
                                                     Some(log_directory.join("ffmpeg-adaptive-near-budget-bridge-repair.log")), &self.process_manager,
@@ -1130,7 +1227,7 @@ impl PipelineRunner {
                                                 let executable = self.colmap_executable().to_path_buf();
                                                 let repair_log = repair_root.join("colmap.log");
                                                 colmap::extract_features(&executable, &repair_database, &repair_frames,
-                                                    ColmapFeatureOptions { compute }, repair_log.clone(), &self.process_manager,
+                                                    ColmapFeatureOptions { compute, rig: false }, repair_log.clone(), &self.process_manager,
                                                     Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
                                                         Some(repair_selection.len() as u64), ObserverMode::BracketProgress))).await?;
                                                 colmap::match_sequential(&executable, &repair_database,
@@ -1141,11 +1238,11 @@ impl PipelineRunner {
                                                     &self.process_manager, Some(self.process_observer(PipelineStage::SelectingFrames,
                                                         PipelineEngine::Colmap, Some(repair_selection.len() as u64), ObserverMode::Mapper))).await
                                             }.await;
-                                            Some((repair_selection, repair_result))
-                                        } else {
-                                            None
-                                        };
-                                        match repair {
+                                                Some((repair_selection, repair_result))
+                                            } else {
+                                                None
+                                            };
+                                            match repair {
                                             Some((repair_selection, Ok((_, repair_report)))) if repair_report.quality != ReconstructionQuality::Failed
                                                 && repair_report.registered_ratio >= 0.80
                                                 && repair_report.registered_images * 4 >= repair_selection.len() as u64 * 3 => {
@@ -1191,7 +1288,7 @@ impl PipelineRunner {
                                                     let executable = self.colmap_executable().to_path_buf();
                                                     let dense_log = dense_root.join("colmap.log");
                                                     colmap::extract_features(&executable, &dense_database, &dense_frames,
-                                                        ColmapFeatureOptions { compute }, dense_log.clone(), &self.process_manager,
+                                                        ColmapFeatureOptions { compute, rig: false }, dense_log.clone(), &self.process_manager,
                                                         Some(self.process_observer(PipelineStage::SelectingFrames, PipelineEngine::Colmap,
                                                             Some(dense_selection.len() as u64), ObserverMode::BracketProgress))).await?;
                                                     colmap::match_sequential(&executable, &dense_database,
@@ -1237,35 +1334,38 @@ impl PipelineRunner {
                                                 report.registered_images, report.input_images, report.registered_ratio * 100.0
                                             )),
                                         }
+                                        }
+                                        Err(SplatError::Cancelled) => {
+                                            return Err(SplatError::Cancelled)
+                                        }
+                                        Err(error) => {
+                                            adaptive_reason =
+                                                Some(format!("精细近预算 COLMAP 验证失败：{error}"))
+                                        }
                                     }
-                                    Err(SplatError::Cancelled) => {
-                                        return Err(SplatError::Cancelled)
-                                    }
-                                    Err(error) => {
-                                        adaptive_reason =
-                                            Some(format!("精细近预算 COLMAP 验证失败：{error}"))
-                                    }
+                                } else {
+                                    adaptive_reason = Some(format!(
+                                        "{} 自适应关键帧覆盖不足（{} / {} 张）",
+                                        if quality == Quality::High {
+                                            "精细"
+                                        } else {
+                                            "可靠几何"
+                                        },
+                                        selected.len(),
+                                        minimum_selected
+                                    ));
                                 }
-                            } else {
-                                adaptive_reason = Some(format!(
-                                    "{} 自适应关键帧覆盖不足（{} / {} 张）",
-                                    if quality == Quality::High {
-                                        "精细"
-                                    } else {
-                                        "可靠几何"
-                                    },
-                                    selected.len(),
-                                    minimum_selected
-                                ));
                             }
+                            Err(error) => adaptive_reason = Some(format!("代理分析失败：{error}")),
                         }
-                        Err(error) => adaptive_reason = Some(format!("代理分析失败：{error}")),
+                    }
+                    Err(error) if matches!(error, SplatError::Cancelled) => return Err(error),
+                    Err(error) => {
+                        adaptive_reason = Some(format!("代理抽帧或 PTS 映射失败：{error}"))
                     }
                 }
-                Err(error) if matches!(error, SplatError::Cancelled) => return Err(error),
-                Err(error) => adaptive_reason = Some(format!("代理抽帧或 PTS 映射失败：{error}")),
+                adaptive_planning_ms = planning_started.elapsed().as_millis() as u64;
             }
-            adaptive_planning_ms = planning_started.elapsed().as_millis() as u64;
         }
         if let Some(reason) = &adaptive_reason {
             let diagnostics_hint = adaptive_proxy_frames
@@ -1583,6 +1683,7 @@ impl PipelineRunner {
             adaptive_planning_ms,
             selected_extraction_ms,
             adaptive_fallback_reason: adaptive_reason,
+            rig: false,
         })
     }
     pub async fn generate(
@@ -1879,7 +1980,7 @@ impl PipelineRunner {
             self.colmap_executable(),
             &database,
             &frames,
-            ColmapFeatureOptions { compute },
+            ColmapFeatureOptions { compute, rig: false },
             colmap_log.clone(),
             &self.process_manager,
             Some(self.process_observer(
@@ -2124,6 +2225,7 @@ impl PipelineRunner {
                     &attempt_frames,
                     &model,
                     &temporary,
+                    None,
                     paths.logs.join("colmap-supplement-undistort.log"),
                     &self.process_manager,
                 )
@@ -2156,7 +2258,8 @@ impl PipelineRunner {
             frames.extracted_frames = Some(report.input_images);
             frames.selected_frames = Some(report.input_images);
         }
-        let preset = self.training_preset(metadata.quality);
+        let panorama = is_insv(&metadata.source_path);
+        let preset = self.training_preset(metadata.quality, panorama);
         self.events.stage(
             PipelineStage::TrainingSplats,
             0.0,
@@ -2189,8 +2292,13 @@ impl PipelineRunner {
                 max_resolution: preset.brush_max_resolution,
                 max_splats: match self.training_backend {
                     TrainingBackend::Brush => preset.brush_max_splats,
-                    TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
+                    TrainingBackend::Gsplat => self.gsplat_splat_limit(&preset, panorama),
                 },
+                panorama,
+                panorama_view_count: if panorama { PANORAMA_VIEW_COUNT } else { 1 },
+                native_fisheye: false,
+                initial_points_ply: None,
+                mcmc_min_opacity: self.gsplat_mcmc_min_opacity(&preset, panorama),
                 seed: 42,
                 photometric_mode: self.photometric_mode,
                 densification_strategy: self.gsplat_densification_strategy,
@@ -2384,35 +2492,65 @@ impl PipelineRunner {
         metadata.gsplat_densification_strategy = self.gsplat_densification_strategy;
         metadata.photometric_mode = self.photometric_mode;
         let total_started = Instant::now();
-        let source_input = if is_insv(&metadata.source_path) {
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                0.0,
-                "正在调用 Insta360 MediaSDK 拼接并转换透视视频",
-            );
-            let work_dir = paths.project.join("work").join("insta360");
-            let prepared = prepare_insta360_video(
+        let panorama = is_insv(&metadata.source_path);
+        let mut rig_dataset = None;
+        let source_input = if panorama {
+            self.events.stage(PipelineStage::ExtractingFrames, 0.0, "正在读取 Insta360 双鱼眼视频流");
+            let prepared = prepare_insta360_rig_dataset(
                 &metadata.source_path,
-                &work_dir,
+                &paths.frames,
+                &self.engines.ffprobe,
                 &self.engines.ffmpeg,
-                self.ffmpeg_hw_accel,
+                panorama_rig_sampling_fps(quality),
                 &self.process_manager,
-                Some(paths.logs.join("insta360-mediasdk.log")),
-                Some(paths.logs.join("insta360-perspective-ffmpeg.log")),
+                Some(paths.logs.join("insta360-rig.log")),
+                None,
             )
             .await?;
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                1.0,
-                "Insta360 拼接与透视转换完成",
-            );
-            prepared
+            if let Some(dataset) = prepared {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    1.0,
+                    format!("原始双鱼眼抽帧完成：{} 个同步时刻", dataset.frame_count),
+                );
+                rig_dataset = Some(dataset);
+                paths.frames.clone()
+            } else {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    0.0,
+                    "当前 INSV 没有双视频流，回退 MediaSDK 拼接路径",
+                );
+                let work_dir = paths.project.join("work").join("insta360");
+                let prepared = prepare_insta360_video(
+                    &metadata.source_path,
+                    &work_dir,
+                    &self.engines.ffprobe,
+                    &self.engines.ffmpeg,
+                    self.ffmpeg_hw_accel,
+                    &self.process_manager,
+                    Some(paths.logs.join("insta360-mediasdk.log")),
+                    Some(paths.logs.join("insta360-perspective-ffmpeg.log")),
+                )
+                .await?;
+                self.events.stage(PipelineStage::ExtractingFrames, 1.0, "Insta360 拼接与透视转换完成");
+                prepared
+            }
         } else {
             metadata.source_path.clone()
         };
-        let prepared = self
-            .prepare_frames(&source_input, quality, &paths.frames, Some(&paths.logs))
-            .await?;
+        let prepared = if let Some(dataset) = rig_dataset.as_ref() {
+            Self::prepared_rig_frames(dataset)
+        } else {
+            self.prepare_frames(
+                &source_input,
+                quality,
+                panorama,
+                &paths.frames,
+                Some(&paths.logs),
+            )
+            .await?
+        };
         metadata.timings.probe_ms = prepared.probe_ms;
         metadata.timings.extract_ms = prepared.extract_ms;
         metadata.timings.select_ms = prepared.select_ms;
@@ -2446,6 +2584,7 @@ impl PipelineRunner {
         tokio::fs::create_dir_all(&attempt_root).await?;
         let mut database = attempt_root.join("database.db");
         let mut colmap_log = attempt_root.join("colmap.log");
+        reset_colmap_attempt(&attempt_root).await?;
         // COLMAP 4.1.x 的 OptionManager 无法用相对路径（如 ../frames）解析
         // --image_path，`ExistsDir` 校验会直接失败。这里传入绝对路径；
         // COLMAP 4.1.1 的 bitmap loader 已能正确处理 UTF-8/宽字符绝对路径。
@@ -2471,6 +2610,7 @@ impl PipelineRunner {
             colmap_images,
             ColmapFeatureOptions {
                 compute: colmap_compute,
+                rig: prepared.rig,
             },
             colmap_log.clone(),
             &self.process_manager,
@@ -2498,6 +2638,7 @@ impl PipelineRunner {
                 .join("colmap-attempts")
                 .join("cpu-fallback");
             tokio::fs::create_dir_all(&attempt_root).await?;
+            reset_colmap_attempt(&attempt_root).await?;
             database = attempt_root.join("database.db");
             colmap_log = attempt_root.join("colmap.log");
             colmap_exe = self
@@ -2512,6 +2653,7 @@ impl PipelineRunner {
                 colmap_images,
                 ColmapFeatureOptions {
                     compute: colmap_compute,
+                    rig: prepared.rig,
                 },
                 colmap_log.clone(),
                 &self.process_manager,
@@ -2539,64 +2681,25 @@ impl PipelineRunner {
             format!("COLMAP 正在进行 {backend_label} 顺序匹配"),
         );
         let phase_started = Instant::now();
-        let matching_result = colmap::match_sequential(
-            &colmap_exe,
-            &database,
-            ColmapMatchingOptions {
-                compute: colmap_compute,
-                overlap: 10,
-            },
-            colmap_log.clone(),
-            &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::Matching,
-                PipelineEngine::Colmap,
-                Some(prepared.selection.retained),
-                ObserverMode::BracketProgress,
-            )),
-        )
-        .await;
-        if let Err(error) = matching_result {
-            if effective_backend != ColmapBackend::Cuda || !colmap::is_cuda_runtime_error(&error) {
-                return Err(error);
-            }
-            self.events.stage(
-                PipelineStage::Matching,
-                0.0,
-                "CUDA SIFT 匹配运行时失败，正在使用独立 CPU 数据库重试",
-            );
-            effective_backend = ColmapBackend::Cpu;
-            attempt_root = paths
-                .project
-                .join("work")
-                .join("colmap-attempts")
-                .join("cpu-fallback");
-            tokio::fs::create_dir_all(&attempt_root).await?;
-            database = attempt_root.join("database.db");
-            colmap_log = attempt_root.join("colmap.log");
-            colmap_exe = self
-                .engines
-                .colmap_for(effective_backend, self.cuda_colmap_flavor)
-                .to_path_buf();
-            colmap_compute = ColmapComputeMode::Cpu;
-            backend_label = "CPU（CUDA 回退）";
-            colmap::extract_features(
+        let matching_result = if prepared.rig {
+            colmap::match_exhaustive(
                 &colmap_exe,
                 &database,
-                colmap_images,
-                ColmapFeatureOptions {
+                ColmapMatchingOptions {
                     compute: colmap_compute,
+                    overlap: 10,
                 },
                 colmap_log.clone(),
                 &self.process_manager,
                 Some(self.process_observer(
-                    PipelineStage::ExtractingFeatures,
+                    PipelineStage::Matching,
                     PipelineEngine::Colmap,
                     Some(prepared.selection.retained),
                     ObserverMode::BracketProgress,
                 )),
             )
-            .await?;
+            .await
+        } else {
             colmap::match_sequential(
                 &colmap_exe,
                 &database,
@@ -2613,7 +2716,88 @@ impl PipelineRunner {
                     ObserverMode::BracketProgress,
                 )),
             )
+            .await
+        };
+        if let Err(error) = matching_result {
+            if effective_backend != ColmapBackend::Cuda || !colmap::is_cuda_runtime_error(&error) {
+                return Err(error);
+            }
+            self.events.stage(
+                PipelineStage::Matching,
+                0.0,
+                "CUDA SIFT 匹配运行时失败，正在使用独立 CPU 数据库重试",
+            );
+            effective_backend = ColmapBackend::Cpu;
+            attempt_root = paths
+                .project
+                .join("work")
+                .join("colmap-attempts")
+                .join("cpu-fallback");
+            tokio::fs::create_dir_all(&attempt_root).await?;
+            reset_colmap_attempt(&attempt_root).await?;
+            database = attempt_root.join("database.db");
+            colmap_log = attempt_root.join("colmap.log");
+            colmap_exe = self
+                .engines
+                .colmap_for(effective_backend, self.cuda_colmap_flavor)
+                .to_path_buf();
+            colmap_compute = ColmapComputeMode::Cpu;
+            backend_label = "CPU（CUDA 回退）";
+            colmap::extract_features(
+                &colmap_exe,
+                &database,
+                colmap_images,
+            ColmapFeatureOptions {
+                compute: colmap_compute,
+                rig: prepared.rig,
+            },
+            colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(prepared.selection.retained),
+                    ObserverMode::BracketProgress,
+                )),
+            )
             .await?;
+            if prepared.rig {
+                colmap::match_exhaustive(
+                    &colmap_exe,
+                    &database,
+                    ColmapMatchingOptions {
+                        compute: colmap_compute,
+                        overlap: 10,
+                    },
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::Matching,
+                        PipelineEngine::Colmap,
+                        Some(prepared.selection.retained),
+                        ObserverMode::BracketProgress,
+                    )),
+                )
+                .await?;
+            } else {
+                colmap::match_sequential(
+                    &colmap_exe,
+                    &database,
+                    ColmapMatchingOptions {
+                        compute: colmap_compute,
+                        overlap: 10,
+                    },
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::Matching,
+                        PipelineEngine::Colmap,
+                        Some(prepared.selection.retained),
+                        ObserverMode::BracketProgress,
+                    )),
+                )
+                .await?;
+            }
         }
         metadata.timings.colmap_matching_ms = phase_started.elapsed().as_millis() as u64;
         let fallback_used =
@@ -2653,6 +2837,50 @@ impl PipelineRunner {
             1.0,
             format!("{backend_label} 顺序匹配完成"),
         );
+        let mut rig_configured_model = None;
+        if prepared.rig {
+            let rig_config = rig_dataset
+                .as_ref()
+                .map(|dataset| dataset.rig_config.clone())
+                .ok_or_else(|| SplatError::Process("双鱼眼 rig 配置丢失".into()))?;
+            let bootstrap = attempt_root.join("rig-bootstrap");
+            let (bootstrap_model, bootstrap_report) = run_ceres_mapper(
+                &colmap_exe,
+                &database,
+                colmap_images,
+                &bootstrap,
+                colmap_log.clone(),
+                &self.process_manager,
+                None,
+            )
+            .await?;
+            if bootstrap_report.quality == ReconstructionQuality::Failed {
+                return Err(SplatError::Process(format!(
+                    "双鱼眼 rig 初始重建失败：注册 {}/{}（{:.1}%），无法估计镜头基线",
+                    bootstrap_report.registered_images,
+                    bootstrap_report.input_images,
+                    bootstrap_report.registered_ratio * 100.0
+                )));
+            }
+            let configured = attempt_root.join("rig-configured");
+            colmap::configure_rig(
+                &colmap_exe,
+                &database,
+                &rig_config,
+                Some(&bootstrap_model),
+                Some(&configured),
+                attempt_root.join("rig-configurator.log"),
+                &self.process_manager,
+                None,
+            )
+            .await?;
+            rig_configured_model = Some(configured);
+            self.events.stage(
+                PipelineStage::Matching,
+                1.0,
+                "双鱼眼镜头 rig 基线已从初始重建估计",
+            );
+        }
         let caspar_available = if effective_backend == ColmapBackend::Cuda {
             engines::cuda_colmap_supports_caspar(&self.engines, self.cuda_colmap_flavor).await?
         } else {
@@ -2668,7 +2896,7 @@ impl PipelineRunner {
             caspar_available,
             self.mapper_ba_mode,
             prepared.selection.retained,
-        );
+        ) && !prepared.rig;
         let ceres_sparse = attempt_root.join("incremental-ceres").join("sparse");
         let caspar_sparse = attempt_root.join("incremental-caspar").join("sparse");
         let mut caspar_fallback_reason = None;
@@ -2677,6 +2905,8 @@ impl PipelineRunner {
             0.0,
             if use_caspar {
                 "正在使用 CASPAR GPU 增量重建相机轨迹"
+            } else if prepared.rig {
+                "正在使用 Ceres 优化 rig 相机轨迹"
             } else {
                 "正在使用 Ceres 增量重建相机轨迹"
             },
@@ -2693,6 +2923,7 @@ impl PipelineRunner {
         let (mut model, mut report, mut ba_backend) = if use_caspar {
             let caspar_options = IncrementalMapperOptions {
                 ba_backend: IncrementalBaBackend::Caspar { gpu_index: -1 },
+                rig: false,
             };
             let caspar_result = colmap::map(
                 &colmap_exe,
@@ -2754,16 +2985,32 @@ impl PipelineRunner {
                 }
             }
         } else {
-            let (model, report) = run_ceres_mapper(
-                &colmap_exe,
-                &database,
-                colmap_images,
-                &ceres_sparse,
-                colmap_log.clone(),
-                &self.process_manager,
-                mapper_observer(),
-            )
-            .await?;
+            let (model, report) = if prepared.rig {
+                let configured = rig_configured_model.as_ref().ok_or_else(|| {
+                    SplatError::Process("双鱼眼 rig 配置模型丢失".into())
+                })?;
+                run_rig_bundle_adjuster(
+                    &colmap_exe,
+                    configured,
+                    colmap_images,
+                    &ceres_sparse,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    mapper_observer(),
+                )
+                .await?
+            } else {
+                run_ceres_mapper(
+                    &colmap_exe,
+                    &database,
+                    colmap_images,
+                    &ceres_sparse,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    mapper_observer(),
+                )
+                .await?
+            };
             (model, report, "ceres")
         };
         metadata.timings.colmap_mapping_ms = phase_started.elapsed().as_millis() as u64;
@@ -2970,6 +3217,7 @@ impl PipelineRunner {
                 &bridge_frames,
                 ColmapFeatureOptions {
                     compute: colmap_compute,
+                    rig: false,
                 },
                 bridge_log.clone(),
                 &self.process_manager,
@@ -3101,6 +3349,7 @@ impl PipelineRunner {
             ),
         );
         let phase_started = Instant::now();
+        let mut initial_points_ply: Option<PathBuf> = None;
         let training_input = match self.training_backend {
             TrainingBackend::Brush => {
                 training::prepare_standard_colmap_dataset(
@@ -3112,38 +3361,160 @@ impl PipelineRunner {
                 paths.training_input.clone()
             }
             TrainingBackend::Gsplat => {
-                let undistorted = paths.gsplat.join("training-input-undistorted");
-                let temporary = paths.gsplat.join(".training-input-undistorted.tmp");
-                if temporary.exists() {
-                    tokio::fs::remove_dir_all(&temporary).await?;
+                if panorama && prepared.rig {
+                    tokio::fs::create_dir_all(&paths.gsplat).await?;
+                    // CASPAR is a mapper-only build; its CLI omits dense MVS
+                    // commands.  Always use the official COLMAP binary here.
+                    let mvs_exe = match self.colmap_backend {
+                        ColmapBackend::Cpu => &self.engines.colmap,
+                        ColmapBackend::Cuda => &self.engines.colmap_cuda,
+                    };
+                    colmap::require_verified_cli(mvs_exe)?;
+                    let mvs_workspace = paths.gsplat.join("mvs-undistorted");
+                    let mvs_temporary = paths.gsplat.join(".mvs-undistorted.tmp");
+                    if mvs_temporary.exists() {
+                        tokio::fs::remove_dir_all(&mvs_temporary).await?;
+                    }
+                    if mvs_workspace.exists() {
+                        tokio::fs::remove_dir_all(&mvs_workspace).await?;
+                    }
+                    colmap::undistort_images(
+                        mvs_exe,
+                        &paths.frames,
+                        &model,
+                        &mvs_temporary,
+                        // Keep MVS above the 1536px panorama training target while
+                        // avoiding the full 2560px PatchMatch cost.
+                        Some(1920),
+                        paths.logs.join("colmap-mvs-undistort.log"),
+                        &self.process_manager,
+                    )
+                    .await?;
+                    self.events.stage(
+                        PipelineStage::TrainingSplats,
+                        0.0,
+                        format!(
+                            "MVS photometric/geometric：准备 0/{} 个视图",
+                            report.input_images
+                        ),
+                    );
+                    let mvs_model = normalize_undistorted_sparse_layout(&mvs_temporary).await?;
+                    if !mvs_temporary.join("images").is_dir()
+                        || !mvs_model.join("cameras.bin").is_file()
+                    {
+                        return Err(SplatError::Process(
+                            "COLMAP MVS 去畸变输出不完整，已停止 gsplat 训练。".into(),
+                        ));
+                    }
+                    // COLMAP dense tools read workspace/sparse/* directly;
+                    // keep sparse/0 as the gsplat layout and mirror the files
+                    // at the dense workspace root.
+                    let dense_sparse = mvs_temporary.join("sparse");
+                    for name in ["cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin"] {
+                        let source = mvs_model.join(name);
+                        if source.is_file() {
+                            tokio::fs::copy(&source, dense_sparse.join(name)).await?;
+                        }
+                    }
+                    tokio::fs::rename(&mvs_temporary, &mvs_workspace).await?;
+                    // COLMAP stores the automatically selected source-view
+                    // count in patch-match.cfg; restore the 20-view baseline.
+                    let rewritten_sources =
+                        colmap::limit_patch_match_sources(&mvs_workspace, 20).await?;
+                    if rewritten_sources == 0 {
+                        return Err(SplatError::Process(
+                            "COLMAP MVS patch-match.cfg 未找到默认源视图配置。".into(),
+                        ));
+                    }
+                    colmap::patch_match_stereo(
+                        mvs_exe,
+                        &mvs_workspace,
+                        4,
+                        paths.logs.join("colmap-patch-match.log"),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::TrainingSplats,
+                            PipelineEngine::Colmap,
+                            Some(report.input_images),
+                            ObserverMode::MvsPatchMatch,
+                        )),
+                    )
+                    .await?;
+                    self.events.stage(
+                        PipelineStage::TrainingSplats,
+                        0.0,
+                        format!("MVS fusion：准备 0/{} 个视图", report.input_images),
+                    );
+                    let fused = paths.gsplat.join("mvs-fused.ply");
+                    if fused.exists() {
+                        tokio::fs::remove_file(&fused).await?;
+                    }
+                    colmap::stereo_fusion(
+                        mvs_exe,
+                        &mvs_workspace,
+                        &fused,
+                        paths.logs.join("colmap-stereo-fusion.log"),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::TrainingSplats,
+                            PipelineEngine::Colmap,
+                            Some(report.input_images),
+                            ObserverMode::MvsFusion,
+                        )),
+                    )
+                    .await?;
+                    if !fused.is_file() {
+                        return Err(SplatError::Process(
+                            "COLMAP MVS 未生成 fused.ply，已停止 gsplat 训练。".into(),
+                        ));
+                    }
+                    self.events.stage(
+                        PipelineStage::TrainingSplats,
+                        0.0,
+                        "MVS 深度初始化完成，准备启动 gsplat",
+                    );
+                    initial_points_ply = Some(fused);
+                    // Native FishEye is wired in the adapter, but the bundled
+                    // extension currently lacks GSPLAT_BUILD_3DGUT.  Keep the
+                    // runnable path on this MVS pinhole workspace until that
+                    // binary is rebuilt; the fused depth points still apply.
+                    mvs_workspace
+                } else {
+                    let undistorted = paths.gsplat.join("training-input-undistorted");
+                    let temporary = paths.gsplat.join(".training-input-undistorted.tmp");
+                    if temporary.exists() {
+                        tokio::fs::remove_dir_all(&temporary).await?;
+                    }
+                    colmap::undistort_images(
+                        &colmap_exe,
+                        &paths.frames,
+                        &model,
+                        &temporary,
+                        None,
+                        paths.logs.join("colmap-undistort.log"),
+                        &self.process_manager,
+                    )
+                    .await?;
+                    let sparse_model = normalize_undistorted_sparse_layout(&temporary).await?;
+                    if !temporary.join("images").is_dir()
+                        || !sparse_model.join("cameras.bin").is_file()
+                    {
+                        return Err(SplatError::Process(
+                            "COLMAP 去畸变输出不完整，已停止 gsplat 训练。".into(),
+                        ));
+                    }
+                    if undistorted.exists() {
+                        tokio::fs::remove_dir_all(&undistorted).await?;
+                    }
+                    tokio::fs::rename(&temporary, &undistorted).await?;
+                    undistorted
                 }
-                colmap::undistort_images(
-                    &colmap_exe,
-                    &paths.frames,
-                    &model,
-                    &temporary,
-                    paths.logs.join("colmap-undistort.log"),
-                    &self.process_manager,
-                )
-                .await?;
-                let sparse_model = normalize_undistorted_sparse_layout(&temporary).await?;
-                if !temporary.join("images").is_dir() || !sparse_model.join("cameras.bin").is_file()
-                {
-                    return Err(SplatError::Process(
-                        "COLMAP 去畸变输出不完整，已停止 gsplat 训练。".into(),
-                    ));
-                }
-                if undistorted.exists() {
-                    tokio::fs::remove_dir_all(&undistorted).await?;
-                }
-                tokio::fs::rename(&temporary, &undistorted).await?;
-                undistorted
             }
         };
         metadata.timings.training_input_ms = phase_started.elapsed().as_millis() as u64;
         state.training_input_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
-        let preset = self.training_preset(quality);
+        let preset = self.training_preset(quality, panorama);
         let engine = match self.training_backend {
             TrainingBackend::Brush => PipelineEngine::Brush,
             TrainingBackend::Gsplat => PipelineEngine::Gsplat,
@@ -3179,8 +3550,17 @@ impl PipelineRunner {
                 max_resolution: preset.brush_max_resolution,
                 max_splats: match self.training_backend {
                     TrainingBackend::Brush => preset.brush_max_splats,
-                    TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
+                    TrainingBackend::Gsplat => self.gsplat_splat_limit(&preset, panorama),
                 },
+                panorama,
+                panorama_view_count: if panorama {
+                    if prepared.rig { 2 } else { PANORAMA_VIEW_COUNT }
+                } else {
+                    1
+                },
+                native_fisheye: false,
+                initial_points_ply: initial_points_ply.clone(),
+                mcmc_min_opacity: self.gsplat_mcmc_min_opacity(&preset, panorama),
                 seed: 42,
                 photometric_mode: self.photometric_mode,
                 densification_strategy: self.gsplat_densification_strategy,
@@ -3417,7 +3797,8 @@ impl PipelineRunner {
         state.training_input_complete = true;
         state.stage = PipelineStage::TrainingSplats;
         project_manager.write_state(&paths.state, &state).await?;
-        let preset = self.training_preset(quality);
+        let panorama = false;
+        let preset = self.training_preset(quality, panorama);
         let engine = match self.training_backend {
             TrainingBackend::Brush => PipelineEngine::Brush,
             TrainingBackend::Gsplat => PipelineEngine::Gsplat,
@@ -3453,8 +3834,13 @@ impl PipelineRunner {
                 max_resolution: preset.brush_max_resolution,
                 max_splats: match self.training_backend {
                     TrainingBackend::Brush => preset.brush_max_splats,
-                    TrainingBackend::Gsplat => self.gsplat_splat_cap.limit(preset.brush_max_splats),
+                    TrainingBackend::Gsplat => self.gsplat_splat_limit(&preset, panorama),
                 },
+                panorama,
+                panorama_view_count: if panorama { PANORAMA_VIEW_COUNT } else { 1 },
+                native_fisheye: false,
+                initial_points_ply: None,
+                mcmc_min_opacity: self.gsplat_mcmc_min_opacity(&preset, panorama),
                 seed: 42,
                 photometric_mode: self.photometric_mode,
                 densification_strategy: self.gsplat_densification_strategy,
@@ -3581,6 +3967,7 @@ impl PipelineRunner {
         let initial_unit = match &mode {
             ObserverMode::Brush(_) | ObserverMode::Gsplat => Some("iterations".to_string()),
             ObserverMode::FfmpegSelected { .. } => Some("秒".to_string()),
+            ObserverMode::MvsPatchMatch | ObserverMode::MvsFusion => Some("视图".to_string()),
             _ => None,
         };
         let stage_progress = Arc::new(std::sync::Mutex::new((
@@ -3622,10 +4009,10 @@ impl PipelineRunner {
                     // such as focal length and camera parameters. They remain in
                     // the per-project log file, but the live UI is reserved for
                     // meaningful progress and actionable failures.
-                    let (progress, current, total, unit) = stage_progress
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
+                let (progress, current, total, unit) = stage_progress
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                     events.send(
                         stage,
                         Some(engine),
@@ -3655,17 +4042,44 @@ impl PipelineRunner {
                             (ratio, Some(bounded), total, Some("iterations".into()));
                     }
                 }
-                let (progress, current, total, unit) = stage_progress
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
-                let message = match (engine, current, total) {
-                    (PipelineEngine::Brush, Some(current), Some(total)) if current > 0 => {
+                    let (progress, current, total, unit) = stage_progress
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                let mvs_phase = if matches!(&mode, ObserverMode::MvsPatchMatch) {
+                    let state = ffmpeg_state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.mvs_geometric {
+                        "geometric"
+                    } else {
+                        "photometric"
+                    }
+                } else {
+                    "fusion"
+                };
+                let message = match (&mode, engine, current, total) {
+                    (ObserverMode::Brush(_), PipelineEngine::Brush, Some(current), Some(total))
+                        if current > 0 =>
+                    {
                         format!("Brush · {current}/{total}")
                     }
-                    (PipelineEngine::Brush, _, _) => format!("Brush · {} 秒", elapsed_ms / 1000),
-                    (PipelineEngine::Gsplat, Some(current), Some(total)) => {
+                    (ObserverMode::Brush(_), PipelineEngine::Brush, _, _) => {
+                        format!("Brush · {} 秒", elapsed_ms / 1000)
+                    }
+                    (ObserverMode::Gsplat, PipelineEngine::Gsplat, Some(current), Some(total)) => {
                         format!("gsplat · {current}/{total}")
+                    }
+                    (ObserverMode::MvsPatchMatch, PipelineEngine::Colmap, Some(current), Some(total))
+                        if stage == PipelineStage::TrainingSplats =>
+                    {
+                        format!("COLMAP MVS {mvs_phase} · {current}/{total}")
+                    }
+                    (ObserverMode::MvsFusion, PipelineEngine::Colmap, Some(current), Some(total))
+                        if stage == PipelineStage::TrainingSplats =>
+                    {
+                        format!("COLMAP MVS fusion · {current}/{total}")
+                    }
+                    (_, PipelineEngine::Colmap, Some(current), Some(total)) => {
+                        format!("COLMAP · {current}/{total}")
                     }
                     _ => format!("运行中 · {} 秒", elapsed_ms / 1000),
                 };
@@ -3714,6 +4128,8 @@ enum ObserverMode {
         source_duration_seconds: f64,
     },
     BracketProgress,
+    MvsPatchMatch,
+    MvsFusion,
     Mapper,
     Brush(PathBuf),
     Gsplat,
@@ -3723,6 +4139,8 @@ type ProgressSample = (f32, String, u64, Option<u64>, Option<String>);
 #[derive(Default)]
 struct FfmpegProgressState {
     encoded_frames: u64,
+    mvs_geometric: bool,
+    mvs_last_view: u64,
 }
 
 #[derive(Deserialize)]
@@ -3748,6 +4166,33 @@ fn brush_checkpoint_step(directory: &Path) -> Option<u64> {
         })
         .max()
 }
+
+fn parse_bracket_counter(line: &str) -> Option<(u64, u64, bool)> {
+    for token in line.split_whitespace() {
+        if let Some((left, right)) = token.split_once('/') {
+            if let (Ok(current), Ok(total)) = (
+                left.trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u64>(),
+                right
+                    .trim_end_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u64>(),
+            ) {
+                return Some((current, total, false));
+            }
+        }
+    }
+    for window in line.split_whitespace().collect::<Vec<_>>().windows(3) {
+        if window[1] == "/" {
+            if let (Ok(current), Ok(total)) =
+                (window[0].parse::<u64>(), window[2].parse::<u64>())
+            {
+                return Some((current, total, true));
+            }
+        }
+    }
+    None
+}
+
 fn parse_progress(
     line: &str,
     mode: &ObserverMode,
@@ -3810,32 +4255,57 @@ fn parse_progress(
             ))
         }
         ObserverMode::BracketProgress => {
-            // Generic `<X>/<Y>` bracket counter, e.g. `processed 12/100`.
-            for token in line.split_whitespace() {
-                if let Some((left, right)) = token.split_once('/') {
-                    if let (Ok(current), Ok(total)) = (
-                        left.trim_start_matches(|c: char| !c.is_ascii_digit())
-                            .parse::<u64>(),
-                        right
-                            .trim_end_matches(|c: char| !c.is_ascii_digit())
-                            .parse::<u64>(),
-                    ) {
-                        let ratio = if total > 0 {
-                            current.min(total) as f32 / total as f32
-                        } else {
-                            0.0
-                        };
-                        return Some((
-                            ratio,
-                            line.to_string(),
-                            current,
-                            Some(total),
-                            Some("步".into()),
-                        ));
-                    }
-                }
+            let (current, parsed_total, _) = parse_bracket_counter(line)?;
+            let ratio = if parsed_total > 0 {
+                current.min(parsed_total) as f32 / parsed_total as f32
+            } else {
+                0.0
+            };
+            Some((
+                ratio,
+                line.to_string(),
+                current,
+                Some(parsed_total),
+                Some("步".into()),
+            ))
+        }
+        ObserverMode::MvsPatchMatch | ObserverMode::MvsFusion => {
+            if matches!(mode, ObserverMode::MvsPatchMatch)
+                && line.contains("geom_consistency: 1")
+            {
+                ffmpeg_state.mvs_geometric = true;
             }
-            None
+            let (current, parsed_total, _) = parse_bracket_counter(line)?;
+            if matches!(mode, ObserverMode::MvsPatchMatch)
+                && !ffmpeg_state.mvs_geometric
+                && current == 1
+                && ffmpeg_state.mvs_last_view >= parsed_total
+            {
+                // The second PatchMatch pass emits `Processing view 1 / N`
+                // before it prints its `geom_consistency: 1` options block.
+                ffmpeg_state.mvs_geometric = true;
+            }
+            if matches!(mode, ObserverMode::MvsPatchMatch) {
+                ffmpeg_state.mvs_last_view = current;
+            }
+            let ratio = if parsed_total > 0 {
+                current.min(parsed_total) as f32 / parsed_total as f32
+            } else {
+                0.0
+            };
+            let label = match mode {
+                ObserverMode::MvsFusion => "MVS fusion",
+                ObserverMode::MvsPatchMatch if ffmpeg_state.mvs_geometric => "MVS geometric",
+                ObserverMode::MvsPatchMatch => "MVS photometric",
+                _ => unreachable!(),
+            };
+            Some((
+                ratio,
+                format!("{label} {current}/{parsed_total}"),
+                current,
+                Some(parsed_total),
+                Some("视图".into()),
+            ))
         }
         ObserverMode::Mapper => {
             // COLMAP/GLOG prefixes each line and reports the meaningful count
@@ -3908,6 +4378,47 @@ fn parse_progress(
     }
 }
 
+fn panorama_gsplat_limit(
+    configured_cap: crate::presets::GsplatSplatCap,
+    quality_cap: u32,
+    panorama: bool,
+) -> u32 {
+    let configured = configured_cap.limit(quality_cap);
+    // M4-C: a 1M ceiling is too small for balanced/fine panorama coverage;
+    // fast and ordinary-video requests retain the user's configured cap.
+    if panorama && quality_cap >= 3_000_000 && configured_cap == crate::presets::GsplatSplatCap::M1
+    {
+        configured.max(2_000_000)
+    } else {
+        configured
+    }
+}
+
+fn gsplat_mcmc_min_opacity_for(quality_cap: u32, panorama: bool) -> f32 {
+    if panorama && quality_cap >= 3_000_000 {
+        0.0025
+    } else {
+        0.005
+    }
+}
+
+fn panorama_sampling_fps(quality: Quality, source_fps: f64) -> f64 {
+    let time_sampling_fps = match quality {
+        Quality::Draft => 1.0,
+        Quality::Standard => 3.0,
+        Quality::High => 4.0,
+    };
+    (time_sampling_fps * PANORAMA_VIEW_COUNT as f64).min(source_fps.max(1.0))
+}
+
+fn panorama_rig_sampling_fps(quality: Quality) -> f64 {
+    match quality {
+        Quality::Draft => 0.5,
+        Quality::Standard => 1.0,
+        Quality::High => 2.0,
+    }
+}
+
 #[cfg(test)]
 mod progress_tests {
     use super::*;
@@ -3917,6 +4428,43 @@ mod progress_tests {
         assert_eq!(supplement_attempt_number("supplemented-3").unwrap(), 3);
         assert!(supplement_attempt_number("supplemented-0").is_err());
         assert!(supplement_attempt_number("../supplemented-3").is_err());
+    }
+
+    #[test]
+    fn raises_only_balanced_or_fine_panorama_m1_cap() {
+        use crate::presets::GsplatSplatCap;
+
+        assert_eq!(
+            panorama_gsplat_limit(GsplatSplatCap::M1, 3_000_000, true),
+            2_000_000
+        );
+        assert_eq!(
+            panorama_gsplat_limit(GsplatSplatCap::M1, 1_500_000, true),
+            1_000_000
+        );
+        assert_eq!(
+            panorama_gsplat_limit(GsplatSplatCap::M1, 3_000_000, false),
+            1_000_000
+        );
+        assert_eq!(
+            panorama_gsplat_limit(GsplatSplatCap::M2, 3_000_000, true),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn lowers_mcmc_opacity_only_for_balanced_or_fine_panorama() {
+        assert_eq!(gsplat_mcmc_min_opacity_for(3_000_000, true), 0.0025);
+        assert_eq!(gsplat_mcmc_min_opacity_for(1_500_000, true), 0.005);
+        assert_eq!(gsplat_mcmc_min_opacity_for(3_000_000, false), 0.005);
+    }
+
+    #[test]
+    fn panorama_sampling_uses_twelve_to_sixteen_fps_for_balanced_and_high() {
+        assert_eq!(panorama_sampling_fps(Quality::Draft, 200.0), 4.0);
+        assert_eq!(panorama_sampling_fps(Quality::Standard, 200.0), 12.0);
+        assert_eq!(panorama_sampling_fps(Quality::High, 200.0), 16.0);
+        assert_eq!(panorama_sampling_fps(Quality::High, 10.0), 10.0);
     }
 
     #[test]
@@ -4018,6 +4566,74 @@ mod progress_tests {
         .unwrap();
         assert_eq!(sample.2, 2);
         assert_eq!(sample.3, Some(273));
+    }
+
+    #[test]
+    fn labels_colmap_mvs_photometric_geometric_and_fusion() {
+        let patch_match = ObserverMode::MvsPatchMatch;
+        let mut state = FfmpegProgressState::default();
+        assert!(parse_progress(
+            "geom_consistency: 0",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .is_none());
+        let sample = parse_progress(
+            "I20260920 patch_match.cc:419] === Processing view 46 / 70 for rig1/camera2/frame_000023.jpg ===",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(sample.0, 46.0 / 70.0);
+        assert_eq!(sample.1, "MVS photometric 46/70");
+        assert_eq!(sample.2, 46);
+        assert_eq!(sample.3, Some(70));
+        assert_eq!(sample.4.as_deref(), Some("视图"));
+
+        let sample = parse_progress(
+            "I20260920 patch_match.cc:419] === Processing view 70 / 70 for rig1/camera2/frame_000035.jpg ===",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(sample.1, "MVS photometric 70/70");
+
+        let sample = parse_progress(
+            "I20260920 patch_match.cc:419] === Processing view 1 / 70 for rig1/camera1/frame_000001.jpg ===",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(sample.1, "MVS geometric 1/70");
+
+        assert!(parse_progress(
+            "geom_consistency: 1",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .is_none());
+        let sample = parse_progress(
+            "I20260920 patch_match.cc:419] === Processing view 1 / 70 for rig1/camera1/frame_000001.jpg ===",
+            &patch_match,
+            Some(70),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(sample.1, "MVS geometric 1/70");
+
+        let sample = parse_progress(
+            "I20260920 fusion.cc:283] Fusing image [1/70] with index 0",
+            &ObserverMode::MvsFusion,
+            Some(70),
+            &mut FfmpegProgressState::default(),
+        )
+        .unwrap();
+        assert_eq!(sample.1, "MVS fusion 1/70");
     }
 
     #[test]
@@ -4902,6 +5518,7 @@ async fn run_ceres_mapper(
         sparse,
         IncrementalMapperOptions {
             ba_backend: IncrementalBaBackend::Ceres,
+            rig: false,
         },
         log.clone(),
         manager,
@@ -4930,6 +5547,28 @@ async fn run_ceres_mapper(
             diagnostic_path.display()
         )));
     }
+    best_sparse_model(images, sparse)
+}
+
+async fn run_rig_bundle_adjuster(
+    executable: &Path,
+    input_model: &Path,
+    images: &Path,
+    sparse: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<(PathBuf, ReconstructionReport)> {
+    let output_model = sparse.join("0");
+    colmap::bundle_adjust_rig(
+        executable,
+        input_model,
+        &output_model,
+        log,
+        manager,
+        observer,
+    )
+    .await?;
     best_sparse_model(images, sparse)
 }
 
@@ -5039,4 +5678,23 @@ fn best_sparse_model(frames: &Path, sparse_root: &Path) -> Result<(PathBuf, Reco
         }
     }
     best.ok_or_else(|| SplatError::Process("稀疏重建没有可用子模型".into()))
+}
+
+async fn reset_colmap_attempt(root: &Path) -> Result<()> {
+    for path in [
+        root.join("database.db"),
+        root.join("colmap.log"),
+        root.join("rig-configurator.log"),
+        root.join("rig-bootstrap"),
+        root.join("rig-configured"),
+        root.join("incremental-ceres"),
+        root.join("incremental-caspar"),
+    ] {
+        if path.is_dir() {
+            tokio::fs::remove_dir_all(path).await?;
+        } else if path.is_file() {
+            tokio::fs::remove_file(path).await?;
+        }
+    }
+    Ok(())
 }
